@@ -1,0 +1,61 @@
+name: "Chore / 工程任务"
+description: "重构、依赖升级、工具链、文档。必须说明范围与不改变的行为。"
+title: "[Chore] "
+labels: ["type:chore"]  # status:ready 由人工在 DoR 复核后手动添加
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 模块归属
+      options: [watchlist, quotes, news, portfolio, settings, design, infra]
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目标
+      description: 要解决什么工程问题？（可维护性、构建时长、崩溃率……）
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与不做的事
+    validations:
+      required: true
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: 必须保持不变的行为
+      description: 重构类任务的关键约束，Agent 会据此判断是否引入回归。
+      placeholder: "公开 API 签名不变；现有测试全部保持通过；无 UI 变化"
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      placeholder: |
+        - 构建时间从 X 降到 Y（CI 记录）
+        - 无新增 SwiftLint warning
+    validations:
+      required: true
+
+  - type: input
+    id: affected_paths
+    attributes:
+      label: 预期受影响路径（glob）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: 风险等级
+      options: [low, medium, high]
+    validations:
+      required: true

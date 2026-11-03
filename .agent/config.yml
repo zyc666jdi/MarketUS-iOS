@@ -1,0 +1,99 @@
+# AI Agent 运行时契约（Phase 0：规范定义；Phase 1 由调度器读取执行）
+# 修改本文件属于受保护变更，必须人类审批。
+version: 1
+
+repo:
+  visibility: public               # 公开仓库：外部输入一律视为不可信
+  trusted_associations: [OWNER, MEMBER, COLLABORATOR]
+  require_maintainer_label: true   # 必须有维护者打的 status:ready
+  ignore_fork_prs: true
+  ignore_external_comments: true
+
+data:
+  provider: mock                   # mock | alpaca
+  mock_seed: 42
+  mock_scenarios: [default, bull, bear, volatile, stale, disconnect, slow, error500, rate429, malformed, empty]
+  live_provider: alpaca            # 仅手动触发，需要 key
+  live_requires_secret: true
+  live_allowed_in_ci: false
+
+ticket:
+  provider: github_issues          # github_issues | jira | linear
+  repo: YOUR_ORG/MarketUS-iOS
+  ready_label: "status:ready"
+  claim_label: "status:claimed"
+  # 领取租约：超时未续租，调度器回收该 ticket
+  lease_minutes: 120
+  heartbeat_minutes: 15
+  # 单次运行最多尝试轮次（含首次实现）
+  max_attempts: 3
+  max_scope_changes: 0             # 发现需要扩大范围时，默认拒绝并建议拆票
+
+concurrency:
+  max_parallel_implementers: 2
+  max_parallel_reviewers: 2
+  # 两个 ticket 的 affected_paths 有交集时串行执行，避免写冲突
+  serialize_on_path_overlap: true
+  worktree_root: ".worktrees"
+
+limits:
+  timeout_minutes: 90
+  max_changed_lines: 400           # 超过则必须拆票
+  hard_max_changed_lines: 800      # 绝对上限，超过直接终止并上报
+  max_files_changed: 25
+  max_new_dependencies: 0          # 新增 SPM 依赖需人类批准
+  tool_call_budget: 400
+
+gates:
+  required_checks:
+    - lint
+    - build
+    - unit-tests
+    - snapshot-tests
+    - secret-scan
+    - dependency-review
+  coverage:
+    changed_lines_min: 0.80
+    module_min: 0.70
+    allow_decrease: false
+  # 以下任一失败 → 立即停止，不重试
+  fatal:
+    - secret-scan
+    - security:suspicious
+    - protected-path-violation
+
+review:
+  independent_context: true        # Reviewer 不得继承 Implementer 的对话上下文
+  read_only: true                  # Reviewer 只能评论，不能 push
+  max_rounds: 2                    # 两轮仍有 blocker → 升级给人
+  require_evidence: true           # 评论必须引用 file:line 与依据
+
+merge:
+  agent_can_merge: false           # 硬性红线：Agent 永不合并
+  human_approvals:
+    low: 1
+    medium: 1
+    high: 2
+  strategy: squash
+  delete_branch: true
+  require_up_to_date: true
+  require_all_threads_resolved: true
+
+protected_paths:
+  - "AGENTS.md"
+  - "LICENSE"
+  - "SECURITY.md"
+  - ".agent/**"
+  - ".github/**"
+  - "project.yml"
+  - "Packages/MarketUSKit/Package.swift"
+  - "**/*.entitlements"
+  - "**/Info.plist"
+  - "**/PrivacyInfo.xcprivacy"
+  - "Tools/signing/**"
+  - "docs/adr/**"
+
+notifications:
+  on_merge_requested: ["slack:#ios-review"]
+  on_blocked: ["slack:#ios-agents", "mention:@ios-leads"]
+  on_security_suspicious: ["slack:#ios-security", "mention:@ios-leads"]

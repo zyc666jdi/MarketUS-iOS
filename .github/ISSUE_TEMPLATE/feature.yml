@@ -1,0 +1,103 @@
+name: "Feature / 功能需求"
+description: "新增功能或增强。必须填写可验证的验收标准，否则 Agent 不会领取。"
+title: "[Feature] "
+labels: ["type:feature"]  # status:ready 由人工在 DoR 复核后手动添加
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > 填写完成后，请确认满足 `docs/ticket-protocol.md` 的 Definition of Ready。
+        > 缺少验收标准的 ticket 会被 Agent 退回（`ai:needs-human-decision`）。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 模块归属
+      options: [watchlist, quotes, news, portfolio, settings, design, infra]
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级
+      options: ["p0", "p1", "p2", "p3"]
+    validations:
+      required: true
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景与用户价值
+      description: 为什么做？谁受益？不做会怎样？
+      placeholder: "美股用户需要把最关注的 10 支股票固定在最前面……"
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准（必须可验证）
+      description: 每条一行，使用 Given / When / Then 或明确的可观测结果。
+      placeholder: |
+        - Given 自选股数量 ≥ 2，When 长按并拖动某行，Then 行顺序变化并触发触觉反馈
+        - Given 重启 App，Then 排序结果保持不变
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: 范围外（明确不做）
+      placeholder: "排序结果不同步到服务端，见 #456"
+    validations:
+      required: true
+
+  - type: input
+    id: affected_paths
+    attributes:
+      label: 预期受影响路径（glob）
+      description: 用于 Agent 并行调度时避免写入冲突。
+      placeholder: "Packages/MarketUSKit/Sources/FeatureWatchlist/**"
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: 设计稿 / 交互说明（UI 类必填）
+      description: Figma 链接、截图、动效说明；无 UI 变更写"无"。
+    validations:
+      required: true
+
+  - type: textarea
+    id: test_plan
+    attributes:
+      label: 测试建议
+      placeholder: |
+        - 单元：排序算法在重复 symbol、空列表下的行为
+        - UI：拖拽后重启 App 顺序保持
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: 风险等级
+      options: [low, medium, high]
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ready
+    attributes:
+      label: Definition of Ready
+      options:
+        - label: 验收标准完整且可测试（≥ 2 条）
+          required: true
+        - label: 无未决的产品/设计问题
+          required: true
+        - label: 无需新增密钥、权限或第三方依赖（如需，请先走 ADR）
+          required: true
+        - label: 预估改动 ≤ 400 行，否则已拆分为多个 ticket
+          required: true

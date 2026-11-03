@@ -1,0 +1,6 @@
+# 继承 gitleaks 默认规则集。
+#
+# 若出现误报，请在 PR 中说明并把精确的 `regexes` / `paths` 加到 allowlist，
+# 不得整体排除某个目录（会掩盖真实泄漏）。allowlist 变更需人类审批。
+[extend]
+useDefault = true

@@ -1,0 +1,75 @@
+# MarketUS SwiftLint 规则
+# 目标：0 warning（`swiftlint --strict` 作为合并门禁）
+
+disabled_rules:
+  - todo
+  - trailing_comma
+  - opening_brace
+  - multiple_closures_with_trailing_closure
+
+opt_in_rules:
+  - empty_count
+  - explicit_init
+  - first_where
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+  - last_where
+  - legacy_random
+  - redundant_nil_coalescing
+  - sorted_first_last
+  - toggle_bool
+  - unneeded_parentheses_in_closure_argument
+
+analyzer_rules:
+  - unused_declaration
+  - unused_import
+
+included:
+  - App/Sources
+  - Packages/MarketUSKit/Sources
+  - Tests
+
+excluded:
+  - .build
+  - DerivedData
+  - TestResults
+  - MarketUS.xcodeproj
+
+line_length:
+  warning: 120
+  error: 160
+  ignores_comments: true
+  ignores_urls: true
+
+file_length:
+  warning: 400
+  error: 500
+
+type_body_length:
+  warning: 300
+  error: 400
+
+function_body_length:
+  warning: 40
+  error: 60
+
+cyclomatic_complexity:
+  warning: 10
+  error: 15
+
+identifier_name:
+  min_length:
+    warning: 2
+    error: 1
+  excluded:
+    - id
+    - x
+    - y
+
+type_name:
+  min_length: 3
+  max_length:
+    warning: 50
+    error: 60
+
+reporter: "xcode"

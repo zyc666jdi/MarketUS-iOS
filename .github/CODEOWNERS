@@ -1,0 +1,42 @@
+# CODEOWNERS —— 谁有权审批什么
+#
+# 规则：
+#  1. 最后一条匹配的规则生效。
+#  2. AI Agent 永远不是 owner；owner 必须是人类。
+#  3. 受保护路径（见 docs/merge-policy.md）必须由对应 owner 审批，
+#     且高风险变更需要 2 位人类审批。
+
+# 默认：所有变更至少需要一位 iOS owner
+*                                   @YOUR_ORG/ios-owners
+
+# 工程与流程（Agent 无权自行修改）
+/AGENTS.md                          @YOUR_ORG/ios-leads
+/LICENSE                            @YOUR_ORG/ios-leads
+/SECURITY.md                        @YOUR_ORG/ios-leads
+/.agent/                            @YOUR_ORG/ios-leads
+/.github/                           @YOUR_ORG/ios-leads
+/project.yml                        @YOUR_ORG/ios-leads
+/Packages/MarketUSKit/Package.swift @YOUR_ORG/ios-leads
+/docs/                              @YOUR_ORG/ios-leads
+/docs/adr/                          @YOUR_ORG/ios-leads
+
+# 签名、权限、隐私：必须人类专属审批
+**/*.entitlements                   @YOUR_ORG/ios-leads
+**/Info.plist                       @YOUR_ORG/ios-leads
+**/PrivacyInfo.xcprivacy            @YOUR_ORG/ios-leads
+/Tools/signing/                     @YOUR_ORG/ios-leads
+
+# 核心模块
+/Packages/MarketUSKit/Sources/MarketUSCore/         @YOUR_ORG/ios-core
+/Packages/MarketUSKit/Sources/MarketUSData/         @YOUR_ORG/ios-core
+/Packages/MarketUSKit/Sources/MarketUSNetworking/   @YOUR_ORG/ios-core
+
+# 功能模块（按 area 归属）
+/Packages/MarketUSKit/Sources/FeatureWatchlist/     @YOUR_ORG/ios-features
+/Packages/MarketUSKit/Sources/FeatureQuotes/        @YOUR_ORG/ios-features
+/Packages/MarketUSKit/Sources/FeatureNews/          @YOUR_ORG/ios-features
+/Packages/MarketUSKit/Sources/FeaturePortfolio/     @YOUR_ORG/ios-features
+
+# UI / 设计系统
+/Packages/MarketUSKit/Sources/MarketUSDesignSystem/ @YOUR_ORG/ios-design
+/App/Sources/Resources/Assets.xcassets/             @YOUR_ORG/ios-design

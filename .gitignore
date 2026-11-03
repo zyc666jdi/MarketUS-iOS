@@ -1,0 +1,61 @@
+# ---- macOS ----
+.DS_Store
+*.swp
+
+# ---- Xcode ----
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+!default.xcworkspace/xcshareddata/
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# XcodeGen 生成物（唯一事实来源是 project.yml）
+MarketUS.xcodeproj/
+
+# ---- Swift Package Manager ----
+.build/
+.swiftpm/
+
+# ---- AI Agent 运行时（不提交） ----
+.worktrees/
+.agent/runs/
+.agent/locks/
+.agent/cache/
+
+# ---- 本地环境与密钥（永不提交） ----
+.env
+.env.*
+!.env.example
+*.p12
+*.mobileprovision
+*.cer
+*.p8
+*.pem
+Secrets.xcconfig
+Config/Local.xcconfig
+fastlane/report.xml
+fastlane/screenshots/**/*.png
+
+# ---- 测试与工具产物 ----
+coverage/
+coverage-report.txt
+TestResults/
+*.xcresult
+*.profraw
+*.profdata
+snapshot-failures/
+
+# ---- Mock market server（Tools/mock-market） ----
+Tools/mock-market/.venv/
+Tools/mock-market/__pycache__/
+Tools/mock-market/.pytest_cache/
+Tools/mock-market/node_modules/
+Tools/mock-market/.env

@@ -1,0 +1,62 @@
+name: MarketUS
+
+options:
+  bundleIdPrefix: com.marketus
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+packages:
+  MarketUSKit:
+    path: Packages/MarketUSKit
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  MarketUS:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/Sources
+      - path: App/Resources
+    entitlements:
+      path: App/Supporting/MarketUS.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.marketus.app
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_FILE: App/Supporting/Info.plist
+    dependencies:
+      - package: MarketUSKit
+        product: MarketUSCore
+      - package: MarketUSKit
+        product: MarketUSData
+      - package: MarketUSKit
+        product: FeatureWatchlist
+    scheme:
+      gatherCoverageData: true
+      testTargets:
+        - MarketUSUITests
+
+  MarketUSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: Tests/UITests
+    dependencies:
+      - target: MarketUS
+    settings:
+      base:
+        TEST_TARGET_NAME: MarketUS
+        GENERATE_INFOPLIST_FILE: YES

@@ -1,0 +1,105 @@
+name: "Bug / 缺陷"
+description: "可复现的缺陷。必须包含复现步骤与期望行为，否则 Agent 不会领取。"
+title: "[Bug] "
+labels: ["type:bug"]  # status:ready 由人工在 DoR 复核后手动添加
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > Agent 修复 bug 时必须先写一个能复现该 bug 的失败测试，再修复使其通过。
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 模块归属
+      options: [watchlist, quotes, news, portfolio, settings, design, infra]
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级
+      options: ["p0", "p1", "p2", "p3"]
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开自选股
+        2. 下拉刷新
+        3. 快速连续下拉 3 次
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为（含日志 / 崩溃栈）
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 环境
+      placeholder: "iPhone 15 / iOS 17.4 / build 0.1.0 (42) / 美国东部时区"
+    validations:
+      required: true
+
+  - type: input
+    id: frequency
+    attributes:
+      label: 复现概率
+      placeholder: "必现 / 3 次中 1 次"
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 修复验收标准
+      description: 至少包含一条「自动化回归测试」要求。
+      placeholder: |
+        - 新增单测：连续刷新 3 次时只发起 1 次网络请求
+        - 手动：连续下拉 3 次无重复 loading 指示器
+    validations:
+      required: true
+
+  - type: input
+    id: affected_paths
+    attributes:
+      label: 预期受影响路径（glob）
+      placeholder: "Packages/MarketUSKit/Sources/FeatureWatchlist/**"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: 风险等级
+      options: [low, medium, high]
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ready
+    attributes:
+      label: Definition of Ready
+      options:
+        - label: 复现步骤可被他人按步骤重现
+          required: true
+        - label: 已排除数据/账号/网络等外部因素
+          required: true
+        - label: 已确认不是已知问题（未重复）
+          required: true
