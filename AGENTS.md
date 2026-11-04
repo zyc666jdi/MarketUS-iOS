@@ -79,9 +79,9 @@ make verify      # lint + 包测试 + build + UI 测试 + 覆盖率报告（提�
 make secret-scan # gitleaks 本地扫描（CI 由 GitHub secret scanning 兜底）
 ```
 
-> **Phase 1 说明**：工程与 `Makefile` 已生成（`xcodegen generate` 通过），但当前开发机
-> **未安装 Xcode**（只有 Command Line Tools），`make build/test/verify` 尚不可运行。
-> 在 `xcodebuild -version` 成功之前：不得声称构建或测试通过，PR 必须标注「未验证构建」。
+> **环境现状（已验证）**：Xcode 26.6 + iOS 26.5 模拟器，`make verify` 全绿（lint +
+> 8 个单测 + 构建 + UI 测试）。本地跑 UI 测试前请先 `open -a Simulator`——headless
+> `simctl boot` 的设备会出现 “Timed out while loading Accessibility”。
 
 系统要求：macOS + Xcode（`xcodebuild -version` 与 `.xcode-version` 一致）。
 禁止在容器/Linux 上尝试构建 iOS 目标。
