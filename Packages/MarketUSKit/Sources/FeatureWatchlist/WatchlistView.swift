@@ -10,24 +10,53 @@ public struct WatchlistView: View {
     }
 
     public var body: some View {
-        List(viewModel.quotes) { quote in
-            QuoteRow(quote: quote)
-        }
-        .listStyle(.plain)
-        .overlay {
-            if viewModel.quotes.isEmpty, !viewModel.isLoading {
-                Text("watchlist.empty")
-                    .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            if let message = viewModel.errorMessage {
+                banner(message: message, isError: true)
+            } else if viewModel.isStale {
+                banner(message: String(localized: "watchlist.stale"), isError: false)
             }
-        }
-        .overlay {
-            if viewModel.isLoading {
-                ProgressView()
+
+            List(viewModel.quotes) { quote in
+                QuoteRow(quote: quote)
+            }
+            .listStyle(.plain)
+            .overlay {
+                if viewModel.isEmpty {
+                    Text("watchlist.empty")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .overlay {
+                if viewModel.isLoading {
+                    ProgressView()
+                }
+            }
+            .refreshable {
+                await viewModel.refresh()
             }
         }
         .task {
             await viewModel.load()
         }
+    }
+
+    private func banner(message: String, isError: Bool) -> some View {
+        HStack(spacing: 8) {
+            Text(message)
+                .font(.footnote)
+            Spacer()
+            if isError {
+                Button("watchlist.retry") {
+                    Task { await viewModel.refresh() }
+                }
+                .font(.footnote.weight(.semibold))
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(isError ? Color.red.opacity(0.12) : Color.orange.opacity(0.15))
+        .accessibilityElement(children: .combine)
     }
 }
 

@@ -1,54 +1,134 @@
 {
-  "sourceLanguage" : "en",
-  "strings" : {
-    "watchlist.empty" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Add symbols to your watchlist to see quotes."
+  "sourceLanguage": "en",
+  "strings": {
+    "watchlist.empty": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add symbols to your watchlist to see quotes."
           }
         },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "添加标的后即可查看报价。"
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加标的后即可查看报价。"
           }
         }
       }
     },
-    "watchlist.error" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Couldn't load quotes. Pull to retry."
+    "watchlist.error": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't load quotes. Pull to retry."
           }
         },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "报价加载失败，下拉重试。"
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "报价加载失败，下拉重试。"
           }
         }
       }
     },
-    "watchlist.title" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Watchlist"
+    "watchlist.error.offline": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No connection. Check your network and try again."
           }
         },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "自选股"
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "网络不可用，请检查连接后重试。"
+          }
+        }
+      }
+    },
+    "watchlist.error.rateLimited": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Too many requests. Try again in a moment."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请求过于频繁，请稍后再试。"
+          }
+        }
+      }
+    },
+    "watchlist.error.unauthorized": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your session expired. Please sign in again."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "登录已过期，请重新登录。"
+          }
+        }
+      }
+    },
+    "watchlist.retry": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Retry"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "重试"
+          }
+        }
+      }
+    },
+    "watchlist.stale": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delayed quotes"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "延迟行情"
+          }
+        }
+      }
+    },
+    "watchlist.title": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Watchlist"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自选股"
           }
         }
       }
     }
   },
-  "version" : "1.0"
+  "version": "1.0"
 }

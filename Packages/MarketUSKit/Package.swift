@@ -30,6 +30,10 @@ let package = Package(
             dependencies: ["MarketUSCore", "MarketUSDesignSystem", "MarketUSObservability"]
         ),
         .testTarget(name: "MarketUSCoreTests", dependencies: ["MarketUSCore"]),
-        .testTarget(name: "MarketUSDataTests", dependencies: ["MarketUSData"]),
+        .testTarget(
+            name: "MarketUSDataTests",
+            dependencies: ["MarketUSData", "MarketUSNetworking", "MarketUSPersistence"]
+        ),
+        .testTarget(name: "FeatureWatchlistTests", dependencies: ["FeatureWatchlist"]),
     ]
 )
