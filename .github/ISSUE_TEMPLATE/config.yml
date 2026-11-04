@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: "架构 / 流程讨论（不要开 ticket）"
-    url: "https://github.com/YOUR_ORG/MarketUS-iOS/discussions"
+    url: "https://github.com/zyc666jdi/MarketUS-iOS/discussions"
     about: "技术选型、流程调整、跨模块设计请走 Discussion 或 ADR。"
   - name: "安全漏洞"
-    url: "https://github.com/YOUR_ORG/MarketUS-iOS/security/advisories/new"
+    url: "https://github.com/zyc666jdi/MarketUS-iOS/security/advisories/new"
     about: "请勿通过公开 issue 报告安全问题。"
   - name: "Agent 工作流说明"
-    url: "https://github.com/YOUR_ORG/MarketUS-iOS/blob/main/docs/agent-workflow.md"
+    url: "https://github.com/zyc666jdi/MarketUS-iOS/blob/main/docs/agent-workflow.md"
     about: "了解 ticket 如何被 AI Agent 领取、实现与评审。"

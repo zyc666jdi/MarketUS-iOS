@@ -19,7 +19,7 @@ data:
 
 ticket:
   provider: github_issues          # github_issues | jira | linear
-  repo: YOUR_ORG/MarketUS-iOS
+  repo: zyc666jdi/MarketUS-iOS
   ready_label: "status:ready"
   claim_label: "status:claimed"
   # 领取租约：超时未续租，调度器回收该 ticket
