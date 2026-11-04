@@ -113,6 +113,8 @@ CI 不允许「失败自动重试直到通过」的配置。
 
 ## 8. UI 测试策略
 
+- **本地前置**：先 `open -a Simulator` 再跑 UI 测试；仅用 `simctl boot` 的 headless 设备
+  可能出现 `Timed out while loading Accessibility`（本项目已踩坑）。
 - PR 冒烟集（3–5 条）：启动 → 自选股列表 → 打开详情 → 返回 → 搜索。
 - nightly 全量：覆盖所有主路径 + 深链 + 空态/错误态。
 - 使用 accessibility identifier（稳定），不用可见文案定位（易因本地化失效）。

@@ -177,7 +177,7 @@ verify: lint build test coverage
 > 已完成：`project.yml`、`Package.swift`、最小 App、`Makefile`、`ci.yml`、`Brewfile`、
 > 工具链配置、Mock 行情服务。**未完成**：本机构建验证（缺 Xcode）与 GitHub 侧配置。
 
-- [ ] `make bootstrap && make verify` 在干净环境通过（需先安装 Xcode）
+- [x] `make bootstrap && make verify` 通过（Xcode 26.6 + iOS 26.5，已验证）
 - [ ] CI 在 PR 上全绿，且分支保护生效（直接 push main 会被拒绝）
 - [ ] 空 App 能在模拟器启动，显示 "MarketUS"
 - [ ] `swift test --package-path Packages/MarketUSKit` 通过（可为空测）

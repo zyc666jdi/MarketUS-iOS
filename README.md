@@ -10,14 +10,14 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 阶段 | **Phase 1 · 骨架已生成**（工程可生成；因本机未装 Xcode，构建尚未验证） |
+| 阶段 | **Phase 1 · 骨架完成**（构建、单元测试与 UI 测试均已在本机验证） |
 | 架构 | ✅ 已规划（Proposed，待确认；[`docs/architecture.md`](docs/architecture.md)） |
 | Agent 契约 | ✅ [`AGENTS.md`](AGENTS.md) |
 | 工作流规范 | ✅ [`docs/agent-workflow.md`](docs/agent-workflow.md) |
 | Ticket 协议 | ✅ [`docs/ticket-protocol.md`](docs/ticket-protocol.md) |
 | 代码 / Xcode 工程 | ✅ `project.yml` + `Package.swift` + 最小 App（`xcodegen generate` 已通过） |
-| 构建 / 测试 | ⚠️ **未验证**：本机只有 Command Line Tools，`xcodebuild` 不可用 |
-| CI | ✅ `ci.yml` 已就绪，⬜ 推送到 GitHub 后才会实际运行 |
+| 构建 / 测试 | ✅ 已验证：Xcode 26.6 + iOS 26.5 模拟器，`make verify` 全绿 |
+| CI | ✅ 已在 GitHub Actions 跑通（commit `cca95bf`，`success`） |
 | 分支保护 | ⬜ 建仓后按 [`docs/infrastructure.md`](docs/infrastructure.md) 配置 |
 | 数据源 | ✅ Mock 优先（[`docs/data-sources.md`](docs/data-sources.md)） |
 | 依赖基线 | ✅ 运行时零第三方依赖（[`docs/dependencies.md`](docs/dependencies.md)） |
