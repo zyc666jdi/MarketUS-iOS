@@ -10,7 +10,7 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 阶段 | **Phase 2 · 垂直切片完成**（PR #4 已合并；Phase 3 待启动） |
+| 阶段 | **Phase 3 · Dispatcher 3b 已验证**（#11 → PR #14）；3c 待启动 |
 | 架构 | ✅ 已规划（Proposed，待确认；[`docs/architecture.md`](docs/architecture.md)） |
 | Agent 契约 | ✅ [`AGENTS.md`](AGENTS.md) |
 | 工作流规范 | ✅ [`docs/agent-workflow.md`](docs/agent-workflow.md) |
