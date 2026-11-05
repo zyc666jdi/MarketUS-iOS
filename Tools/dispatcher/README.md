@@ -35,6 +35,20 @@ python3 Tools/dispatcher/dispatcher.py once --issue 8 --execute --timeout 90
 
 未通过只会在输出里标 `⛔`，不会修改任何 issue。
 
+## 凭据（`dsh headless`）
+
+`dsh headless` 不使用 Web 的交互式凭据，需显式提供 `DEEPSEEK_API_KEY`。按优先级：
+
+1. 当前 shell：`export DEEPSEEK_API_KEY=sk-...`
+2. 600 权限文件：`~/.config/marketUS/deepseek.env`（或 `AGENT_ENV_FILE` 指定）
+3. macOS Keychain：
+
+```bash
+security add-generic-password -a "$USER" -s DEEPSEEK_API_KEY -w 'sk-...' -U
+```
+
+Dispatcher 只在需要时读取，不打印、不落盘。使用 `AGENT_CMD="codex exec ..."` 时无需该 key。
+
 ## 后续阶段
 
 | 阶段 | 能力 |

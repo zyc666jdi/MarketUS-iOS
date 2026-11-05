@@ -15,6 +15,8 @@ import argparse
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -64,6 +66,52 @@ ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url"
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
+
+
+def agent_command() -> list[str]:
+    """Agent 入口；可用 AGENT_CMD 覆盖（例如 codex exec / claude -p）。"""
+    return shlex.split(os.environ.get("AGENT_CMD", "dsh --profile headless --json"))
+
+
+def secret_env_file() -> Path:
+    return Path(os.environ.get("AGENT_ENV_FILE", Path.home() / ".config/marketUS/deepseek.env"))
+
+
+def load_agent_secrets() -> None:
+    """按 env → 600 权限 env 文件 → macOS Keychain 的顺序解析 DEEPSEEK_API_KEY。
+
+    只写入当前进程环境，不打印、不落盘。
+    """
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return
+
+    path = secret_env_file()
+    if path.exists():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value:
+                os.environ.setdefault(key, value)
+
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return
+
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "DEEPSEEK_API_KEY", "-w"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            os.environ["DEEPSEEK_API_KEY"] = result.stdout.strip()
 
 
 def now_iso() -> str:
@@ -322,7 +370,11 @@ def cmd_once(args: argparse.Namespace) -> int:
     print(f"branch   {branch}")
     print(f"worktree {worktree}")
     print(f"prompt   {len(prompt)} chars")
-    print("agent    dsh --profile headless --json")
+    command = agent_command()
+    load_agent_secrets()
+    credential = "DEEPSEEK_API_KEY" if os.environ.get("DEEPSEEK_API_KEY") else "missing"
+    print(f"agent    {' '.join(command)}")
+    print(f"cred     {credential}")
 
     if not args.execute:
         print("\n(dry-run) 未写入 GitHub、未创建 worktree、未调用 Agent；加 --execute 执行。")
@@ -330,6 +382,15 @@ def cmd_once(args: argparse.Namespace) -> int:
 
     if worktree.exists():
         print(f"⛔ worktree 已存在：{worktree}")
+        return 1
+
+    if command and command[0] == "dsh" and not os.environ.get("DEEPSEEK_API_KEY"):
+        print("⛔ 缺少 DEEPSEEK_API_KEY：headless 不使用交互式凭据。")
+        print("   配置方式：export DEEPSEEK_API_KEY、~/.config/marketUS/deepseek.env，或 Keychain。")
+        return 1
+
+    if not command or shutil.which(command[0]) is None:
+        print(f"⛔ 找不到 Agent 命令：{command[0] if command else '<empty>'}")
         return 1
 
     run_id = make_run_id(number)
@@ -347,7 +408,7 @@ def cmd_once(args: argparse.Namespace) -> int:
         cmd(["git", "fetch", "origin", "main"])
         cmd(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
     except SystemExit as error:
-        gh(["issue", "edit", str(number), "--remove-label", "status:claimed"])
+        gh(["issue", "edit", str(number), "--remove-label", "status:claimed", "--add-label", "status:blocked"])
         comment(number, f"⛔ 创建 worktree 失败：{error}")
         return 1
 
@@ -362,9 +423,10 @@ def cmd_once(args: argparse.Namespace) -> int:
     env["TICKET_NUMBER"] = str(number)
 
     timeout_seconds = args.timeout * 60
+    command = agent_command()
     try:
         result = subprocess.run(
-            ["dsh", "--profile", "headless", "--json"],
+            command,
             input=prompt,
             text=True,
             cwd=str(worktree),
@@ -372,15 +434,27 @@ def cmd_once(args: argparse.Namespace) -> int:
             timeout=timeout_seconds,
             env=env,
         )
-        (run_dir / "agent.jsonl").write_text(result.stdout, encoding="utf-8")
+        (run_dir / "agent.log").write_text(result.stdout, encoding="utf-8")
         (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
         agent_failed = result.returncode != 0
     except subprocess.TimeoutExpired:
-        gh(["issue", "edit", str(number), "--remove-label", "status:in-progress", "--add-label", "status:blocked"])
+        gh(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "--remove-label",
+                "status:in-progress",
+                "--remove-label",
+                "status:claimed",
+                "--add-label",
+                "status:blocked",
+            ]
+        )
         comment(number, f"⛔ Agent 超时（{args.timeout} 分钟）。日志：`.agent/runs/{number}/`")
         return 1
     except FileNotFoundError:
-        raise SystemExit("找不到 dsh，请确认 PATH 中有 dsh")
+        raise SystemExit(f"找不到 Agent 命令：{command[0]}")
 
     prs = json.loads(
         run(["gh", "pr", "list", "--head", branch, "--json", "number,url,title", "--limit", "1"]).stdout or "[]"
@@ -389,12 +463,34 @@ def cmd_once(args: argparse.Namespace) -> int:
 
     if prs:
         pr = prs[0]
-        gh(["issue", "edit", str(number), "--add-label", "status:in-review"])
+        gh(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "--remove-label",
+                "status:claimed",
+                "--add-label",
+                "status:in-review",
+            ]
+        )
         comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
         print(f"PR: {pr['url']}")
         return 0
 
-    gh(["issue", "edit", str(number), "--add-label", "status:blocked"])
+    gh(
+        [
+            "issue",
+            "edit",
+            str(number),
+            "--remove-label",
+            "status:in-progress",
+            "--remove-label",
+            "status:claimed",
+            "--add-label",
+            "status:blocked",
+        ]
+    )
     reason = "Agent 退出码非 0" if agent_failed else "未检测到 PR"
     comment(number, f"⛔ {reason}。worktree: `{worktree}`，日志：`.agent/runs/{number}/`")
     print(f"⛔ {reason}")
