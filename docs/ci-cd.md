@@ -31,7 +31,7 @@ graph LR
 | `build` | `xcodegen` + Debug 构建（模拟器） | ✅ | 6 min |
 | `unit-tests` | 单元 + 集成测试 | ✅ | 6 min |
 | `snapshot-tests` | 组件/页面快照 | ✅ | 3 min |
-| `coverage` | Phase 1 仅报告；Phase 2 起变更行 ≥ 80% | ⚠️ Phase 1 | 1 min |
+| `coverage` | 本地 `make coverage`（需要 `make test` 产物）；CI 不跑 | ⚠️ 本地 | — |
 | `secret-scan` | GitHub 原生 secret scanning + push protection（非 job） | ✅ | — |
 | `dependency-review` | 新增依赖/许可证 | ✅ | 1 min |
 | `ui-smoke` | 3–5 条关键路径（需本地/自托管模拟器） | ⚠️ 本地或 nightly | 8 min |

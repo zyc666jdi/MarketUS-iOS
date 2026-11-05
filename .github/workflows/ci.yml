@@ -40,7 +40,6 @@ jobs:
       # Hosted macOS runners may not have an iPhone simulator device installed;
       # build for the generic simulator, and keep UI tests local/nightly.
       - run: make build
-      - run: make coverage
       - uses: actions/upload-artifact@v4
         if: always()
         with:
