@@ -318,3 +318,28 @@ dispatcher:
 3. 合并后是否自动领取下一张票（链式调度）还是等人工确认？
 4. 多机/多实例时的分布式锁（当前假设单机）。
 5. CI 恢复前是否允许 `once` 绕过 checks（建议不允许）。
+
+## 19. 首次运行检查清单
+
+在第一次执行 `dispatcher.py once --issue <N> --execute`（3b 手动灰度）前逐项确认；
+任一未勾选则继续使用 `--dry-run`，不要进入真实领取。
+
+- [ ] **`dsh` 可用**：`command -v dsh` 有输出，`dsh --version` 正常；若用 `AGENT_CMD`
+      覆盖，确认该命令可在非交互模式读取 stdin 并返回 JSON。
+- [ ] **`gh` 认证有效**：`gh auth status` 显示当前账号，目标仓库可读（`gh issue view <N>`），
+      且具备 `repo` scope；确认 token 不含多余权限。
+- [ ] **worktree 干净**：`git status --porcelain` 为空，`git worktree list` 无遗留的
+      同名 worktree，`ai/<N>-<slug>` 分支不存在或已确认可安全重建。
+- [ ] **超时已设置**：`.agent/config.yml` 的 `limits.timeout_minutes` 与
+      `dispatcher.agent.timeout_minutes` 一致（默认 90 分钟），并确认超时后
+      `SIGTERM` → 5 分钟 `SIGKILL` 的兜底逻辑生效。
+- [ ] **凭据就绪且不落盘**：`DEEPSEEK_API_KEY` 可从进程环境、权限 600 的
+      `AGENT_ENV_FILE` 或 Keychain 解析；`--execute` 在 claim 前完成校验，日志中无密钥。
+- [ ] **失败回滚已确认**：按 §11 失败矩阵，失败时只杀进程、释放租约并打
+      `status:blocked`；未合并的 `ai/*` 分支/PR 只关闭或清理，**禁止 force push**，
+      绝不 push `main`；合并后的回滚由人类 revert。
+- [ ] **人工合并已就位**：确认至少一位有合并权的人类在观察窗口内可响应；流程只会
+      打 `merge:requested` + `status:awaiting-human`，由人类执行 squash merge，
+      Agent 不合并。
+- [ ] **观察窗口已安排**：首次运行安排在人可盯守的时段，能同时查看
+      `.agent/runs/<N>/agent.log` 与 `gh pr checks`；同类失败连续 2 次即停止并升级。
