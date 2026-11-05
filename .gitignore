@@ -28,6 +28,7 @@ MarketUS.xcodeproj/
 .worktrees/
 .agent/runs/
 .agent/locks/
+.agent/state/
 .agent/cache/
 
 # ---- 本地环境与密钥（永不提交） ----

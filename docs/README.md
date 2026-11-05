@@ -41,6 +41,7 @@
 | [data-sources.md](data-sources.md) | Mock 行情方案、WebSocket 契约、真实源对比 | ✅ |
 | [dependencies.md](dependencies.md) | 依赖白名单、许可证、准入与升级策略 | ✅ |
 | [infrastructure.md](infrastructure.md) | 公开仓库设置、分支规则、Actions 权限、CI 成本 | ✅ |
+| [dispatcher.md](dispatcher.md) | Phase 3 Dispatcher 设计（状态机/租约/AgentRunner/灰度） | ✅ |
 | [implementation-plan.md](implementation-plan.md) | Phase 0→4 落地清单与脚手架代码 | ✅ |
 | [glossary.md](glossary.md) | 术语与标签释义 | ✅ |
 | [adr/](adr/README.md) | 架构决策记录 | ✅ |
