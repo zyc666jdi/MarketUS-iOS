@@ -34,6 +34,8 @@
 2. 打标签：`ai:generated`、`risk:*`、`size:*`。
 3. 移交给 Reviewer：设置 `status:in-review`，在 PR 里 @reviewer-agent。
 4. 请求人类合并 = 打 `merge:requested` + 按模板留言，**不得自行 merge**。
+5. **PR 创建后立即结束进程**：不要轮询 CI、不要等待 checks、不要再改代码。
+   CI 结果由 Dispatcher / 人类处理；继续驻留会被判定为超时。
 
 ## 输出格式（最终消息）
 
