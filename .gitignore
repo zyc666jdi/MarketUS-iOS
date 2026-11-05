@@ -57,6 +57,8 @@ snapshot-failures/
 # ---- Mock market server（Tools/mock-market） ----
 Tools/mock-market/.venv/
 Tools/mock-market/__pycache__/
+__pycache__/
+*.pyc
 Tools/mock-market/.pytest_cache/
 Tools/mock-market/node_modules/
 Tools/mock-market/.env

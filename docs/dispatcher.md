@@ -268,9 +268,11 @@ dispatcher.py status                 # 只读：各状态数量 + 活跃租约
 dispatcher.py plan [--json]          # 只读：列出 ready 票与 DoR 结果
 dispatcher.py once --issue 6         # 手动跑一张票（3b 起）
 dispatcher.py once --issue 6 --dry-run
-dispatcher.py run --interval 300     # 常驻轮询（3c 起）
-dispatcher.py review --pr 4          # 手动触发评审（3c 起）
-dispatcher.py reap                   # 回收过期租约
+dispatcher.py run [--dry-run]        # 单次巡检（launchd 每 5 分钟调用）
+dispatcher.py review --pr 4          # 对单个 PR 运行只读 Reviewer
+dispatcher.py postmerge              # 收尾已合并 PR 对应的 issue
+dispatcher.py run [--dry-run]        # 单次巡检：postmerge → dispatch → review
+dispatcher.py reap                   # 回收过期租约（未实现）
 ```
 
 当前已实现 `status` / `plan` / `once`。`once` 默认 **dry-run**，加 `--execute` 才会领取、建 worktree 并调用 Agent（首次真实运行待验证）。
@@ -309,7 +311,7 @@ dispatcher:
 | --- | --- | --- |
 | **3a 只读** | `status` / `plan`，dry-run，不写 GitHub | 能正确列出/拒绝 ticket |
 | **3b 手动** ✅ | `once --issue N` 跑实现 Agent；人工评审合并 | 已验证（#11 → PR #14） |
-| **3c 常驻** | launchd 每 5 分钟；Reviewer 自动评审；PostMerge 收尾 | 连续 3 张票、2 张一次通过 |
+| **3c 常驻**（已实现） | launchd 每 5 分钟；Reviewer 自动评审；PostMerge 收尾 | 连续 3 张票、2 张一次通过 |
 | **3d 并行** | 2 个 implementer + 路径锁 + 指标 | 无写冲突、无重复领取 |
 
 ## 18. 未决问题
@@ -344,3 +346,23 @@ dispatcher:
       Agent 不合并。
 - [ ] **观察窗口已安排**：首次运行安排在人可盯守的时段，能同时查看
       `.agent/runs/<N>/agent.log` 与 `gh pr checks`；同类失败连续 2 次即停止并升级。
+
+
+## 20. launchd 常驻（3c）
+
+`run` 设计为**单次巡检**，由 launchd 每 5 分钟调用；进程内用 `.agent/state/dispatcher.lock`
+防止重叠。
+
+```bash
+sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
+  Tools/dispatcher/com.marketus.dispatcher.plist.template \
+  > ~/Library/LaunchAgents/com.marketus.dispatcher.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.marketus.dispatcher.plist
+```
+
+单次巡检顺序：`postmerge` → 派发 1 张 ready → 评审 1 个 `status:in-review` 的 PR。
+
+**Reviewer 限制**：Dispatcher 与 PR 作者是同一个 GitHub 账号，GitHub 不允许 approve
+自己的 PR。因此评审通过时写 PR 评论 + 打 `merge:requested` + `status:awaiting-human`，
+不调用 `gh pr review --approve`；人类仍是唯一合并者。评审 Agent 以
+`DSH_PERMISSION_MODE=read-only` 运行，避免修改工作区。

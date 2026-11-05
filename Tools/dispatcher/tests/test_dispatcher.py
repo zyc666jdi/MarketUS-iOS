@@ -43,6 +43,31 @@ class SlugifyTests(unittest.TestCase):
         self.assertLessEqual(len(dispatcher.slugify("a" * 100)), 40)
 
 
+class ParsingTests(unittest.TestCase):
+    def test_extract_issue_from_branch(self):
+        pr = {"headRefName": "ai/17-chore-jsonfilestore", "body": ""}
+        self.assertEqual(dispatcher.extract_issue_number(pr), 17)
+
+    def test_extract_issue_from_body(self):
+        pr = {"headRefName": "feature/x", "body": "Fixes #12"}
+        self.assertEqual(dispatcher.extract_issue_number(pr), 12)
+
+    def test_extract_issue_none(self):
+        self.assertIsNone(dispatcher.extract_issue_number({"headRefName": "main", "body": ""}))
+
+    def test_parse_verdict(self):
+        self.assertEqual(dispatcher.parse_verdict("## Verdict: APPROVE\n"), "APPROVE")
+        self.assertEqual(
+            dispatcher.parse_verdict("## Verdict: REQUEST_CHANGES\n- P1 ..."),
+            "REQUEST_CHANGES",
+        )
+        self.assertIsNone(dispatcher.parse_verdict("no verdict"))
+
+    def test_agent_text_reads_final_event(self):
+        output = '{"type":"status"}\n{"type":"final","text":"OK"}\n'
+        self.assertEqual(dispatcher.agent_text(output), "OK")
+
+
 class CredentialTests(unittest.TestCase):
     def test_env_file_is_loaded(self):
         fd, path = tempfile.mkstemp()

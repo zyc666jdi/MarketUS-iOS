@@ -55,7 +55,7 @@ Dispatcher 只在需要时读取，不打印、不落盘。使用 `AGENT_CMD="co
 | --- | --- |
 | 3a（当前） | `status` / `plan`，只读 |
 | 3b（已实现） | `once --issue N --execute`：claim、worktree、`dsh headless` 实现、校验 PR |
-| 3c | launchd 常驻、Reviewer 自动评审、合并后收尾 |
+| 3c（当前） | `run` 单次巡检、Reviewer 自动评审、合并后收尾、launchd 模板 |
 | 3d | 2 并发 + 路径锁 + 指标 |
 
 ## 自测
@@ -64,3 +64,36 @@ Dispatcher 只在需要时读取，不打印、不落盘。使用 `AGENT_CMD="co
 python3 -m py_compile Tools/dispatcher/dispatcher.py
 python3 Tools/dispatcher/dispatcher.py status
 ```
+
+
+## 3c：巡检与 Reviewer
+
+```bash
+# 单次巡检（postmerge → 派发 1 张 → 评审 1 个 PR）
+python3 Tools/dispatcher/dispatcher.py run --dry-run
+python3 Tools/dispatcher/dispatcher.py run
+
+# 单独评审 / 收尾
+python3 Tools/dispatcher/dispatcher.py review --pr 18 --dry-run
+python3 Tools/dispatcher/dispatcher.py review --pr 18 --execute
+python3 Tools/dispatcher/dispatcher.py postmerge --dry-run
+```
+
+Reviewer 以 `DSH_PERMISSION_MODE=read-only` 运行；因为是同一个 GitHub 账号，
+GitHub 不允许 approve 自己的 PR，所以 Dispatcher 用 **评论 verdict + `merge:requested` 标签**
+表示通过，最终仍由人类合并。
+
+### launchd（不会自动安装）
+
+```bash
+sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
+  Tools/dispatcher/com.marketus.dispatcher.plist.template \
+  > ~/Library/LaunchAgents/com.marketus.dispatcher.plist
+
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.marketus.dispatcher.plist
+launchctl kickstart -k gui/$UID/com.marketus.dispatcher   # 立即跑一次
+launchctl bootout gui/$UID/com.marketus.dispatcher        # 停止
+```
+
+日志：`~/Library/Logs/marketus-dispatcher.log`。
+启用后它会真的领取 `status:ready` 的 ticket；先确认 `.agent/config.yml` 与凭据无误。
