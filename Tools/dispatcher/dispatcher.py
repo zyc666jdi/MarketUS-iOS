@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -497,6 +498,299 @@ def cmd_once(args: argparse.Namespace) -> int:
     return 1
 
 
+
+ISSUE_PATTERN = re.compile(r"(?:Fixes|Closes|Refs)\s*#(\d+)", re.IGNORECASE)
+VERDICT_PATTERN = re.compile(r"##\s*Verdict:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
+
+
+def extract_issue_number(pr: dict[str, Any]) -> int | None:
+    branch = pr.get("headRefName", "")
+    match = re.match(r"(?:ai|human)/(\d+)-", branch)
+    if match:
+        return int(match.group(1))
+    match = ISSUE_PATTERN.search(pr.get("body") or "")
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def parse_verdict(text: str) -> str | None:
+    match = VERDICT_PATTERN.search(text)
+    return match.group(1).upper() if match else None
+
+
+def agent_text(output: str) -> str:
+    """dsh --json 输出 NDJSON；取 final 事件，否则原样返回。"""
+    final: list[str] = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "final" and event.get("text"):
+            final.append(str(event["text"]))
+    return "\n".join(final) if final else output
+
+
+def run_review_agent(prompt: str, run_dir: Path, timeout_minutes: int) -> tuple[str, int]:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+    load_agent_secrets()
+
+    command = agent_command()
+    env = os.environ.copy()
+    env["AGENT_RUN_ID"] = run_dir.name
+    if command and command[0] == "dsh":
+        env["DSH_PERMISSION_MODE"] = "read-only"
+
+    try:
+        result = subprocess.run(
+            command,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout_minutes * 60,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return "reviewer timeout", 1
+    except FileNotFoundError:
+        return f"agent not found: {command[0] if command else '<empty>'}", 1
+
+    (run_dir / "agent.log").write_text(result.stdout, encoding="utf-8")
+    (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
+    return agent_text(result.stdout), result.returncode
+
+
+def comment_pr(number: int, body: str) -> None:
+    gh(["pr", "comment", str(number), "--body", body])
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    pr = gh_json(
+        [
+            "pr",
+            "view",
+            str(args.pr),
+            "--json",
+            "number,title,body,headRefName,headRefOid,state,url,comments",
+        ]
+    )
+    if pr.get("state") != "OPEN":
+        print(f"⛔ PR #{args.pr} 不是 OPEN")
+        return 1
+
+    issue_number = extract_issue_number(pr)
+    if issue_number is None:
+        print("⛔ 无法从分支名/PR body 解析 ticket 编号")
+        return 1
+
+    sha = pr["headRefOid"]
+    marker = f"dispatcher-review pr={args.pr} sha={sha}"
+    for existing in pr.get("comments", []):
+        if marker in (existing.get("body") or ""):
+            print(f"PR #{args.pr} 在 {sha[:8]} 上已评审过，跳过")
+            return 0
+
+    issue = issue_detail(issue_number)
+    diff = gh(["pr", "diff", str(args.pr)]).stdout
+    if len(diff) > 60_000:
+        diff = diff[:60_000] + "\n\n[diff truncated]\n"
+
+    prompt = (
+        Path(".agent/prompts/reviewer.md").read_text(encoding="utf-8")
+        + "\n\n---\n\n"
+        + Path("docs/code-review.md").read_text(encoding="utf-8")
+        + f"\n\n---\n\n# PR #{args.pr}: {pr['title']}\n\n{pr.get('body') or ''}"
+        + f"\n\n---\n\n# Ticket #{issue_number}\n\n{issue.get('body') or ''}"
+        + f"\n\n---\n\n# Diff\n\n```diff\n{diff}\n```\n"
+    )
+
+    print(f"PR       #{args.pr} {pr['title']}")
+    print(f"ticket   #{issue_number}")
+    print(f"sha      {sha[:8]}")
+    print(f"diff     {len(diff)} chars")
+    print(f"agent    {' '.join(agent_command())}")
+
+    if not args.execute:
+        print("\n(dry-run) 未调用 Reviewer；加 --execute 执行。")
+        return 0
+
+    run_dir = RUN_ROOT / f"review-{args.pr}"
+    text, code = run_review_agent(prompt, run_dir, args.timeout)
+    verdict = parse_verdict(text)
+    print(f"verdict  {verdict or 'MISSING'} (exit={code})")
+
+    if verdict is None:
+        comment_pr(
+            args.pr,
+            f"## ⛔ Dispatcher Review 未能给出 verdict\n\n日志：`.agent/runs/review-{args.pr}/`\n\n"
+            f"<!-- {marker} verdict=MISSING -->",
+        )
+        gh(["issue", "edit", str(issue_number), "--remove-label", "status:in-review", "--add-label", "status:blocked"])
+        return 1
+
+    body = (
+        f"{text}\n\n---\n\n"
+        f"<!-- {marker} verdict={verdict} -->\n"
+        f"评审日志：`.agent/runs/review-{args.pr}/`\n"
+    )
+    comment_pr(args.pr, body)
+
+    if verdict == "APPROVE":
+        gh(["pr", "edit", str(args.pr), "--add-label", "merge:requested"])
+        gh(
+            [
+                "issue",
+                "edit",
+                str(issue_number),
+                "--remove-label",
+                "status:in-review",
+                "--add-label",
+                "status:awaiting-human",
+            ]
+        )
+        print("✅ APPROVE — 已请求人工合并")
+        return 0
+
+    gh(
+        [
+            "issue",
+            "edit",
+            str(issue_number),
+            "--remove-label",
+            "status:in-review",
+            "--add-label",
+            "status:in-progress",
+        ]
+    )
+    print("⛔ REQUEST_CHANGES — 已退回实现")
+    return 1
+
+
+def cmd_postmerge(args: argparse.Namespace) -> int:
+    prs = gh_json(
+        [
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--limit",
+            "50",
+            "--json",
+            "number,title,body,headRefName,url",
+        ]
+    )
+    changed = 0
+    for pr in prs:
+        issue_number = extract_issue_number(pr)
+        if issue_number is None:
+            continue
+        try:
+            issue = issue_detail(issue_number)
+        except SystemExit:
+            continue
+        labels = labels_of(issue)
+        if "status:done" in labels:
+            continue
+        print(f"merged PR #{pr['number']} → issue #{issue_number}")
+        if args.dry_run:
+            continue
+        gh(
+            [
+                "issue",
+                "edit",
+                str(issue_number),
+                "--remove-label",
+                "status:awaiting-human",
+                "--remove-label",
+                "status:in-review",
+                "--remove-label",
+                "status:blocked",
+                "--add-label",
+                "status:done",
+            ]
+        )
+        gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}"])
+        branch = pr.get("headRefName", "")
+        if "/" in branch:
+            worktree = WORKTREE_ROOT / branch.split("/", 1)[1]
+            if worktree.exists():
+                run(["git", "worktree", "remove", str(worktree), "--force"])
+        changed += 1
+    print(f"postmerge: {changed} issue(s) updated")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    state_dir = Path(".agent/state")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "dispatcher.lock"
+    lock = lock_path.open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("另一个 Dispatcher 正在运行，跳过本轮")
+        return 0
+
+    try:
+        cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
+
+        ready = sorted(list_issues("status:ready"), key=lambda issue: (priority_rank(issue), issue["number"]))
+        for issue in ready:
+            failures = validate(issue)
+            if failures:
+                continue
+            print(f"dispatch #{issue['number']} {issue['title']}")
+            cmd_once(
+                argparse.Namespace(
+                    issue=issue["number"],
+                    execute=not args.dry_run,
+                    timeout=args.timeout,
+                )
+            )
+            break
+
+        prs = gh_json(
+            [
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "20",
+                "--json",
+                "number,body,headRefName,isDraft",
+            ]
+        )
+        for pr in prs:
+            if pr.get("isDraft") or not pr.get("headRefName", "").startswith("ai/"):
+                continue
+            issue_number = extract_issue_number(pr)
+            if issue_number is None:
+                continue
+            try:
+                issue = issue_detail(issue_number)
+            except SystemExit:
+                continue
+            if "status:in-review" not in labels_of(issue):
+                continue
+            print(f"review PR #{pr['number']} (issue #{issue_number})")
+            cmd_review(
+                argparse.Namespace(
+                    pr=pr["number"],
+                    execute=not args.dry_run,
+                    timeout=args.timeout,
+                )
+            )
+            break
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MarketUS Dispatcher (Phase 3a, read-only)")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -511,6 +805,18 @@ def main() -> int:
     once_parser.add_argument("--execute", action="store_true", help="真正领取并调用 Agent")
     once_parser.add_argument("--timeout", type=int, default=90, help="Agent 超时（分钟）")
 
+    review_parser = subparsers.add_parser("review", help="对 PR 运行只读 Reviewer（默认 dry-run）")
+    review_parser.add_argument("--pr", type=int, required=True)
+    review_parser.add_argument("--execute", action="store_true")
+    review_parser.add_argument("--timeout", type=int, default=30)
+
+    postmerge_parser = subparsers.add_parser("postmerge", help="收尾已合并 PR 对应的 issue")
+    postmerge_parser.add_argument("--dry-run", action="store_true")
+
+    run_parser = subparsers.add_parser("run", help="单次巡检：postmerge → dispatch → review")
+    run_parser.add_argument("--dry-run", action="store_true")
+    run_parser.add_argument("--timeout", type=int, default=90)
+
     args = parser.parse_args()
     if args.command == "status":
         return cmd_status(args)
@@ -518,6 +824,12 @@ def main() -> int:
         return cmd_plan(args)
     if args.command == "once":
         return cmd_once(args)
+    if args.command == "review":
+        return cmd_review(args)
+    if args.command == "postmerge":
+        return cmd_postmerge(args)
+    if args.command == "run":
+        return cmd_run(args)
     parser.print_help()
     return 2
 
