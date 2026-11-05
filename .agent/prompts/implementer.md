@@ -22,7 +22,11 @@
 ## 提交前
 
 按 `/AGENTS.md` 的《提交前自检》逐项执行并在运行日志中记录真实输出。
-`make verify` 必须全绿。任何一项失败不得提交 PR。
+
+- 有 Simulator.app 的本地环境：`make verify` 必须全绿。
+- Headless / CI：运行 `make build` + `make test-package`；UI 测试仅在 Simulator.app
+  已启动时运行，否则在 PR 中标注「UI 未跑」，**不要等待或伪造通过**。
+- 构建/测试任一项真实失败，不得提交 PR。
 
 ## 提交后
 

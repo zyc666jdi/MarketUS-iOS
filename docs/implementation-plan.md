@@ -214,7 +214,7 @@ verify: lint build test coverage
 
 ## Phase 3 · 激活 Agent 工作流
 
-> 状态：3a（设计 + 只读 `status`/`plan`）已落地；3b（`once --issue`，默认 dry-run）已实现，待首次真实运行。
+> 状态：3a 已落地；3b 已验证（首次真实运行 #11 → PR #14，2026-11-05）；3c 待启动。
 
 ### 任务
 

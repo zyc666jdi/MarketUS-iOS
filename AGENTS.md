@@ -240,6 +240,8 @@ gh issue edit 123 --add-label "status:awaiting-human"
 - bug 修复 = 必须包含**先失败后通过**的回归测试。
 - 禁止：`sleep` 等待、依赖真实网络、依赖当前时间/时区、依赖执行顺序。
 - 网络测试用 `URLProtocol` stub；时间用注入的 `MarketClock`；持久化用内存容器。
+- Headless/CI 环境只跑 `make build` + `make test-package`；UI 测试需要 Simulator.app，
+  未启动时在 PR 标注「UI 未跑」，不得声称已通过。
 - 断言必须有效：禁止 `XCTAssertNotNil` 了事，禁止对快照设置过宽容差。
 - 覆盖率：变更行 ≥ 80%，模块 ≥ 70%，**不得下降**。
 - 测试命名：`test_<行为>_<条件>_<预期>()`。
