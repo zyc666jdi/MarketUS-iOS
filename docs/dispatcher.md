@@ -144,13 +144,35 @@ printf '%s' "$PROMPT" | dsh --profile headless --json > .agent/runs/6/agent.json
 
 | 项 | 约定 |
 | --- | --- |
-| 入口 | `dsh --profile headless --json`（stdin 传 prompt，避免 argv 长度限制） |
+| 入口 | 默认 `dsh --profile headless --json`；可用 `AGENT_CMD` 覆盖（stdin 传 prompt） |
 | 超时 | 90 分钟；超时 `SIGTERM` → 5 分钟后 `SIGKILL` |
-| 环境 | 仅 `PATH/HOME/LANG/TZ` + `GH_TOKEN`（细粒度）+ `AGENT_RUN_ID/TICKET` |
+| 环境 | 继承当前进程环境（含 `GH_TOKEN`）+ `AGENT_RUN_ID/TICKET`；`dsh` 额外解析 `DEEPSEEK_API_KEY` |
 | 工作目录 | worktree；禁止在主工作区执行 |
 | 会话 | implementer 每次新会话；修复轮次用 `--session-id` 恢复（需要时） |
 | 退出码 | 仅作参考；以 `git`/`gh` 实际结果为准 |
-| 产物 | `.agent/runs/<issue>/agent.jsonl`、`final.md`、`git diff` |
+| 产物 | `.agent/runs/<issue>/agent.log`、`prompt.md`、`git diff` |
+
+**凭据解析（`dsh` 入口）**
+
+`dsh headless` 在 bundle 里显式禁用了交互式凭据存储：
+
+```yaml
+# @deepseek-ai/dsh-headless/cordis.patch.yml
+- id: credentials
+  disabled: true
+- id: authorization
+  disabled: true
+- id: deepseek-account
+  disabled: true
+```
+
+因此它只接受启动时注入的 `DEEPSEEK_API_KEY`。Dispatcher 按以下顺序解析（只写入子进程环境，不打印、不落盘）：
+
+1. 当前进程环境变量 `DEEPSEEK_API_KEY`
+2. `AGENT_ENV_FILE`（默认 `~/.config/marketUS/deepseek.env`，权限必须 600）
+3. macOS Keychain：`security find-generic-password -s DEEPSEEK_API_KEY -w`
+
+缺失时 `--execute` 会在 claim 之前退出，不会留下 blocked 状态。使用 `AGENT_CMD`（例如 `codex exec ...`）时不需要该 key。
 
 **评审 Agent**（独立、只读）：
 
@@ -263,6 +285,7 @@ dispatcher:
   max_daily_tickets: 12
   agent:
     command: ["dsh", "--profile", "headless", "--json"]
+    env_file: "~/.config/marketUS/deepseek.env"   # 600；不要提交
     timeout_minutes: 90
     max_attempts: 2
   reviewer:

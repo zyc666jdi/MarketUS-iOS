@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -39,6 +41,30 @@ class SlugifyTests(unittest.TestCase):
 
     def test_truncates(self):
         self.assertLessEqual(len(dispatcher.slugify("a" * 100)), 40)
+
+
+class CredentialTests(unittest.TestCase):
+    def test_env_file_is_loaded(self):
+        fd, path = tempfile.mkstemp()
+        os.write(fd, b"DEEPSEEK_API_KEY=sk-test\n")
+        os.close(fd)
+        os.chmod(path, 0o600)
+
+        old_key = os.environ.pop("DEEPSEEK_API_KEY", None)
+        old_file = os.environ.get("AGENT_ENV_FILE")
+        os.environ["AGENT_ENV_FILE"] = path
+        try:
+            dispatcher.load_agent_secrets()
+            self.assertEqual(os.environ.get("DEEPSEEK_API_KEY"), "sk-test")
+        finally:
+            os.remove(path)
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+            if old_key is not None:
+                os.environ["DEEPSEEK_API_KEY"] = old_key
+            if old_file is None:
+                os.environ.pop("AGENT_ENV_FILE", None)
+            else:
+                os.environ["AGENT_ENV_FILE"] = old_file
 
 
 class ValidateTests(unittest.TestCase):
