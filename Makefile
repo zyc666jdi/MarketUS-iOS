@@ -2,6 +2,7 @@ SHELL := /bin/bash
 
 SCHEME  := MarketUS
 DEST    ?= platform=iOS Simulator,name=iPhone 16
+BUILD_DEST ?= generic/platform=iOS Simulator
 PACKAGE := Packages/MarketUSKit
 RESULT  := TestResults/MarketUS.xcresult
 
@@ -24,7 +25,7 @@ test-package:
 	swift test --package-path $(PACKAGE)
 
 build: bootstrap
-	xcodebuild -scheme $(SCHEME) -destination '$(DEST)' build CODE_SIGNING_ALLOWED=NO
+	xcodebuild -scheme $(SCHEME) -destination '$(BUILD_DEST)' build CODE_SIGNING_ALLOWED=NO
 
 test: bootstrap
 	rm -rf $(RESULT)
