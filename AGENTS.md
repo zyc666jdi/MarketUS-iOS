@@ -165,6 +165,7 @@ gh issue edit 123 --add-label "status:in-review"
 ```
 
 PR body 必须使用 `.github/PULL_REQUEST_TEMPLATE.md` 并填满所有必填段。
+PR 创建后**立即结束本次运行**，不要轮询 CI checks；CI 由 Dispatcher 与人类处理。
 **禁止**自己给自己批准、自己 resolve 评审意见。
 
 ### 4.9 移交评审 → 请求人工合并

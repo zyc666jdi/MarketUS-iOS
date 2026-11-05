@@ -151,6 +151,7 @@ printf '%s' "$PROMPT" | dsh --profile headless --json > .agent/runs/6/agent.json
 | 会话 | implementer 每次新会话；修复轮次用 `--session-id` 恢复（需要时） |
 | 退出码 | 仅作参考；以 `git`/`gh` 实际结果为准 |
 | 产物 | `.agent/runs/<issue>/agent.log`、`prompt.md`、`git diff` |
+| 生命周期 | 开 PR 后立即退出；不轮询 CI，不驻留等待 |
 
 **凭据解析（`dsh` 入口）**
 
