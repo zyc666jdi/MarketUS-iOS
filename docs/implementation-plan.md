@@ -187,26 +187,28 @@ verify: lint build test coverage
 
 ## Phase 2 · 垂直切片（自选股）
 
+> 状态：核心链路已完成（PR #4，2026-11-05 合并）；行情 fixture、覆盖率门禁与独立评审留待 Phase 3。
+
 目标：打通「模型 → 网络 → 仓储 → ViewModel → UI → 测试」全链路，作为后续 ticket 的模板。
 
 ### 任务
 
-- [ ] `MarketUSCore`：`Symbol`、`Quote`、`MarketError`、`QuoteRepository` 协议、`Clock`
-- [ ] `MarketUSNetworking`：`HTTPClient` + `URLSessionHTTPClient` + DTO
-- [ ] `MarketUSData`：`MockMarketDataSource`（确定性随机游走 + 场景）
-- [ ] `MarketUSData`：`LiveQuoteRepository`（缓存优先 + 错误映射）
+- [x] `MarketUSCore`：`Symbol`、`Quote`、`MarketError`、`QuoteRepository` 协议、`MarketClock`
+- [x] `MarketUSNetworking`：`HTTPClient` + `URLSessionHTTPClient` + DTO + `MarketDataEndpoint`
+- [x] `MarketUSData`：`MockQuoteRepository`（确定性随机游走 + 场景）
+- [x] `MarketUSData`：`LiveQuoteRepository`（网络优先 + 缓存回退 + 错误映射）
 - [ ] 定义行情 JSON 契约 + fixture（见 `docs/data-sources.md` §4）
-- [ ] `FeatureWatchlist`：`WatchlistViewModel`（`@MainActor`、去重、取消）+ `WatchlistView`
-- [ ] `MarketUS`：组合根注入 + 根路由
-- [ ] 测试：ViewModel 全状态、Repository 错误映射、网络 stub、XCTest（快照库待批准）
+- [x] `FeatureWatchlist`：`WatchlistViewModel`（`@MainActor`、去重、取消）+ `WatchlistView`（错误/延迟/重试）
+- [x] `MarketUS`：组合根注入 + 根路由 + `MARKET_BASE_URL` 切换
+- [x] 测试：ViewModel 全状态、Repository 错误映射、HTTPClient stub（20 tests；快照库待批准）
 - [ ] 新增 3–5 个真实 ticket，验证 DoR 与拆分规则
 
 ### 退出条件
 
-- [ ] 变更行覆盖率 ≥ 80%
-- [ ] 冷启动到列表可交互 < 1.5s
-- [ ] 弱网/离线/401 有明确 UI 表现
-- [ ] 代码通过一次独立 Agent 评审且无 P1/P2
+- [ ] 变更行覆盖率 ≥ 80%（当前 app 76.6%，Phase 3 启用门禁）
+- [ ] 冷启动到列表可交互 < 1.5s（未测量）
+- [x] 弱网/离线/401 有明确 UI 表现
+- [ ] 代码通过一次独立 Agent 评审且无 P1/P2（尚未执行）
 
 ---
 

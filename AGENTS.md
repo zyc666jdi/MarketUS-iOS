@@ -77,6 +77,7 @@ make build       # iOS Simulator Debug 构建
 make test        # 单元测试（快照测试在 Phase 2 批准后加入）
 make verify      # lint + 包测试 + build + UI 测试 + 覆盖率报告（提交前必跑）
 make secret-scan # gitleaks 本地扫描（CI 由 GitHub secret scanning 兜底）
+make simulator-stop # 关闭模拟器，避免模拟器内 mediaanalysisd 空转占用 CPU
 ```
 
 > **环境现状（已验证）**：Xcode 26.6 + iOS 26.5 模拟器，`make verify` 全绿（lint +

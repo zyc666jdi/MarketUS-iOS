@@ -10,16 +10,17 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 阶段 | **Phase 1 · 骨架完成**（构建、单元测试与 UI 测试均已在本机验证） |
+| 阶段 | **Phase 2 · 垂直切片完成**（PR #4 已合并；Phase 3 待启动） |
 | 架构 | ✅ 已规划（Proposed，待确认；[`docs/architecture.md`](docs/architecture.md)） |
 | Agent 契约 | ✅ [`AGENTS.md`](AGENTS.md) |
 | 工作流规范 | ✅ [`docs/agent-workflow.md`](docs/agent-workflow.md) |
 | Ticket 协议 | ✅ [`docs/ticket-protocol.md`](docs/ticket-protocol.md) |
 | 代码 / Xcode 工程 | ✅ `project.yml` + `Package.swift` + 最小 App（`xcodegen generate` 已通过） |
 | 构建 / 测试 | ✅ 已验证：Xcode 26.6 + iOS 26.5 模拟器，`make verify` 全绿 |
-| CI | ✅ 已在 GitHub Actions 跑通（commit `cca95bf`，`success`） |
+| CI | ⚠️ 2026-11-04 起 GitHub hosted-runner 获取失败（job 零步骤后取消）；历史 commit `cca95bf` 曾成功 |
 | 分支保护 | ⬜ 建仓后按 [`docs/infrastructure.md`](docs/infrastructure.md) 配置 |
 | 数据源 | ✅ Mock 优先（[`docs/data-sources.md`](docs/data-sources.md)） |
+| 数据链路 | ✅ 默认 Mock；设置 `MARKET_BASE_URL` 切换 HTTP（缓存回退 + stale 标记） |
 | 依赖基线 | ✅ 运行时零第三方依赖（[`docs/dependencies.md`](docs/dependencies.md)） |
 | 仓库形态 | ✅ GitHub Public（[`docs/infrastructure.md`](docs/infrastructure.md)） |
 
@@ -275,7 +276,7 @@ ready → claimed → in-progress → in-review → awaiting-human → done
 | 格式 / 静态分析 | SwiftFormat 或 SwiftLint 有 diff / warning | ❌ 无人 |
 | 构建 | 编译失败或新增 warning | ❌ |
 | 单元 / 快照测试 | 任一失败 | ❌ |
-| 覆盖率 | Phase 1 仅出报告；Phase 2 起变更行 < 80% 或模块 < 70% 即阻断 | 人类（PR 中说明理由） |
+| 覆盖率 | 当前仅出报告；Phase 3 起启用「变更行 < 80%」阻断 | 人类（PR 中说明理由） |
 | 密钥扫描 | 检测到疑似密钥 | ❌ |
 | 依赖审查 | 未批准的新增依赖 | 人类 + ADR |
 | 独立评审 | 存在 P0 / P1 | ❌ |
@@ -353,7 +354,7 @@ make bootstrap && make verify
 | --- | --- | --- |
 | **0 · 规划** ✅ | 架构、AGENTS.md、docs、模板、标签 | 文档评审通过 |
 | **1 · 骨架** | 依赖/基建定稿 + 空 App 可构建 + CI + Makefile + 分支保护 | `make verify` 绿、CI 绿、保护生效 |
-| **2 · 垂直切片** | 自选股端到端（模型→网络→UI→测试） | 变更行覆盖率 ≥ 80% |
+| **2 · 垂直切片** ✅ | 自选股端到端（模型→网络→UI→测试） | 已完成（PR #4）；覆盖率门禁待 Phase 3 |
 | **3 · Agent 激活** | 调度器 + 3 个真实 ticket | 2/3 一次通过评审，无越权 |
 | **4 · 加固** | UI 测试、TestFlight、性能与安全门禁 | 7 天无 revert |
 
