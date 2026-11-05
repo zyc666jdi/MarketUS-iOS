@@ -250,7 +250,7 @@ dispatcher.py review --pr 4          # 手动触发评审（3c 起）
 dispatcher.py reap                   # 回收过期租约
 ```
 
-当前骨架只实现 `status` 与 `plan`（只读）。
+当前已实现 `status` / `plan` / `once`。`once` 默认 **dry-run**，加 `--execute` 才会领取、建 worktree 并调用 Agent（首次真实运行待验证）。
 
 ## 15. 配置（拟议）
 
@@ -284,7 +284,7 @@ dispatcher:
 | 阶段 | 内容 | 退出条件 |
 | --- | --- | --- |
 | **3a 只读** | `status` / `plan`，dry-run，不写 GitHub | 能正确列出/拒绝 ticket |
-| **3b 手动** | `once --issue N` 跑实现 Agent；人工评审合并 | 1 张票端到端跑通 |
+| **3b 手动** | `once --issue N` 跑实现 Agent；人工评审合并 | 代码已实现（dry-run 通过）；待 1 张票端到端跑通 |
 | **3c 常驻** | launchd 每 5 分钟；Reviewer 自动评审；PostMerge 收尾 | 连续 3 张票、2 张一次通过 |
 | **3d 并行** | 2 个 implementer + 路径锁 + 指标 | 无写冲突、无重复领取 |
 

@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 STATUS_LABELS = [
@@ -57,6 +60,44 @@ SUSPICIOUS_PATTERNS = [
 ]
 
 ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url"
+
+TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+WORKTREE_ROOT = Path(".worktrees")
+RUN_ROOT = Path(".agent/runs")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def make_run_id(issue: int) -> str:
+    return f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{issue}"
+
+
+def slugify(title: str, limit: int = 40) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return (slug[:limit].strip("-") or "ticket")
+
+
+def gh(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = run(["gh", *args])
+    if check and result.returncode != 0:
+        raise SystemExit(f"gh {' '.join(args)} failed: {result.stderr.strip()}")
+    return result
+
+
+def cmd(args: list[str]) -> None:
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"{' '.join(args)} failed: {result.stderr.strip()}")
+
+
+def issue_detail(number: int) -> dict[str, Any]:
+    return gh_json(["api", f"repos/{repo_slug()}/issues/{number}"])
+
+
+def comment(number: int, body: str) -> None:
+    gh(["issue", "comment", str(number), "--body", body])
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -127,8 +168,8 @@ def validate(issue: dict[str, Any]) -> list[str]:
     if not section(body, "范围外"):
         failures.append("缺少「范围外」段落")
 
-    if "affected_paths" not in body.lower():
-        failures.append("缺少 affected_paths")
+    if "affected_paths" not in body.lower() and not section(body, "预期受影响路径"):
+        failures.append("缺少 affected_paths / 预期受影响路径")
 
     if "security:suspicious" in names:
         failures.append("标记为 security:suspicious")
@@ -222,6 +263,144 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def build_prompt(issue: dict[str, Any], worktree: Path, branch: str) -> str:
+    implementer = Path(".agent/prompts/implementer.md").read_text(encoding="utf-8")
+    contract = Path("AGENTS.md").read_text(encoding="utf-8")
+    body = issue.get("body") or ""
+    return f"""{implementer}
+
+---
+
+{contract}
+
+---
+
+# Ticket #{issue['number']}: {issue['title']}
+
+{body}
+
+---
+
+# Run constraints
+
+- 工作目录：`{worktree}`（不得在主工作区修改）
+- 分支：`{branch}`
+- 超时：见 dispatcher；超过即会被终止
+- 禁止：合并 PR、push `main`、修改受保护路径、跳过测试
+- 完成后：按 PR 模板填写证据，并确保 `make verify` 通过
+"""
+
+
+def cmd_once(args: argparse.Namespace) -> int:
+    number = args.issue
+    issue = issue_detail(number)
+    labels = labels_of(issue)
+    failures = validate(issue)
+
+    if issue.get("state") != "open":
+        failures.append("issue 不是 open 状态")
+    if "pull_request" in issue:
+        failures.append("这是 PR，不是 issue")
+    if issue.get("author_association") not in TRUSTED_ASSOCIATIONS:
+        failures.append(f"作者不可信：{issue.get('author_association')}")
+    if "status:ready" not in labels:
+        failures.append("缺少 status:ready（可能已被领取或未就绪）")
+
+    if failures:
+        print(f"⛔ #{number} 未通过 DoR/准入：")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+
+    slug = slugify(issue["title"])
+    branch = f"ai/{number}-{slug}"
+    worktree = WORKTREE_ROOT / f"{number}-{slug}"
+    prompt = build_prompt(issue, worktree, branch)
+
+    print(f"ticket   #{number} {issue['title']}")
+    print(f"branch   {branch}")
+    print(f"worktree {worktree}")
+    print(f"prompt   {len(prompt)} chars")
+    print("agent    dsh --profile headless --json")
+
+    if not args.execute:
+        print("\n(dry-run) 未写入 GitHub、未创建 worktree、未调用 Agent；加 --execute 执行。")
+        return 0
+
+    if worktree.exists():
+        print(f"⛔ worktree 已存在：{worktree}")
+        return 1
+
+    run_id = make_run_id(number)
+    gh(["issue", "edit", str(number), "--remove-label", "status:ready", "--add-label", "status:claimed"])
+    comment(
+        number,
+        f"🤖 claimed\n\n- run: `{run_id}`\n- at: `{now_iso()}`\n- branch: `{branch}`",
+    )
+    after = issue_detail(number)
+    if "status:claimed" not in labels_of(after):
+        print("⛔ 领取回读失败（可能被其他实例抢占）")
+        return 1
+
+    try:
+        cmd(["git", "fetch", "origin", "main"])
+        cmd(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
+    except SystemExit as error:
+        gh(["issue", "edit", str(number), "--remove-label", "status:claimed"])
+        comment(number, f"⛔ 创建 worktree 失败：{error}")
+        return 1
+
+    gh(["issue", "edit", str(number), "--add-label", "status:in-progress"])
+
+    run_dir = RUN_ROOT / str(number)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+
+    env = os.environ.copy()
+    env["AGENT_RUN_ID"] = run_id
+    env["TICKET_NUMBER"] = str(number)
+
+    timeout_seconds = args.timeout * 60
+    try:
+        result = subprocess.run(
+            ["dsh", "--profile", "headless", "--json"],
+            input=prompt,
+            text=True,
+            cwd=str(worktree),
+            capture_output=True,
+            timeout=timeout_seconds,
+            env=env,
+        )
+        (run_dir / "agent.jsonl").write_text(result.stdout, encoding="utf-8")
+        (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
+        agent_failed = result.returncode != 0
+    except subprocess.TimeoutExpired:
+        gh(["issue", "edit", str(number), "--remove-label", "status:in-progress", "--add-label", "status:blocked"])
+        comment(number, f"⛔ Agent 超时（{args.timeout} 分钟）。日志：`.agent/runs/{number}/`")
+        return 1
+    except FileNotFoundError:
+        raise SystemExit("找不到 dsh，请确认 PATH 中有 dsh")
+
+    prs = json.loads(
+        run(["gh", "pr", "list", "--head", branch, "--json", "number,url,title", "--limit", "1"]).stdout or "[]"
+    )
+    gh(["issue", "edit", str(number), "--remove-label", "status:in-progress"])
+
+    if prs:
+        pr = prs[0]
+        gh(["issue", "edit", str(number), "--add-label", "status:in-review"])
+        comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
+        print(f"PR: {pr['url']}")
+        return 0
+
+    gh(["issue", "edit", str(number), "--add-label", "status:blocked"])
+    reason = "Agent 退出码非 0" if agent_failed else "未检测到 PR"
+    comment(number, f"⛔ {reason}。worktree: `{worktree}`，日志：`.agent/runs/{number}/`")
+    print(f"⛔ {reason}")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MarketUS Dispatcher (Phase 3a, read-only)")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -231,11 +410,18 @@ def main() -> int:
     plan_parser = subparsers.add_parser("plan", help="列出 ready ticket 并校验 DoR")
     plan_parser.add_argument("--json", action="store_true", help="输出 JSON")
 
+    once_parser = subparsers.add_parser("once", help="手动派发一张 ticket（默认 dry-run）")
+    once_parser.add_argument("--issue", type=int, required=True, help="issue number")
+    once_parser.add_argument("--execute", action="store_true", help="真正领取并调用 Agent")
+    once_parser.add_argument("--timeout", type=int, default=90, help="Agent 超时（分钟）")
+
     args = parser.parse_args()
     if args.command == "status":
         return cmd_status(args)
     if args.command == "plan":
         return cmd_plan(args)
+    if args.command == "once":
+        return cmd_once(args)
     parser.print_help()
     return 2
 

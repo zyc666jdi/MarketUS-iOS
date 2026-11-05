@@ -214,7 +214,7 @@ verify: lint build test coverage
 
 ## Phase 3 · 激活 Agent 工作流
 
-> 状态：3a（设计 + 只读 `status`/`plan`）已落地（PR #7）；3b（`once --issue` 调用 `dsh headless`）待启动。
+> 状态：3a（设计 + 只读 `status`/`plan`）已落地；3b（`once --issue`，默认 dry-run）已实现，待首次真实运行。
 
 ### 任务
 
