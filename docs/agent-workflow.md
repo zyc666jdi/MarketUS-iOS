@@ -270,3 +270,6 @@ worktree（物理隔离）。合并冲突由后合并者解决，且必须重跑
 
 **建议路径**：Phase 1 用「人工触发 + 单 Agent」跑通 3 个真实 ticket，Phase 2 再上定时
 调度与双并发。不要一开始就追求全自动。
+
+具体实现方案（本地 daemon + `dsh headless`、租约协议、失败矩阵）见
+[`dispatcher.md`](dispatcher.md)。

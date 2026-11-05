@@ -45,3 +45,4 @@ docs/adr/NNNN-<kebab-case-title>.md
 | [0002](0002-agent-model.md) | AI Agent 运营模型（有写权、无合并权） | Proposed |
 | [0003](0003-market-data.md) | 行情数据策略：Mock 优先，真实源可选 | Proposed |
 | [0004](0004-dependencies.md) | 依赖基线：运行时零第三方依赖 | Proposed |
+| [0005](0005-dispatcher-architecture.md) | Dispatcher：本地守护进程 + dsh headless | Proposed |

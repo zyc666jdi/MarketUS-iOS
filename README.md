@@ -300,6 +300,7 @@ ready → claimed → in-progress → in-review → awaiting-human → done
 | CI 有哪些必需检查 | [`docs/ci-cd.md`](docs/ci-cd.md) |
 | 安全红线、注入防护、行情合规 | [`docs/security-and-compliance.md`](docs/security-and-compliance.md) |
 | 行情数据从哪来、Mock 怎么设计 | [`docs/data-sources.md`](docs/data-sources.md) |
+| Dispatcher 怎么设计、怎么跑 | [`docs/dispatcher.md`](docs/dispatcher.md) · [`Tools/dispatcher`](Tools/dispatcher/README.md) |
 | 能不能引某个库、怎么升级 | [`docs/dependencies.md`](docs/dependencies.md) |
 | 仓库怎么配、Actions 权限、CI 成本 | [`docs/infrastructure.md`](docs/infrastructure.md) |
 | 从零到跑通要做哪些事 | [`docs/implementation-plan.md`](docs/implementation-plan.md) |
