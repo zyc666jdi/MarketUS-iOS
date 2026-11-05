@@ -5,7 +5,7 @@ DEST    ?= platform=iOS Simulator,name=iPhone 16
 PACKAGE := Packages/MarketUSKit
 RESULT  := TestResults/MarketUS.xcresult
 
-.PHONY: bootstrap lint format build test test-package coverage secret-scan verify clean
+.PHONY: bootstrap lint format build test test-package coverage secret-scan verify simulator-stop clean
 
 bootstrap:
 	@command -v xcodegen >/dev/null 2>&1 || { echo "缺少 xcodegen：请先运行 brew bundle"; exit 1; }
@@ -40,6 +40,13 @@ secret-scan:
 
 verify: lint test-package build test coverage
 	@echo "✅ verify 通过（lint + package tests + build + UI test + coverage 报告）"
+
+simulator-stop:
+	@xcrun simctl shutdown all 2>/dev/null; \
+	if pgrep -x Simulator >/dev/null 2>&1; then \
+		osascript -e 'tell application "Simulator" to quit' >/dev/null 2>&1; \
+	fi; \
+	echo "✅ 模拟器已关闭（避免模拟器内 mediaanalysisd 空转占用 CPU）"
 
 clean:
 	rm -rf build DerivedData TestResults coverage-report.txt
