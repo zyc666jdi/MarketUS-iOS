@@ -116,4 +116,4 @@ Implementer 在 PR 分支的临时 worktree 修复、push，issue 回到 `status
 ## 漏审兜底
 
 `run` 会补审满足以下条件的 PR：`ai/*`、issue 为 `status:in-progress`、
-没有 `dispatcher-review` 标记、创建超过 10 分钟。用于手动创建或标签未更新的 PR。
+当前 head 没有 `dispatcher-review` 标记、创建超过 10 分钟（严格大于）。用于手动创建或标签未更新的 PR。
