@@ -1,6 +1,6 @@
-import XCTest
 @testable import FeatureWatchlist
 @testable import MarketUSCore
+import XCTest
 
 @MainActor
 final class WatchlistViewModelTests: XCTestCase {
@@ -80,7 +80,7 @@ private final class StubQuoteRepository: QuoteRepository, @unchecked Sendable {
         self.result = result
     }
 
-    func quotes(for symbols: [Symbol]) async throws -> [Quote] {
+    func quotes(for _: [Symbol]) async throws -> [Quote] {
         callCount += 1
         return try result.get()
     }

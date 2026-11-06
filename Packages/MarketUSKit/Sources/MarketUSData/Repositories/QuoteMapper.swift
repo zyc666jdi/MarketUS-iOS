@@ -8,7 +8,8 @@ enum QuoteMapper {
         guard let price = decimal(dto.price),
               let change = decimal(dto.change),
               let changePercent = decimal(dto.changePercent),
-              let timestamp = date(from: dto.ts) else {
+              let timestamp = date(from: dto.ts)
+        else {
             throw MarketError.decoding
         }
         return Quote(

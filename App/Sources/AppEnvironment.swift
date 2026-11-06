@@ -14,7 +14,8 @@ struct AppEnvironment: Sendable {
     /// （本地 Mock Server 或 Alpaca 适配器）。
     private static func make() -> AppEnvironment {
         guard let rawBaseURL = ProcessInfo.processInfo.environment["MARKET_BASE_URL"],
-              let baseURL = URL(string: rawBaseURL) else {
+              let baseURL = URL(string: rawBaseURL)
+        else {
             return AppEnvironment(quoteRepository: MockQuoteRepository())
         }
 

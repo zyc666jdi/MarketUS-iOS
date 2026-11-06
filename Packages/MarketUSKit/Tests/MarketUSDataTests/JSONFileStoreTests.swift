@@ -1,5 +1,5 @@
-import XCTest
 @testable import MarketUSPersistence
+import XCTest
 
 final class JSONFileStoreTests: XCTestCase {
     func test_write_thenRead_returnsSameValue() throws {

@@ -1,8 +1,8 @@
 import Foundation
-import XCTest
 @testable import MarketUSCore
 @testable import MarketUSData
 @testable import MarketUSPersistence
+import XCTest
 
 final class QuoteCacheTests: XCTestCase {
     private let fixedDate = Date(timeIntervalSince1970: 1_700_000_000)

@@ -9,5 +9,7 @@ public protocol MarketClock: Sendable {
 public struct SystemClock: MarketClock {
     public init() {}
 
-    public var now: Date { Date() }
+    public var now: Date {
+        Date()
+    }
 }
