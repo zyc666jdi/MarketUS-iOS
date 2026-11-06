@@ -145,6 +145,19 @@ def issue_detail(number: int) -> dict[str, Any]:
     return gh_json(["api", f"repos/{repo_slug()}/issues/{number}"])
 
 
+def notify(title: str, message: str) -> None:
+    """macOS 通知；MARKETUS_NOTIFY=0 关闭，失败静默。"""
+    if os.environ.get("MARKETUS_NOTIFY") == "0" or sys.platform != "darwin":
+        return
+    safe_title = title.replace('"', '\\"')
+    safe_message = message.replace('"', '\\"')
+    script = f'display notification "{safe_message}" with title "{safe_title}" sound name "Glass"'
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def comment(number: int, body: str) -> None:
     gh(["issue", "comment", str(number), "--body", body])
 
@@ -476,6 +489,7 @@ def cmd_once(args: argparse.Namespace) -> int:
             ]
         )
         comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
+        notify("MarketUS PR 已创建", f"#{number} {pr['url']}")
         print(f"PR: {pr['url']}")
         return 0
 
@@ -650,6 +664,7 @@ def cmd_review(args: argparse.Namespace) -> int:
                 "status:awaiting-human",
             ]
         )
+        notify("MarketUS PR 可合并", f"PR #{args.pr} 评审通过，等待你合并")
         print("✅ APPROVE — 已请求人工合并")
         return 0
 
