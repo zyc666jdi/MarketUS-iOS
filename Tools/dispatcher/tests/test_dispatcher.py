@@ -68,6 +68,20 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(dispatcher.agent_text(output), "OK")
 
 
+class ReviewRepairTests(unittest.TestCase):
+    def test_last_review_and_repair_rounds(self):
+        pr = {
+            "comments": [
+                {"body": "<!-- dispatcher-review pr=1 sha=abc123 verdict=REQUEST_CHANGES -->"},
+                {"body": "<!-- dispatcher-repair pr=1 sha=abc123 round=1 -->"},
+            ]
+        }
+        sha, verdict, _ = dispatcher.last_review(pr)
+        self.assertEqual(sha, "abc123")
+        self.assertEqual(verdict, "REQUEST_CHANGES")
+        self.assertEqual(dispatcher.repair_rounds(pr), 1)
+
+
 class CredentialTests(unittest.TestCase):
     def test_env_file_is_loaded(self):
         fd, path = tempfile.mkstemp()
