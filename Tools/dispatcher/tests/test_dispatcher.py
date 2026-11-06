@@ -192,13 +192,15 @@ class RunFallbackTests(unittest.TestCase):
         review.assert_not_called()
 
     def test_cmd_run_skips_pr_without_created_at(self):
-        review, detail = self._run(
-            [ai_pr(created_at=None)],
-            issue_with({"status:in-progress"}),
-            details=[{"headRefOid": "abc123", "comments": []}],
-        )
-        review.assert_not_called()
-        detail.assert_not_called()
+        for created_at in (None, ""):
+            with self.subTest(created_at=created_at):
+                review, detail = self._run(
+                    [ai_pr(created_at=created_at)],
+                    issue_with({"status:in-progress"}),
+                    details=[{"headRefOid": "abc123", "comments": []}],
+                )
+                review.assert_not_called()
+                detail.assert_not_called()
 
     def test_cmd_run_skips_pr_detail_failure(self):
         review, _ = self._run(
