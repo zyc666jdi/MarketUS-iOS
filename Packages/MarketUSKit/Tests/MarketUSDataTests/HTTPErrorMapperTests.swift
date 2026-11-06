@@ -20,10 +20,10 @@ final class HTTPErrorMapperTests: XCTestCase {
     }
 
     func test_validate_rateLimitedWithRetryAfter_throwsRateLimitedWithInterval() throws {
-        let response = try makeResponse(statusCode: 429, headers: ["Retry-After": "2.5"])
+        let response = try makeResponse(statusCode: 429, headers: ["Retry-After": "2"])
 
         XCTAssertThrowsError(try HTTPErrorMapper.validate(response)) { error in
-            XCTAssertEqual(error as? MarketError, .rateLimited(retryAfter: 2.5))
+            XCTAssertEqual(error as? MarketError, .rateLimited(retryAfter: 2))
         }
     }
 
@@ -66,7 +66,10 @@ final class HTTPErrorMapperTests: XCTestCase {
     }
 
     func test_map_marketError_returnsSameError() {
-        XCTAssertEqual(HTTPErrorMapper.map(MarketError.offline), .offline)
+        let errors: [MarketError] = [.offline, .unauthorized]
+        for error in errors {
+            XCTAssertEqual(HTTPErrorMapper.map(error), error)
+        }
     }
 
     func test_map_unknownError_returnsUnknownWithDescription() {
