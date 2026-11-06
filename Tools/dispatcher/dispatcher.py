@@ -489,7 +489,6 @@ def cmd_once(args: argparse.Namespace) -> int:
             ]
         )
         comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
-        notify("MarketUS PR 已创建", f"#{number} {pr['url']}")
         print(f"PR: {pr['url']}")
         return 0
 
