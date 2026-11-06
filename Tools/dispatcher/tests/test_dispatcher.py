@@ -82,6 +82,20 @@ class ReviewRepairTests(unittest.TestCase):
         self.assertEqual(dispatcher.repair_rounds(pr), 1)
 
 
+class FallbackReviewTests(unittest.TestCase):
+    def test_auto_review_when_in_progress_without_review(self):
+        self.assertTrue(dispatcher.should_auto_review({"status:in-progress"}, False, 11))
+
+    def test_skip_when_already_reviewed(self):
+        self.assertFalse(dispatcher.should_auto_review({"status:in-progress"}, True, 60))
+
+    def test_skip_when_too_new(self):
+        self.assertFalse(dispatcher.should_auto_review({"status:in-progress"}, False, 5))
+
+    def test_skip_when_not_in_progress(self):
+        self.assertFalse(dispatcher.should_auto_review({"status:in-review"}, False, 60))
+
+
 class CredentialTests(unittest.TestCase):
     def test_env_file_is_loaded(self):
         fd, path = tempfile.mkstemp()
