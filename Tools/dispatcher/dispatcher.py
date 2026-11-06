@@ -738,6 +738,142 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
     return 0
 
 
+
+REVIEW_MARKER = re.compile(r"dispatcher-review pr=\d+ sha=([0-9a-f]+) verdict=(\w+)")
+REPAIR_MARKER = "dispatcher-repair pr="
+
+
+def pr_detail(number: int) -> dict[str, Any]:
+    return gh_json(
+        [
+            "pr",
+            "view",
+            str(number),
+            "--json",
+            "number,title,body,headRefName,headRefOid,state,url,comments",
+        ]
+    )
+
+
+def last_review(pr: dict[str, Any]) -> tuple[str | None, str | None, str]:
+    for comment in reversed(pr.get("comments", [])):
+        body = comment.get("body") or ""
+        match = REVIEW_MARKER.search(body)
+        if match:
+            return match.group(1), match.group(2).upper(), body
+    return None, None, ""
+
+
+def repair_rounds(pr: dict[str, Any]) -> int:
+    return sum(1 for comment in pr.get("comments", []) if REPAIR_MARKER in (comment.get("body") or ""))
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    pr = pr_detail(args.pr)
+    sha, verdict, feedback = last_review(pr)
+    if verdict != "REQUEST_CHANGES":
+        print(f"PR #{args.pr} 最近 verdict={verdict or 'none'}，无需修复")
+        return 0
+
+    rounds = repair_rounds(pr)
+    issue_number = extract_issue_number(pr)
+    if issue_number is None:
+        print("⛔ 无法解析 ticket 编号")
+        return 1
+    issue = issue_detail(issue_number)
+
+    print(f"PR       #{args.pr} {pr['title']}")
+    print(f"ticket   #{issue_number}")
+    print(f"sha      {sha[:8] if sha else '?'}")
+    print(f"round    {rounds + 1}/2")
+    if not args.execute:
+        print("\n(dry-run) 未调用修复 Agent；加 --execute 执行。")
+        return 0
+
+    if rounds >= 2:
+        gh(["issue", "edit", str(issue_number), "--add-label", "status:blocked"])
+        comment_pr(
+            args.pr,
+            f"⛔ 自动修复已达 2 轮上限，升级人类处理。\n\n<!-- {REPAIR_MARKER}{args.pr} sha={sha} round=blocked -->",
+        )
+        notify("MarketUS 自动修复失败", f"PR #{args.pr} 两轮修复仍被退回")
+        return 1
+
+    branch = pr["headRefName"]
+    worktree = WORKTREE_ROOT / f"repair-{args.pr}"
+    if worktree.exists():
+        run(["git", "worktree", "remove", str(worktree), "--force"])
+
+    run(["git", "fetch", "origin", branch])
+    cmd(["git", "worktree", "add", "-b", f"repair/{args.pr}", str(worktree), f"origin/{branch}"])
+    base = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
+
+    prompt = (
+        Path(".agent/prompts/implementer.md").read_text(encoding="utf-8")
+        + "\n\n---\n\n"
+        + Path("AGENTS.md").read_text(encoding="utf-8")
+        + f"\n\n---\n\n# Ticket #{issue_number}\n\n{issue.get('body') or ''}"
+        + f"\n\n---\n\n# Reviewer feedback（必须修复）\n\n{feedback[:20000]}"
+        + f"\n\n---\n\n# Run constraints\n\n- 只修复 Reviewer 指出的问题，不扩大范围\n- 只跑 `make build` + `make test-package`；UI 测试跳过\n- 提交并 push 到 `{branch}`，**不要合并**\n- 完成后立即退出\n"
+    )
+    run_dir = RUN_ROOT / f"repair-{args.pr}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+
+    load_agent_secrets()
+    command = agent_command()
+    if not command or shutil.which(command[0]) is None:
+        print(f"⛔ 找不到 Agent 命令：{command[0] if command else '<empty>'}")
+        return 1
+    env = os.environ.copy()
+    env["AGENT_RUN_ID"] = f"repair-{args.pr}"
+    if command[0] == "dsh":
+        env["DSH_PERMISSION_MODE"] = os.environ.get("AGENT_PERMISSION_MODE", "danger-full-access")
+
+    try:
+        result = subprocess.run(
+            command,
+            input=prompt,
+            text=True,
+            cwd=str(worktree),
+            capture_output=True,
+            timeout=args.timeout * 60,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        gh(["issue", "edit", str(issue_number), "--add-label", "status:blocked"])
+        comment_pr(args.pr, f"⛔ 修复 Agent 超时。日志：`.agent/runs/repair-{args.pr}/`")
+        return 1
+
+    (run_dir / "agent.log").write_text(result.stdout, encoding="utf-8")
+    (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
+    head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
+    if head == base:
+        gh(["issue", "edit", str(issue_number), "--add-label", "status:blocked"])
+        comment_pr(args.pr, f"⛔ 修复未产生 commit。日志：`.agent/runs/repair-{args.pr}/`")
+        return 1
+
+    run(["git", "-C", str(worktree), "push", "origin", f"HEAD:{branch}"])
+    gh(
+        [
+            "issue",
+            "edit",
+            str(issue_number),
+            "--remove-label",
+            "status:in-progress",
+            "--add-label",
+            "status:in-review",
+        ]
+    )
+    comment_pr(
+        args.pr,
+        f"🤖 自动修复已提交 `{head[:8]}`，回到评审。\n\n<!-- {REPAIR_MARKER}{args.pr} sha={sha} round={rounds + 1} -->",
+    )
+    run(["git", "worktree", "remove", str(worktree), "--force"])
+    print(f"repair pushed: {head[:8]} → {branch}")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     state_dir = Path(".agent/state")
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -751,6 +887,43 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
+
+        prs = gh_json(
+            [
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "20",
+                "--json",
+                "number,body,headRefName,isDraft",
+            ]
+        )
+        for pr in prs:
+            if not pr.get("headRefName", "").startswith("ai/"):
+                continue
+            issue_number = extract_issue_number(pr)
+            if issue_number is None:
+                continue
+            try:
+                linked = issue_detail(issue_number)
+            except SystemExit:
+                continue
+            if "status:in-progress" not in labels_of(linked):
+                continue
+            detail = pr_detail(pr["number"])
+            _, verdict, _ = last_review(detail)
+            if verdict == "REQUEST_CHANGES":
+                print(f"repair PR #{pr['number']} (issue #{issue_number})")
+                cmd_repair(
+                    argparse.Namespace(
+                        pr=pr["number"],
+                        execute=not args.dry_run,
+                        timeout=args.timeout,
+                    )
+                )
+                return 0
 
         ready = sorted(list_issues("status:ready"), key=lambda issue: (priority_rank(issue), issue["number"]))
         for issue in ready:
@@ -821,6 +994,11 @@ def main() -> int:
     once_parser.add_argument("--execute", action="store_true", help="真正领取并调用 Agent")
     once_parser.add_argument("--timeout", type=int, default=90, help="Agent 超时（分钟）")
 
+    repair_parser = subparsers.add_parser("repair", help="对 REQUEST_CHANGES 的 PR 运行修复 Agent（默认 dry-run）")
+    repair_parser.add_argument("--pr", type=int, required=True)
+    repair_parser.add_argument("--execute", action="store_true")
+    repair_parser.add_argument("--timeout", type=int, default=90)
+
     review_parser = subparsers.add_parser("review", help="对 PR 运行只读 Reviewer（默认 dry-run）")
     review_parser.add_argument("--pr", type=int, required=True)
     review_parser.add_argument("--execute", action="store_true")
@@ -840,6 +1018,8 @@ def main() -> int:
         return cmd_plan(args)
     if args.command == "once":
         return cmd_once(args)
+    if args.command == "repair":
+        return cmd_repair(args)
     if args.command == "review":
         return cmd_review(args)
     if args.command == "postmerge":
