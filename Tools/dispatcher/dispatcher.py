@@ -702,6 +702,8 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
                 "edit",
                 str(issue_number),
                 "--remove-label",
+                "status:in-progress",
+                "--remove-label",
                 "status:awaiting-human",
                 "--remove-label",
                 "status:in-review",
