@@ -101,5 +101,5 @@ launchctl bootout gui/$UID/com.marketus.dispatcher        # 停止
 
 ## 通知
 
-PR 创建成功、Reviewer APPROVE 时，Dispatcher 会发 macOS 通知（含 PR 编号）。
+仅在 Reviewer APPROVE 后发送「可合并」macOS 通知（含 PR 编号）；PR 创建时不再通知。
 关闭：`MARKETUS_NOTIFY=0`。非 macOS 平台自动跳过。
