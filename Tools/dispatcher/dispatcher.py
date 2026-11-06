@@ -874,6 +874,18 @@ def cmd_repair(args: argparse.Namespace) -> int:
     return 0
 
 
+FALLBACK_REVIEW_MINUTES = 10
+
+
+def age_minutes(iso_timestamp: str) -> float:
+    created = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - created).total_seconds() / 60
+
+
+def should_auto_review(labels: set[str], has_review: bool, age: float) -> bool:
+    return not has_review and "status:in-progress" in labels and age >= FALLBACK_REVIEW_MINUTES
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     state_dir = Path(".agent/state")
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -897,7 +909,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "--limit",
                 "20",
                 "--json",
-                "number,body,headRefName,isDraft",
+                "number,body,headRefName,isDraft,createdAt",
             ]
         )
         for pr in prs:
@@ -949,7 +961,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "--limit",
                 "20",
                 "--json",
-                "number,body,headRefName,isDraft",
+                "number,body,headRefName,isDraft,createdAt",
             ]
         )
         for pr in prs:
@@ -962,8 +974,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 issue = issue_detail(issue_number)
             except SystemExit:
                 continue
-            if "status:in-review" not in labels_of(issue):
+            labels = labels_of(issue)
+            detail = pr_detail(pr["number"])
+            _, verdict, _ = last_review(detail)
+            has_review = verdict is not None
+            fallback = should_auto_review(labels, has_review, age_minutes(pr.get("createdAt") or ""))
+            if "status:in-review" not in labels and not fallback:
                 continue
+            if fallback:
+                print(f"fallback review PR #{pr['number']} (in-progress, no review marker)")
             print(f"review PR #{pr['number']} (issue #{issue_number})")
             cmd_review(
                 argparse.Namespace(
