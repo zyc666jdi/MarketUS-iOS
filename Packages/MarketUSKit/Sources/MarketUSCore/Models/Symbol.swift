@@ -2,8 +2,13 @@
 public struct Symbol: Hashable, Codable, Sendable, Identifiable, CustomStringConvertible {
     public let ticker: String
 
-    public var id: String { ticker }
-    public var description: String { ticker }
+    public var id: String {
+        ticker
+    }
+
+    public var description: String {
+        ticker
+    }
 
     public init(ticker: String) {
         self.ticker = ticker.uppercased()

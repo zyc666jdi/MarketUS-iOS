@@ -1,8 +1,8 @@
-import XCTest
 @testable import MarketUSCore
 @testable import MarketUSData
 @testable import MarketUSNetworking
 @testable import MarketUSPersistence
+import XCTest
 
 final class LiveQuoteRepositoryTests: XCTestCase {
     private let validJSON = """

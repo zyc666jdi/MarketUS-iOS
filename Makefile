@@ -15,7 +15,8 @@ bootstrap:
 lint:
 	@command -v swiftlint >/dev/null 2>&1 || { echo "缺少 swiftlint：请先运行 brew bundle"; exit 1; }
 	swiftlint --strict
-	@command -v swiftformat >/dev/null 2>&1 && swiftformat --lint . || echo "警告：未安装 swiftformat，跳过格式检查"
+	@command -v swiftformat >/dev/null 2>&1 || { echo "缺少 swiftformat：请先运行 brew bundle"; exit 1; }
+	swiftformat --lint .
 
 format:
 	@command -v swiftformat >/dev/null 2>&1 || { echo "缺少 swiftformat：请先运行 brew bundle"; exit 1; }

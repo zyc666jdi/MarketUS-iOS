@@ -1,6 +1,6 @@
-import XCTest
 @testable import MarketUSCore
 @testable import MarketUSData
+import XCTest
 
 final class MockQuoteRepositoryTests: XCTestCase {
     private let fixedDate = Date(timeIntervalSince1970: 0)
@@ -43,5 +43,7 @@ final class MockQuoteRepositoryTests: XCTestCase {
 
 private struct FixedClock: MarketClock {
     let date: Date
-    var now: Date { date }
+    var now: Date {
+        date
+    }
 }

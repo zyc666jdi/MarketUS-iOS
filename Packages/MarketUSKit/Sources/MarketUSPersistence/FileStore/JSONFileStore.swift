@@ -4,7 +4,7 @@ import MarketUSCore
 /// 轻量键值存储抽象。Feature 层不得直接读写文件。
 public protocol FileStore: Sendable {
     func read<T: Decodable>(_ type: T.Type, from name: String) throws -> T?
-    func write<T: Encodable>(_ value: T, to name: String) throws
+    func write(_ value: some Encodable, to name: String) throws
     func remove(_ name: String) throws
 }
 
@@ -16,7 +16,7 @@ public struct JSONFileStore: FileStore {
         self.directory = directory
     }
 
-    public func read<T: Decodable>(_ type: T.Type, from name: String) throws -> T? {
+    public func read<T: Decodable>(_: T.Type, from name: String) throws -> T? {
         let url = fileURL(for: name)
         guard FileManager.default.fileExists(atPath: url.path) else {
             return nil
@@ -29,7 +29,7 @@ public struct JSONFileStore: FileStore {
         }
     }
 
-    public func write<T: Encodable>(_ value: T, to name: String) throws {
+    public func write(_ value: some Encodable, to name: String) throws {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let data = try JSONEncoder().encode(value)

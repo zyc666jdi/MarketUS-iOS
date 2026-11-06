@@ -5,7 +5,7 @@ import MarketUSCore
 enum HTTPErrorMapper {
     static func validate(_ response: HTTPURLResponse) throws {
         switch response.statusCode {
-        case 200..<300:
+        case 200 ..< 300:
             return
         case 401:
             throw MarketError.unauthorized

@@ -1,5 +1,5 @@
-import XCTest
 @testable import MarketUSCore
+import XCTest
 
 final class QuoteTests: XCTestCase {
     private let date = Date(timeIntervalSince1970: 1_700_000_000)

@@ -12,8 +12,13 @@ public struct Quote: Hashable, Codable, Sendable, Identifiable {
     public let timestamp: Date
     public let isStale: Bool
 
-    public var id: String { symbol.ticker }
-    public var isPositive: Bool { change >= 0 }
+    public var id: String {
+        symbol.ticker
+    }
+
+    public var isPositive: Bool {
+        change >= 0
+    }
 
     public init(
         symbol: Symbol,
