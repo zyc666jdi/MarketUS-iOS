@@ -118,6 +118,33 @@ def ai_pr(created_at: str | None = "2026-01-01T00:00:00Z") -> dict:
     }
 
 
+def status_after(labels: set[str], calls: list[list[str]]) -> set[str]:
+    """Apply mocked ``gh issue edit`` calls to a label set and return statuses."""
+    final = set(labels)
+    for args in calls:
+        if args[:2] != ["issue", "edit"]:
+            continue
+        index = 3
+        while index < len(args):
+            if args[index] == "--remove-label":
+                final.discard(args[index + 1])
+                index += 2
+            elif args[index] == "--add-label":
+                final.add(args[index + 1])
+                index += 2
+            else:
+                index += 1
+    return {name for name in final if name.startswith("status:")}
+
+
+def fake_gh(calls: list[list[str]]):
+    def _fake(args, check=True):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    return _fake
+
+
 class RunFallbackTests(unittest.TestCase):
     """Cover the cmd_run wiring, not just the should_auto_review predicate."""
 
@@ -234,10 +261,6 @@ class ReviewLabelTransitionTests(unittest.TestCase):
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
 
-        def fake_gh(args, check=True):
-            calls.append(list(args))
-            return subprocess.CompletedProcess(args, 0, "", "")
-
         def fake_review_agent(_prompt, _run_dir, _timeout):
             return (f"## Verdict: {verdict}\n" if verdict else "no verdict", 0)
 
@@ -247,7 +270,7 @@ class ReviewLabelTransitionTests(unittest.TestCase):
             with (
                 mock.patch.object(dispatcher, "gh_json", return_value=pr),
                 mock.patch.object(dispatcher, "issue_detail", return_value=issue),
-                mock.patch.object(dispatcher, "gh", side_effect=fake_gh),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
                 mock.patch.object(dispatcher, "run_review_agent", side_effect=fake_review_agent),
                 mock.patch.object(dispatcher, "comment_pr"),
                 mock.patch.object(dispatcher, "notify"),
@@ -255,25 +278,7 @@ class ReviewLabelTransitionTests(unittest.TestCase):
                 code = dispatcher.cmd_review(argparse.Namespace(pr=38, execute=True, timeout=30))
         finally:
             os.chdir(old_cwd)
-        return code, self._final_status(labels, calls)
-
-    @staticmethod
-    def _final_status(labels: set[str], calls: list[list[str]]) -> set[str]:
-        final = set(labels)
-        for args in calls:
-            if args[:2] != ["issue", "edit"]:
-                continue
-            index = 3
-            while index < len(args):
-                if args[index] == "--remove-label":
-                    final.discard(args[index + 1])
-                    index += 2
-                elif args[index] == "--add-label":
-                    final.add(args[index + 1])
-                    index += 2
-                else:
-                    index += 1
-        return {name for name in final if name.startswith("status:")}
+        return code, status_after(labels, calls)
 
     def test_approve_from_in_progress_leaves_only_awaiting_human(self):
         code, final = self._review({"status:in-progress"}, "APPROVE")
@@ -289,6 +294,164 @@ class ReviewLabelTransitionTests(unittest.TestCase):
         code, final = self._review({"status:in-progress", "status:in-review"}, "APPROVE")
         self.assertEqual(code, 0)
         self.assertEqual(final, {"status:awaiting-human"})
+
+    def test_approve_from_claimed_and_in_progress_leaves_only_awaiting_human(self):
+        code, final = self._review({"status:in-progress", "status:claimed"}, "APPROVE")
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+
+    def test_request_changes_from_claimed_and_in_progress_leaves_only_in_progress(self):
+        code, final = self._review({"status:in-progress", "status:claimed"}, "REQUEST_CHANGES")
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+
+    def test_approve_from_blocked_and_in_progress_leaves_only_awaiting_human(self):
+        code, final = self._review({"status:in-progress", "status:blocked"}, "APPROVE")
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+
+    def test_request_changes_from_blocked_and_in_progress_leaves_only_in_progress(self):
+        code, final = self._review({"status:in-progress", "status:blocked"}, "REQUEST_CHANGES")
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+
+
+class SetStatusTests(unittest.TestCase):
+    def _apply(self, labels: set[str], target: str):
+        calls = []
+        with mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)):
+            dispatcher.set_status(40, target)
+        return calls, status_after(labels, calls)
+
+    def test_set_status_clears_claimed_and_blocked_residue(self):
+        calls, final = self._apply(
+            {"status:in-progress", "status:claimed", "status:blocked"},
+            "status:in-review",
+        )
+        self.assertEqual(final, {"status:in-review"})
+        pairs = list(zip(calls[0], calls[0][1:]))
+        self.assertIn(("--remove-label", "status:claimed"), pairs)
+        self.assertIn(("--remove-label", "status:blocked"), pairs)
+        self.assertIn(("--add-label", "status:in-review"), pairs)
+
+    def test_set_status_keeps_terminal_done_label(self):
+        calls, final = self._apply({"status:done", "status:in-progress"}, "status:blocked")
+        self.assertEqual(final, {"status:done", "status:blocked"})
+        pairs = list(zip(calls[0], calls[0][1:]))
+        self.assertNotIn(("--remove-label", "status:done"), pairs)
+
+    def test_set_status_done_clears_other_statuses(self):
+        calls, final = self._apply(
+            {"status:in-progress", "status:claimed", "status:awaiting-human"},
+            "status:done",
+        )
+        self.assertEqual(final, {"status:done"})
+        self.assertEqual(calls[0][-2:], ["--add-label", "status:done"])
+
+    def test_set_status_rejects_unknown_target(self):
+        with mock.patch.object(dispatcher, "gh") as gh:
+            with self.assertRaises(ValueError):
+                dispatcher.set_status(40, "status:unknown")
+        gh.assert_not_called()
+
+    def test_set_status_accepts_issue_payload(self):
+        calls = []
+        with mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)):
+            dispatcher.set_status({"number": 40}, "status:blocked")
+        self.assertEqual(calls[0][:3], ["issue", "edit", "40"])
+
+
+class CmdOnceStatusTests(unittest.TestCase):
+    def test_worktree_failure_leaves_only_blocked(self):
+        labels = {
+            "type:feature",
+            "area:infrastructure",
+            "priority:p1",
+            "risk:low",
+            "status:ready",
+            "status:claimed",
+        }
+        issue = {
+            "number": 40,
+            "title": "test",
+            "body": VALID_BODY,
+            "labels": [{"name": name} for name in labels],
+            "state": "open",
+            "author_association": "OWNER",
+        }
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+                mock.patch.object(dispatcher, "build_prompt", return_value="prompt"),
+                mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
+                mock.patch.object(dispatcher, "load_agent_secrets"),
+                mock.patch.object(dispatcher, "cmd", side_effect=SystemExit("git failed")),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+                mock.patch.object(dispatcher, "comment"),
+                mock.patch.object(dispatcher, "notify"),
+            ):
+                code = dispatcher.cmd_once(argparse.Namespace(issue=40, execute=True, timeout=90))
+        self.assertEqual(code, 1)
+        self.assertEqual(status_after(labels, calls), {"status:blocked"})
+
+
+class PostmergeStatusTests(unittest.TestCase):
+    def test_postmerge_leaves_only_done(self):
+        labels = {"status:in-progress", "status:claimed", "status:awaiting-human"}
+        prs = [{"number": 42, "body": "", "headRefName": "ai/40-test", "url": "https://example/pr/42"}]
+        issue = {"number": 40, "labels": [{"name": name} for name in labels]}
+        calls = []
+        with (
+            mock.patch.object(dispatcher, "gh_json", return_value=prs),
+            mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+            mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+        ):
+            code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=False))
+        self.assertEqual(code, 0)
+        self.assertEqual(status_after(labels, calls), {"status:done"})
+
+
+class RepairStatusTests(unittest.TestCase):
+    def test_repair_round_limit_leaves_only_blocked(self):
+        labels = {"status:in-progress", "status:claimed"}
+        pr = {
+            "number": 38,
+            "title": "test",
+            "body": "",
+            "headRefName": "ai/40-test",
+            "comments": [
+                {"body": "<!-- dispatcher-review pr=38 sha=abc123 verdict=REQUEST_CHANGES -->"},
+                {"body": "<!-- dispatcher-repair pr=38 sha=abc123 round=1 -->"},
+                {"body": "<!-- dispatcher-repair pr=38 sha=abc123 round=2 -->"},
+            ],
+        }
+        issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
+        calls = []
+        with (
+            mock.patch.object(dispatcher, "pr_detail", return_value=pr),
+            mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+            mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+            mock.patch.object(dispatcher, "comment_pr"),
+            mock.patch.object(dispatcher, "notify"),
+        ):
+            code = dispatcher.cmd_repair(argparse.Namespace(pr=38, execute=True, timeout=30))
+        self.assertEqual(code, 1)
+        self.assertEqual(status_after(labels, calls), {"status:blocked"})
+
+
+class MergeGuardTests(unittest.TestCase):
+    def test_gh_pr_merge_is_refused(self):
+        with mock.patch.object(dispatcher.subprocess, "run") as subprocess_run:
+            with self.assertRaises(SystemExit):
+                dispatcher.gh(["pr", "merge", "42", "--squash"])
+        subprocess_run.assert_not_called()
+
+    def test_gh_pr_edit_is_allowed(self):
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(dispatcher.subprocess, "run", return_value=completed):
+            dispatcher.gh(["pr", "edit", "42", "--add-label", "merge:requested"])
 
 
 class CredentialTests(unittest.TestCase):
