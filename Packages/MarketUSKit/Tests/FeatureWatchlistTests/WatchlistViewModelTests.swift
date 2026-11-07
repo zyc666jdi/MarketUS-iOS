@@ -17,13 +17,13 @@ final class WatchlistViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.isLoading)
     }
 
-    func test_load_failure_publishesLocalizedError() async {
+    func test_load_offlineError_publishesOfflineMessage() async {
         let repository = StubQuoteRepository(result: .failure(MarketError.offline))
         let viewModel = WatchlistViewModel(repository: repository, symbols: symbols)
 
         await viewModel.load()
 
-        XCTAssertNotNil(viewModel.errorMessage)
+        XCTAssertEqual(viewModel.errorMessage, String(localized: "watchlist.error.offline"))
         XCTAssertTrue(viewModel.quotes.isEmpty)
         XCTAssertFalse(viewModel.isLoading)
     }
