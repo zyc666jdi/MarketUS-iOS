@@ -63,7 +63,7 @@ SUSPICIOUS_PATTERNS = [
     r"rm\s+-rf\s+/",
 ]
 
-ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url"
+ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url,state"
 
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
@@ -75,6 +75,7 @@ AUTOPILOT_PROMPT = Path("Tools/dispatcher/prompts/planner.md")
 AUTOPILOT_DAILY_LIMIT = 30
 AUTOPILOT_FAILURE_LIMIT = 2
 AUTOPILOT_RECENT_LIMIT = 50
+TICKET_SOURCES = {"human", "ai"}
 
 PLANNER_TYPE_LABELS = {"feature": "type:feature", "bug": "type:bug", "chore": "type:chore"}
 PLANNER_AREA_LABELS = {"watchlist", "quotes", "news", "portfolio", "settings", "design", "infra"}
@@ -171,6 +172,16 @@ def issue_detail(number: int) -> dict[str, Any]:
     return gh_json(["api", f"repos/{repo_slug()}/issues/{number}"])
 
 
+def issue_comment_bodies(number: int) -> list[str]:
+    data = gh_json(["issue", "view", str(number), "--json", "comments"])
+    if not isinstance(data, dict):
+        return []
+    comments = data.get("comments")
+    if not isinstance(comments, list):
+        return []
+    return [str(item.get("body") or "") for item in comments if isinstance(item, dict)]
+
+
 def notify(title: str, message: str) -> None:
     """macOS 通知；MARKETUS_NOTIFY=0 关闭，失败静默。"""
     if os.environ.get("MARKETUS_NOTIFY") == "0" or sys.platform != "darwin":
@@ -231,6 +242,20 @@ def set_status(issue: int | dict[str, Any], target: str) -> None:
         args.extend(["--remove-label", label])
     args.extend(["--add-label", target])
     gh(args)
+
+
+def clear_status(issue: int | dict[str, Any], labels: set[str] | None = None, *, kind: str = "issue") -> bool:
+    """Remove every known status label; ``labels=None`` attempts all. Idempotent."""
+    number = issue["number"] if isinstance(issue, dict) else issue
+    names = set(STATUS_LABELS) if labels is None else set(labels)
+    args = [kind, "edit", str(number)]
+    for label in STATUS_LABELS:
+        if label in names:
+            args.extend(["--remove-label", label])
+    if len(args) == 3:
+        return False
+    gh(args)
+    return True
 
 
 def section(body: str, title: str) -> str:
@@ -418,6 +443,215 @@ def build_prompt(issue: dict[str, Any], worktree: Path, branch: str) -> str:
 """
 
 
+def worktree_dirty(worktree: Path) -> bool:
+    """Return True when the worktree has uncommitted changes."""
+    result = run(["git", "-C", str(worktree), "status", "--porcelain"])
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def branch_ahead(worktree: Path, base: str = "origin/main") -> int:
+    """Count commits on the worktree branch that are not on ``base``."""
+    result = run(["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"])
+    if result.returncode != 0:
+        return 0
+    try:
+        return max(0, int(result.stdout.strip() or "0"))
+    except ValueError:
+        return 0
+
+
+def worktree_has_work(worktree: Path) -> bool:
+    return worktree_dirty(worktree) or branch_ahead(worktree) > 0
+
+
+# 与 gitleaks 默认规则对齐的高置信度兜底；本机未安装 gitleaks 时仍拒绝提交。
+SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("private-key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")),
+    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("stripe-key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b")),
+    ("deepseek-key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    (
+        "generic-credential",
+        re.compile(
+            r"""(?ix)\b(?:api[_-]?key|secret|token|password)\b\s*[:=]\s*["']?[A-Za-z0-9_\-]{20,}["']?"""
+        ),
+    ),
+)
+
+
+def staged_secret_hits(worktree: Path) -> list[str]:
+    """Scan added lines in the staged diff; never include the matched value."""
+    diff = run(["git", "-C", str(worktree), "diff", "--cached", "--unified=0"])
+    if diff.returncode != 0:
+        return [f"无法读取 staged diff：{diff.stderr.strip() or 'unknown'}"]
+    findings: list[str] = []
+    path = ""
+    for line in (diff.stdout or "").splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:]
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        for name, pattern in SECRET_RULES:
+            if pattern.search(line):
+                findings.append(f"{path or '<unknown>'}: {name}")
+    return sorted(set(findings))
+
+
+def gitleaks_hits(worktree: Path) -> list[str]:
+    """Run gitleaks against staged changes when the binary is available."""
+    binary = shutil.which("gitleaks")
+    if binary is None:
+        return []
+    result = subprocess.run(
+        [binary, "protect", "--staged", "--redact", "--no-banner", "--verbose"],
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return []
+    if result.returncode == 1:
+        return ["gitleaks: staged change contains a secret"]
+    return [f"gitleaks: scan failed (exit={result.returncode})"]
+
+
+def scan_staged_secrets(worktree: Path) -> list[str]:
+    return staged_secret_hits(worktree) + gitleaks_hits(worktree)
+
+
+def commit_agent_work(worktree: Path, issue_number: int, run_id: str = "") -> tuple[bool, str]:
+    """Commit pending changes after a mandatory staged secret scan."""
+    if not worktree_dirty(worktree):
+        return True, ""
+    added = run(["git", "-C", str(worktree), "add", "-A"])
+    if added.returncode != 0:
+        return False, f"git add 失败：{added.stderr.strip() or 'unknown'}"
+    findings = scan_staged_secrets(worktree)
+    if findings:
+        return False, "密钥扫描命中：" + "; ".join(findings)
+    footer = [f"Refs: #{issue_number}"]
+    if run_id:
+        footer.append(f"Agent-Run: {run_id}")
+    result = run(
+        [
+            "git", "-C", str(worktree),
+            "-c", "user.name=marketus-dispatcher",
+            "-c", "user.email=dispatcher@users.noreply.github.com",
+            "commit", "-m", f"chore(agent): capture work for #{issue_number}",
+            "-m", "\n".join(footer),
+        ]
+    )
+    if result.returncode != 0:
+        return False, f"git commit 失败：{result.stderr.strip() or 'unknown'}"
+    return True, ""
+
+
+def label_value(issue: dict[str, Any], prefix: str, default: str) -> str:
+    for name in labels_of(issue):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return default
+
+
+def auto_pr_labels(issue: dict[str, Any]) -> list[str]:
+    return [
+        "ai:generated",
+        f"risk:{label_value(issue, 'risk:', 'medium')}",
+        f"size:{label_value(issue, 'size:', 's')}",
+    ]
+
+
+def build_auto_pr_body(issue: dict[str, Any]) -> str:
+    number = issue["number"]
+    change_type = label_value(issue, "type:", "chore")
+    risk = label_value(issue, "risk:", "medium")
+    size = label_value(issue, "size:", "s")
+    criteria = acceptance_lines(issue.get("body") or "")
+    rows = "\n".join(
+        f"| {line.lstrip('-* ').strip()} | ⏳ | 待补充 |" for line in criteria
+    ) or "| 见 ticket 正文 | ⏳ | 待补充 |"
+    return (
+        f"## 关联 Ticket\n\nFixes #{number}\n\n"
+        f"## 变更类型\n\n- [x] {change_type}（Dispatcher 自动收尾）\n\n"
+        "## 摘要\n\n- Agent 退出时未创建 PR，但分支存在改动。\n"
+        "- Dispatcher 已自动 add/commit/push 并创建 **draft** PR；"
+        "需人工补齐验收证据并标记 ready 后再进入评审。\n\n"
+        "## 验收标准对照\n\n| 验收标准 | 状态 | 证据 |\n| --- | --- | --- |\n"
+        f"{rows}\n\n"
+        "## 测试证据\n\n- 自动收尾未运行测试；合并前必须由人类复跑 `make verify` 并补齐输出。\n\n"
+        "## UI 变更\n\n- 待人工确认（如涉及 UI，需浅色/深色/大字体截图）。\n\n"
+        "## 影响面与风险\n\n"
+        f"- 受影响模块：见 ticket #{number}\n"
+        f"- 风险等级：`risk:{risk}`\n"
+        f"- 规模：`size:{size}`\n"
+        "- 回滚方案：revert 本 PR\n\n"
+        "## 自查清单（提交者，含 Agent）\n\n"
+        "- [ ] 改动范围与 ticket 一致\n"
+        "- [ ] 测试证据已补齐\n"
+        "- [ ] 无密钥、调试输出、临时文件\n"
+        "- [ ] 未修改受保护路径\n\n"
+        f"<!-- dispatcher-auto-pr issue={number} -->\n"
+    )
+
+
+def remove_worktree(worktree: Path) -> subprocess.CompletedProcess[str] | None:
+    if not worktree.exists():
+        return None
+    return run(["git", "worktree", "remove", str(worktree), "--force"])
+
+
+def ensure_agent_pr(
+    worktree: Path,
+    branch: str,
+    issue: dict[str, Any],
+    run_id: str = "",
+) -> tuple[dict[str, Any] | None, str]:
+    """Salvage an Agent run that left changes but no PR.
+
+    Returns ``(pr, "")`` on success, ``(None, "")`` when there is nothing to
+    salvage, and ``(None, reason)`` when a step fails. A secret-scan hit also
+    removes the dirty worktree so the token never reaches the public remote.
+    """
+    if not worktree_has_work(worktree):
+        return None, ""
+    committed, reason = commit_agent_work(worktree, issue["number"], run_id)
+    if not committed:
+        if reason.startswith("密钥扫描命中："):
+            removed = remove_worktree(worktree)
+            if removed is not None and removed.returncode != 0:
+                reason += f"；清理 worktree 失败：{removed.stderr.strip() or 'unknown'}"
+        return None, reason
+    push = run(["git", "-C", str(worktree), "push", "-u", "origin", branch])
+    if push.returncode != 0:
+        return None, f"git push 失败：{push.stderr.strip() or 'unknown'}"
+
+    title = f"chore(agent): 自动收尾 #{issue['number']}"
+    created = run(
+        [
+            "gh", "pr", "create", "--base", "main", "--head", branch,
+            "--title", title, "--body", build_auto_pr_body(issue), "--draft",
+            *[item for label in auto_pr_labels(issue) for item in ("--label", label)],
+        ]
+    )
+    if created.returncode != 0:
+        return None, f"gh pr create 失败：{created.stderr.strip() or 'unknown'}"
+    lines = [line.strip() for line in (created.stdout or "").splitlines() if line.strip()]
+    url = lines[-1] if lines else ""
+    match = re.search(r"/pull/(\d+)", url)
+    if match is None:
+        return None, f"gh pr create 未返回 PR URL：{url or '(empty)'}"
+    return {
+        "number": int(match.group(1)),
+        "url": url,
+        "title": title,
+        "headRefName": branch,
+        "isDraft": True,
+    }, ""
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     number = args.issue
     issue = issue_detail(number)
@@ -526,16 +760,32 @@ def cmd_once(args: argparse.Namespace) -> int:
         run(["gh", "pr", "list", "--head", branch, "--json", "number,url,title", "--limit", "1"]).stdout or "[]"
     )
 
+    auto_pr = None
+    auto_reason = ""
+    if not prs:
+        auto_pr, auto_reason = ensure_agent_pr(worktree, branch, issue, run_id)
+        if auto_pr is not None:
+            prs = [auto_pr]
+
     if prs:
         pr = prs[0]
-        set_status(number, "status:in-review")
-        comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
+        if auto_pr is not None:
+            set_status(number, "status:awaiting-human")
+            comment(
+                number,
+                f"✅ 已创建 draft PR（Dispatcher 自动收尾）：{pr['url']}\n\n"
+                "需人工补齐 PR 模板、验收证据并标记 ready 后再进入评审。"
+                f"\n\n日志：`.agent/runs/{number}/`",
+            )
+        else:
+            set_status(number, "status:in-review")
+            comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
         notify("MarketUS PR 已创建", f"#{number} {pr['url']}")
         print(f"PR: {pr['url']}")
         return 0
 
     set_status(number, "status:blocked")
-    reason = "Agent 退出码非 0" if agent_failed else "未检测到 PR"
+    reason = auto_reason or ("Agent 退出码非 0" if agent_failed else "未检测到 PR，且自动收尾未产生可提交改动")
     comment(number, f"⛔ {reason}。worktree: `{worktree}`，日志：`.agent/runs/{number}/`")
     print(f"⛔ {reason}")
     return 1
@@ -706,7 +956,7 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
             "--limit",
             "50",
             "--json",
-            "number,title,body,headRefName,url",
+            "number,title,body,headRefName,url,labels",
         ]
     )
     changed = 0
@@ -719,19 +969,35 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         except SystemExit:
             continue
         labels = labels_of(issue)
-        if "status:done" in labels:
-            continue
         print(f"merged PR #{pr['number']} → issue #{issue_number}")
         if args.dry_run:
             continue
-        set_status(issue_number, "status:done")
-        gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}"])
+
+        # Cleanup is unconditional: a previous run may have set done before the
+        # worktree/PR labels were cleaned, and retries must still converge.
         branch = pr.get("headRefName", "")
+        updated = False
         if "/" in branch:
             worktree = WORKTREE_ROOT / branch.split("/", 1)[1]
             if worktree.exists():
-                run(["git", "worktree", "remove", str(worktree), "--force"])
-        changed += 1
+                removed = run(["git", "worktree", "remove", str(worktree), "--force"])
+                updated = updated or removed.returncode == 0
+
+        pr_labels = labels_of(pr) if "labels" in pr else None
+        if clear_status(pr["number"], pr_labels, kind="pr"):
+            updated = True
+
+        residual = labels & (set(STATUS_LABELS) - {"status:done"})
+        if residual:
+            set_status(issue_number, "status:done")
+            updated = True
+
+        marker = f"<!-- dispatcher-merged pr={pr['number']} -->"
+        if not any(marker in body for body in issue_comment_bodies(issue_number)):
+            gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}\n\n{marker}"])
+            updated = True
+        if updated:
+            changed += 1
     print(f"postmerge: {changed} issue(s) updated")
     return 0
 
@@ -952,6 +1218,28 @@ def autopilot_enabled() -> bool:
     return os.environ.get("MARKETUS_AUTOPILOT", "1").strip() != "0"
 
 
+def ticket_source() -> str:
+    """Ticket 来源：``human`` 表示只由人类开票，``ai`` 允许 Planner 开票。
+
+    非法值回落到最保守的 ``human``，避免拼写错误意外打开自动开票。
+    """
+    value = os.environ.get("MARKETUS_TICKET_SOURCE", "ai").strip().lower()
+    return value if value in TICKET_SOURCES else "human"
+
+
+def planner_can_create_tickets() -> bool:
+    return ticket_source() != "human"
+
+
+def is_open_issue(issue: dict[str, Any]) -> bool:
+    """Treat a missing state as open (``gh issue list --state open`` payloads)."""
+    return str(issue.get("state") or "open").strip().lower() == "open"
+
+
+def open_only(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if is_open_issue(item)]
+
+
 def autopilot_today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
@@ -1063,6 +1351,8 @@ def autopilot_gate(state: dict[str, Any]) -> str | None:
     """返回跳过原因；None 表示可以调用 Planner。"""
     if not autopilot_enabled():
         return "MARKETUS_AUTOPILOT=0，Autopilot 已关闭"
+    if not planner_can_create_tickets():
+        return "MARKETUS_TICKET_SOURCE=human，Planner 不创建 ticket"
     if state.get("frozen") is True:
         return f"Autopilot 已冻结：{state.get('frozen_reason') or '连续失败达到上限'}"
     if _non_negative_int(state.get("created_today")) >= AUTOPILOT_DAILY_LIMIT:
@@ -1303,8 +1593,12 @@ def should_run_planner(
     open_prs: list[dict[str, Any]],
     active: list[dict[str, Any]],
 ) -> bool:
-    """仅在没有 ready、没有 open ai/* PR、没有进行中 ticket 时选题。"""
-    return not ready and not open_prs and not active
+    """仅在没有 open ready、open ai/* PR、open 进行中 ticket 时选题。
+
+    Closed issues can keep stale status labels after being closed; they are not
+    active work and must not block Autopilot forever.
+    """
+    return not open_only(ready) and not open_only(open_prs) and not open_only(active)
 
 
 def maybe_run_planner(
@@ -1315,6 +1609,9 @@ def maybe_run_planner(
 ) -> int:
     if not autopilot_enabled():
         print("planner: disabled（MARKETUS_AUTOPILOT=0）")
+        return 0
+    if not planner_can_create_tickets():
+        print("planner: skipped（MARKETUS_TICKET_SOURCE=human）")
         return 0
     if not should_run_planner(ready, open_prs, active):
         print("planner: skipped（仍有 ready / 进行中 ticket 或 ai/* PR）")

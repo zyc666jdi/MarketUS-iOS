@@ -252,11 +252,26 @@ sequenceDiagram
 - Agent 进程无 `sudo`、无生产密钥；`GH_TOKEN` 仅 repo 范围。
 - Agent 永远没有合并权；Dispatcher 也没有（只发请求）。
 - 受保护路径在 Prompt 与 PR 校验中双重拦截。
+- 自动收尾 commit 前必须扫描 staged diff；命中密钥即 blocked 并删除 worktree。
 - 运行日志可能含代码，但不得含 token；日志写入 `.agent/runs/`（gitignored）。
 
 ## 13. 幂等与崩溃恢复
 
 - 每轮先读 GitHub 状态，再读本地 `state/<issue>.json`；以 GitHub 为准。
+- `set_status(issue, target)` 一次写清状态：移除其他 `status:*`（`status:done` 作为终态保留），
+  再添加目标标签；重复调用结果一致。
+- `postmerge` 可重复执行：无论 issue 是否已 `done`，都会清理对应 worktree 与 PR 上的
+  `status:*` 标签；若 issue 还有 `status:done` 之外的残留状态，`set_status(done)` 会保留
+  done 并清除残留。合并评论用 `<!-- dispatcher-merged pr=N -->` marker 去重；上次在
+  「评论」与「改状态」之间崩溃时，重跑会补评论而不会重复。
+- `once` 在 Agent 退出后仍无 PR 时自动收尾：若 worktree 有未提交改动或分支领先
+  `origin/main`，Dispatcher 执行 `git add -A` / commit / push，并以 **draft** PR 创建。
+  commit 前强制扫描 staged diff：优先调用 `gitleaks protect --staged`，未安装 gitleaks 时
+  使用与默认规则对齐的高置信度内置规则；命中即 `status:blocked`、评论命中规则与文件
+  （不输出密钥值）并删除 worktree，绝不 push。
+- 自动收尾 PR 带 `ai:generated` / `risk:*` / `size:*` 标签，body 从 ticket 类型、验收标准与
+  风险标签生成；issue 进入 `status:awaiting-human`，由人工补齐证据并标记 ready 后再评审。
+  commit / push / `gh pr create` 任一步失败时，评论会带上失败步骤与 stderr。
 - `run id` 写入标签评论与本地文件；重复启动时若发现活跃租约 → 跳过。
 - Dispatcher 崩溃后重启：Reaper 先回收过期租约，再继续调度。
 - 所有写操作（标签/评论/PR）都可重复执行；评论用固定 marker 去重。
@@ -373,9 +388,14 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.marketus.dispatcher.plis
 
 `run` 完成收尾、修复、派发与评审后，只有同时满足下面三条才会调用 Planner：
 
-1. 没有 `status:ready` ticket；
+1. 没有 open 的 `status:ready` ticket；
 2. 没有 open 的 `ai/*` PR；
-3. 没有 `status:claimed / in-progress / in-review / awaiting-human` 的 ticket。
+3. 没有 open 的 `status:claimed / in-progress / in-review / awaiting-human` ticket。
+
+已关闭 issue 上残留的状态标签不算「进行中」，不会永久阻塞 Planner。
+Ticket 来源：`MARKETUS_TICKET_SOURCE=ai`（默认，允许 Planner 开票）或
+`human`（只由人类开票，Planner 跳过）。非法值按 `human` 处理，避免拼写错误导致
+自动开票。
 
 每轮最多创建 **1 张** ticket；创建后本轮结束，下一轮 `run` 才会派发，避免
 「选题 + 实现」在同一轮失控。
