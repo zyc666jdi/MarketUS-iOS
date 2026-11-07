@@ -662,7 +662,7 @@ class PlannerCommandTests(unittest.TestCase):
         self.state_path = self.root / "state/autopilot.json"
         self.run_root = self.root / "runs"
 
-    def _call(self, *, state=None, issues=None, proposal=PLANNER_PROPOSAL, execute=True):
+    def _call(self, *, state=None, issues=None, proposal=PLANNER_PROPOSAL, execute=True, env=None):
         if state is not None:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -675,7 +675,7 @@ class PlannerCommandTests(unittest.TestCase):
             mock.patch.object(dispatcher, "run_review_agent", return_value=(text, 0)) as agent_run,
             mock.patch.object(dispatcher, "gh") as gh,
             mock.patch.object(dispatcher, "notify") as notify,
-            mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1"}),
+            mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1", **(env or {})}),
         ):
             gh.return_value = subprocess.CompletedProcess([], 0, "https://example/issues/99\n", "")
             code = dispatcher.cmd_planner(argparse.Namespace(execute=execute, timeout=20))
@@ -748,6 +748,215 @@ class PlannerCommandTests(unittest.TestCase):
         self.assertEqual((code, gh.called), (0, False))
         state = self._saved_state()
         self.assertEqual((state["created_today"], state["last_skip"]), (0, "no safe candidate"))
+
+    def test_human_ticket_source_does_not_call_planner(self):
+        code, agent_run, gh, _ = self._call(env={"MARKETUS_TICKET_SOURCE": "human"})
+        self.assertEqual((code, gh.called), (0, False))
+        agent_run.assert_not_called()
+        self.assertFalse(self.state_path.exists())
+
+
+class PostmergeIdempotencyTests(unittest.TestCase):
+    def _postmerge(self, issue_labels: set[str], pr_labels: set[str]):
+        prs = [
+            {
+                "number": 42,
+                "body": "",
+                "headRefName": "ai/40-test",
+                "url": "https://example/pr/42",
+                "labels": [{"name": name} for name in pr_labels],
+            }
+        ]
+        issue = {"number": 40, "labels": [{"name": name} for name in issue_labels]}
+        calls = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "40-test"
+            worktree.mkdir()
+            with (
+                mock.patch.object(dispatcher, "gh_json", return_value=prs),
+                mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)) as gh,
+                mock.patch.object(dispatcher, "run") as run,
+            ):
+                run.return_value = subprocess.CompletedProcess([], 0, "", "")
+                code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=False))
+        return code, calls, gh, run
+
+    def test_done_issue_still_cleans_worktree_and_pr_status_labels(self):
+        code, calls, _, run = self._postmerge(
+            {"status:done"},
+            {"status:in-review", "status:awaiting-human", "merge:requested"},
+        )
+        self.assertEqual(code, 0)
+        worktree_remove = run.call_args.args[0]
+        self.assertEqual(worktree_remove[:3], ["git", "worktree", "remove"])
+        self.assertEqual(worktree_remove[-1], "--force")
+        pr_edits = [args for args in calls if args[:2] == ["pr", "edit"]]
+        self.assertEqual(len(pr_edits), 1)
+        self.assertIn("--remove-label", pr_edits[0])
+        self.assertIn("status:in-review", pr_edits[0])
+        self.assertIn("status:awaiting-human", pr_edits[0])
+        self.assertNotIn("--add-label", pr_edits[0])
+        self.assertFalse(any(args[:2] == ["issue", "edit"] for args in calls))
+        self.assertFalse(any(args[:2] == ["issue", "comment"] for args in calls))
+
+    def test_undone_issue_sets_done_comments_and_cleans_pr_labels(self):
+        code, calls, _, run = self._postmerge(
+            {"status:in-progress", "status:claimed"},
+            {"status:in-review"},
+        )
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        self.assertEqual(status_after({"status:in-progress", "status:claimed"}, calls), {"status:done"})
+        self.assertTrue(any(args[:2] == ["issue", "comment"] for args in calls))
+        self.assertTrue(any(args[:2] == ["pr", "edit"] for args in calls))
+
+
+class AutoSalvageTests(unittest.TestCase):
+    WORKTREE = Path("/tmp/agent-worktree")
+
+    def _run(self, *, dirty: bool, ahead: int, commit_ok: bool = True, push_ok: bool = True):
+        calls: list[list[str]] = []
+
+        def fake_run(args):
+            calls.append(list(args))
+            if args[:3] == ["git", "-C", str(self.WORKTREE)] and "status" in args:
+                return subprocess.CompletedProcess(args, 0, " M Sources/File.swift\n" if dirty else "", "")
+            if args[:3] == ["git", "-C", str(self.WORKTREE)] and "rev-list" in args:
+                return subprocess.CompletedProcess(args, 0, f"{ahead}\n", "")
+            if args[:3] == ["git", "-C", str(self.WORKTREE)] and "commit" in args:
+                return subprocess.CompletedProcess(args, 0 if commit_ok else 1, "", "" if commit_ok else "commit failed")
+            if args[:2] == ["git", "-C"] and "push" in args:
+                return subprocess.CompletedProcess(args, 0 if push_ok else 1, "", "" if push_ok else "push failed")
+            if args[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(args, 0, "https://example/pull/77\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+            result = dispatcher.ensure_agent_pr(self.WORKTREE, "ai/40-test", {"number": 40, "title": "test"})
+        return result, calls
+
+    def test_dirty_worktree_is_committed_pushed_and_pr_opened(self):
+        result, calls = self._run(dirty=True, ahead=0)
+        self.assertEqual(result["number"], 77)
+        self.assertIn("https://example/pull/77", result["url"])
+        self.assertTrue(any("add" in args for args in calls))
+        self.assertTrue(any("commit" in args for args in calls))
+        self.assertTrue(any("push" in args for args in calls))
+        self.assertTrue(any(args[:3] == ["gh", "pr", "create"] for args in calls))
+        commit = next(args for args in calls if "commit" in args)
+        self.assertIn("Refs: #40", commit)
+
+    def test_clean_but_unpushed_branch_is_pushed_and_pr_opened(self):
+        result, calls = self._run(dirty=False, ahead=1)
+        self.assertEqual(result["number"], 77)
+        self.assertFalse(any("commit" in args for args in calls))
+        self.assertTrue(any("push" in args for args in calls))
+
+    def test_no_work_and_no_new_commits_returns_none(self):
+        result, calls = self._run(dirty=False, ahead=0)
+        self.assertIsNone(result)
+        self.assertFalse(any(args[:3] == ["gh", "pr", "create"] for args in calls))
+        self.assertFalse(any("push" in args for args in calls))
+
+    def test_commit_failure_stops_before_push_and_pr(self):
+        result, calls = self._run(dirty=True, ahead=0, commit_ok=False)
+        self.assertIsNone(result)
+        self.assertFalse(any("push" in args for args in calls))
+        self.assertFalse(any(args[:3] == ["gh", "pr", "create"] for args in calls))
+
+    def test_push_failure_stops_before_pr(self):
+        result, calls = self._run(dirty=True, ahead=0, push_ok=False)
+        self.assertIsNone(result)
+        self.assertFalse(any(args[:3] == ["gh", "pr", "create"] for args in calls))
+
+
+class CmdOnceAutoSalvageTests(unittest.TestCase):
+    def _run(self, salvage):
+        labels = {"type:feature", "area:infrastructure", "priority:p1", "risk:low", "status:ready", "status:claimed"}
+        issue = {
+            "number": 40,
+            "title": "test",
+            "body": VALID_BODY,
+            "labels": [{"name": name} for name in labels],
+            "state": "open",
+            "author_association": "OWNER",
+        }
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "RUN_ROOT", Path(tmp) / "runs"),
+                mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+                mock.patch.object(dispatcher, "build_prompt", return_value="prompt"),
+                mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
+                mock.patch.object(dispatcher, "load_agent_secrets"),
+                mock.patch.object(dispatcher, "cmd"),
+                mock.patch.object(
+                    dispatcher.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ),
+                mock.patch.object(dispatcher, "ensure_agent_pr", return_value=salvage) as ensure,
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+                mock.patch.object(dispatcher, "comment"),
+                mock.patch.object(dispatcher, "notify"),
+            ):
+                code = dispatcher.cmd_once(argparse.Namespace(issue=40, execute=True, timeout=90))
+        return code, calls, ensure
+
+    def test_agent_exit_with_changes_marks_pr_in_review(self):
+        code, calls, ensure = self._run(
+            {"number": 77, "url": "https://example/pull/77", "title": "chore(agent)"}
+        )
+        self.assertEqual(code, 0)
+        ensure.assert_called_once()
+        self.assertEqual(status_after({"status:ready", "status:claimed"}, calls), {"status:in-review"})
+
+    def test_agent_exit_without_changes_is_blocked(self):
+        code, calls, ensure = self._run(None)
+        self.assertEqual(code, 1)
+        ensure.assert_called_once()
+        self.assertEqual(status_after({"status:ready", "status:claimed"}, calls), {"status:blocked"})
+
+
+class PlannerOpenIssueTests(unittest.TestCase):
+    def test_closed_issue_residual_labels_do_not_block_planner(self):
+        closed = {
+            "number": 3,
+            "state": "closed",
+            "labels": [{"name": "status:in-progress"}, {"name": "status:ready"}],
+        }
+        self.assertTrue(dispatcher.should_run_planner([], [], [closed]))
+        self.assertTrue(dispatcher.should_run_planner([closed], [], []))
+        self.assertTrue(dispatcher.should_run_planner([], [dict(closed, state="MERGED")], []))
+
+    def test_open_issue_still_blocks_planner(self):
+        active = {"number": 4, "state": "open", "labels": [{"name": "status:in-progress"}]}
+        self.assertFalse(dispatcher.should_run_planner([], [], [active]))
+        self.assertFalse(dispatcher.should_run_planner([dict(active, labels=[])], [], []))
+
+
+class TicketSourceTests(unittest.TestCase):
+    def test_default_and_explicit_sources(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MARKETUS_TICKET_SOURCE", None)
+            self.assertEqual(dispatcher.ticket_source(), "ai")
+        with mock.patch.dict(os.environ, {"MARKETUS_TICKET_SOURCE": "human"}):
+            self.assertEqual(dispatcher.ticket_source(), "human")
+            self.assertFalse(dispatcher.planner_can_create_tickets())
+        with mock.patch.dict(os.environ, {"MARKETUS_TICKET_SOURCE": "ai"}):
+            self.assertEqual(dispatcher.ticket_source(), "ai")
+            self.assertTrue(dispatcher.planner_can_create_tickets())
+
+    def test_human_source_is_skipped_by_autopilot_gate(self):
+        state = dispatcher.default_autopilot_state()
+        with (
+            mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1", "MARKETUS_TICKET_SOURCE": "human"}),
+        ):
+            self.assertIn("MARKETUS_TICKET_SOURCE=human", dispatcher.autopilot_gate(state) or "")
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ SUSPICIOUS_PATTERNS = [
     r"rm\s+-rf\s+/",
 ]
 
-ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url"
+ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url,state"
 
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
@@ -75,6 +75,7 @@ AUTOPILOT_PROMPT = Path("Tools/dispatcher/prompts/planner.md")
 AUTOPILOT_DAILY_LIMIT = 30
 AUTOPILOT_FAILURE_LIMIT = 2
 AUTOPILOT_RECENT_LIMIT = 50
+TICKET_SOURCES = {"human", "ai"}
 
 PLANNER_TYPE_LABELS = {"feature": "type:feature", "bug": "type:bug", "chore": "type:chore"}
 PLANNER_AREA_LABELS = {"watchlist", "quotes", "news", "portfolio", "settings", "design", "infra"}
@@ -231,6 +232,20 @@ def set_status(issue: int | dict[str, Any], target: str) -> None:
         args.extend(["--remove-label", label])
     args.extend(["--add-label", target])
     gh(args)
+
+
+def clear_status(issue: int | dict[str, Any], labels: set[str] | None = None, *, kind: str = "issue") -> bool:
+    """Remove every known status label; ``labels=None`` attempts all. Idempotent."""
+    number = issue["number"] if isinstance(issue, dict) else issue
+    names = set(STATUS_LABELS) if labels is None else set(labels)
+    args = [kind, "edit", str(number)]
+    for label in STATUS_LABELS:
+        if label in names:
+            args.extend(["--remove-label", label])
+    if len(args) == 3:
+        return False
+    gh(args)
+    return True
 
 
 def section(body: str, title: str) -> str:
@@ -418,6 +433,99 @@ def build_prompt(issue: dict[str, Any], worktree: Path, branch: str) -> str:
 """
 
 
+def worktree_dirty(worktree: Path) -> bool:
+    """Return True when the worktree has uncommitted changes."""
+    result = run(["git", "-C", str(worktree), "status", "--porcelain"])
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def branch_ahead(worktree: Path, base: str = "origin/main") -> int:
+    """Count commits on the worktree branch that are not on ``base``."""
+    result = run(["git", "-C", str(worktree), "rev-list", "--count", f"{base}..HEAD"])
+    if result.returncode != 0:
+        return 0
+    try:
+        return max(0, int(result.stdout.strip() or "0"))
+    except ValueError:
+        return 0
+
+
+def worktree_has_work(worktree: Path) -> bool:
+    return worktree_dirty(worktree) or branch_ahead(worktree) > 0
+
+
+def commit_agent_work(worktree: Path, issue_number: int) -> bool:
+    """Commit any pending worktree changes; no-op when already clean."""
+    if not worktree_dirty(worktree):
+        return True
+    if run(["git", "-C", str(worktree), "add", "-A"]).returncode != 0:
+        return False
+    result = run(
+        [
+            "git", "-C", str(worktree),
+            "-c", "user.name=marketus-dispatcher",
+            "-c", "user.email=dispatcher@users.noreply.github.com",
+            "commit", "-m", f"chore(agent): capture work for #{issue_number}",
+            "-m", f"Refs: #{issue_number}",
+        ]
+    )
+    return result.returncode == 0
+
+
+def build_auto_pr_body(issue: dict[str, Any]) -> str:
+    number = issue["number"]
+    return (
+        f"## 关联 Ticket\n\nFixes #{number}\n\n"
+        "## 变更类型\n\n- [x] chore（Dispatcher 自动收尾）\n\n"
+        "## 摘要\n\n- Agent 退出时未创建 PR，但分支存在改动。\n"
+        "- Dispatcher 已自动 add/commit/push 并创建本 PR；评审前需补齐证据。\n\n"
+        "## 验收标准对照\n\n| 验收标准 | 状态 | 证据 |\n| --- | --- | --- |\n"
+        "| 见 ticket 正文 | ⏳ | 待补充 |\n\n"
+        "## 测试证据\n\n- 自动收尾未额外运行测试；评审前请复跑 `make verify`。\n\n"
+        "## UI 变更\n\n- 见实际 diff。\n\n"
+        "## 影响面与风险\n\n"
+        f"- 受影响模块：见 ticket #{number}\n"
+        "- 风险等级：`medium`（未由 Implementer 自检）\n"
+        "- 回滚方案：revert 本 PR\n\n"
+        "## 自查清单（提交者，含 Agent）\n\n"
+        "- [ ] 见 ticket 验收标准与 `make verify` 证据；需人工补齐。\n\n"
+        f"<!-- dispatcher-auto-pr issue={number} -->\n"
+    )
+
+
+def ensure_agent_pr(worktree: Path, branch: str, issue: dict[str, Any]) -> dict[str, Any] | None:
+    """Salvage an Agent run that left changes but no PR.
+
+    Commits pending files, pushes the branch, and opens a PR. Returns a PR
+    payload compatible with ``gh pr list`` output, or None when there is
+    nothing to salvage or a git/gh step fails.
+    """
+    if not worktree_has_work(worktree):
+        return None
+    if not commit_agent_work(worktree, issue["number"]):
+        return None
+    push = run(["git", "-C", str(worktree), "push", "-u", "origin", branch])
+    if push.returncode != 0:
+        return None
+
+    title = f"chore(agent): 自动收尾 #{issue['number']}"
+    created = run(
+        ["gh", "pr", "create", "--base", "main", "--head", branch,
+         "--title", title, "--body", build_auto_pr_body(issue)]
+    )
+    if created.returncode != 0:
+        return None
+    lines = [line.strip() for line in (created.stdout or "").splitlines() if line.strip()]
+    url = lines[-1] if lines else ""
+    match = re.search(r"/pull/(\d+)", url)
+    return {
+        "number": int(match.group(1)) if match else 0,
+        "url": url,
+        "title": title,
+        "headRefName": branch,
+    }
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     number = args.issue
     issue = issue_detail(number)
@@ -526,16 +634,23 @@ def cmd_once(args: argparse.Namespace) -> int:
         run(["gh", "pr", "list", "--head", branch, "--json", "number,url,title", "--limit", "1"]).stdout or "[]"
     )
 
+    auto_pr = None
+    if not prs:
+        auto_pr = ensure_agent_pr(worktree, branch, issue)
+        if auto_pr is not None:
+            prs = [auto_pr]
+
     if prs:
         pr = prs[0]
         set_status(number, "status:in-review")
-        comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
+        origin_text = "（Dispatcher 自动收尾）" if auto_pr is not None else ""
+        comment(number, f"✅ PR 已创建{origin_text}：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
         notify("MarketUS PR 已创建", f"#{number} {pr['url']}")
         print(f"PR: {pr['url']}")
         return 0
 
     set_status(number, "status:blocked")
-    reason = "Agent 退出码非 0" if agent_failed else "未检测到 PR"
+    reason = "Agent 退出码非 0" if agent_failed else "未检测到 PR，且自动收尾未产生可提交改动"
     comment(number, f"⛔ {reason}。worktree: `{worktree}`，日志：`.agent/runs/{number}/`")
     print(f"⛔ {reason}")
     return 1
@@ -706,7 +821,7 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
             "--limit",
             "50",
             "--json",
-            "number,title,body,headRefName,url",
+            "number,title,body,headRefName,url,labels",
         ]
     )
     changed = 0
@@ -719,18 +834,25 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         except SystemExit:
             continue
         labels = labels_of(issue)
-        if "status:done" in labels:
-            continue
+        already_done = "status:done" in labels
         print(f"merged PR #{pr['number']} → issue #{issue_number}")
         if args.dry_run:
             continue
-        set_status(issue_number, "status:done")
-        gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}"])
+
+        # Cleanup is unconditional: a previous run may have set done before the
+        # worktree/PR labels were cleaned, and retries must still converge.
         branch = pr.get("headRefName", "")
         if "/" in branch:
             worktree = WORKTREE_ROOT / branch.split("/", 1)[1]
             if worktree.exists():
                 run(["git", "worktree", "remove", str(worktree), "--force"])
+
+        pr_labels = labels_of(pr) if "labels" in pr else None
+        clear_status(pr["number"], pr_labels, kind="pr")
+
+        if not already_done:
+            set_status(issue_number, "status:done")
+            gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}"])
         changed += 1
     print(f"postmerge: {changed} issue(s) updated")
     return 0
@@ -952,6 +1074,25 @@ def autopilot_enabled() -> bool:
     return os.environ.get("MARKETUS_AUTOPILOT", "1").strip() != "0"
 
 
+def ticket_source() -> str:
+    """Ticket 来源：``human`` 表示只由人类开票，``ai`` 允许 Planner 开票。"""
+    value = os.environ.get("MARKETUS_TICKET_SOURCE", "ai").strip().lower()
+    return value if value in TICKET_SOURCES else "ai"
+
+
+def planner_can_create_tickets() -> bool:
+    return ticket_source() != "human"
+
+
+def is_open_issue(issue: dict[str, Any]) -> bool:
+    """Treat a missing state as open (``gh issue list --state open`` payloads)."""
+    return str(issue.get("state") or "open").strip().lower() == "open"
+
+
+def open_only(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if is_open_issue(item)]
+
+
 def autopilot_today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
@@ -1063,6 +1204,8 @@ def autopilot_gate(state: dict[str, Any]) -> str | None:
     """返回跳过原因；None 表示可以调用 Planner。"""
     if not autopilot_enabled():
         return "MARKETUS_AUTOPILOT=0，Autopilot 已关闭"
+    if not planner_can_create_tickets():
+        return "MARKETUS_TICKET_SOURCE=human，Planner 不创建 ticket"
     if state.get("frozen") is True:
         return f"Autopilot 已冻结：{state.get('frozen_reason') or '连续失败达到上限'}"
     if _non_negative_int(state.get("created_today")) >= AUTOPILOT_DAILY_LIMIT:
@@ -1303,8 +1446,12 @@ def should_run_planner(
     open_prs: list[dict[str, Any]],
     active: list[dict[str, Any]],
 ) -> bool:
-    """仅在没有 ready、没有 open ai/* PR、没有进行中 ticket 时选题。"""
-    return not ready and not open_prs and not active
+    """仅在没有 open ready、open ai/* PR、open 进行中 ticket 时选题。
+
+    Closed issues can keep stale status labels after being closed; they are not
+    active work and must not block Autopilot forever.
+    """
+    return not open_only(ready) and not open_only(open_prs) and not open_only(active)
 
 
 def maybe_run_planner(
@@ -1315,6 +1462,9 @@ def maybe_run_planner(
 ) -> int:
     if not autopilot_enabled():
         print("planner: disabled（MARKETUS_AUTOPILOT=0）")
+        return 0
+    if not planner_can_create_tickets():
+        print("planner: skipped（MARKETUS_TICKET_SOURCE=human）")
         return 0
     if not should_run_planner(ready, open_prs, active):
         print("planner: skipped（仍有 ready / 进行中 ticket 或 ai/* PR）")

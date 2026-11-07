@@ -257,6 +257,13 @@ sequenceDiagram
 ## 13. 幂等与崩溃恢复
 
 - 每轮先读 GitHub 状态，再读本地 `state/<issue>.json`；以 GitHub 为准。
+- `set_status(issue, target)` 一次写清状态：移除其他 `status:*`（`status:done` 作为终态保留），
+  再添加目标标签；重复调用结果一致。
+- `postmerge` 可重复执行：无论 issue 是否已 `done`，都会清理对应 worktree 与 PR 上的
+  `status:*` 标签；只有首次从非 done 迁移时才评论，避免重复噪音。
+- `once` 在 Agent 退出后仍无 PR 时自动收尾：若 worktree 有未提交改动或分支领先
+  `origin/main`，Dispatcher 执行 `git add -A` / commit / push，并用 PR 模板创建 PR，
+  issue 进入 `status:in-review`；任一步失败则 `status:blocked`，保留日志。
 - `run id` 写入标签评论与本地文件；重复启动时若发现活跃租约 → 跳过。
 - Dispatcher 崩溃后重启：Reaper 先回收过期租约，再继续调度。
 - 所有写操作（标签/评论/PR）都可重复执行；评论用固定 marker 去重。
@@ -373,9 +380,13 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.marketus.dispatcher.plis
 
 `run` 完成收尾、修复、派发与评审后，只有同时满足下面三条才会调用 Planner：
 
-1. 没有 `status:ready` ticket；
+1. 没有 open 的 `status:ready` ticket；
 2. 没有 open 的 `ai/*` PR；
-3. 没有 `status:claimed / in-progress / in-review / awaiting-human` 的 ticket。
+3. 没有 open 的 `status:claimed / in-progress / in-review / awaiting-human` ticket。
+
+已关闭 issue 上残留的状态标签不算「进行中」，不会永久阻塞 Planner。
+Ticket 来源：`MARKETUS_TICKET_SOURCE=ai`（默认，允许 Planner 开票）或
+`human`（只由人类开票，Planner 跳过）。
 
 每轮最多创建 **1 张** ticket；创建后本轮结束，下一轮 `run` 才会派发，避免
 「选题 + 实现」在同一轮失控。
