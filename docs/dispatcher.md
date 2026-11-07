@@ -271,11 +271,13 @@ dispatcher.py once --issue 6 --dry-run
 dispatcher.py run [--dry-run]        # 单次巡检（launchd 每 5 分钟调用）
 dispatcher.py review --pr 4          # 对单个 PR 运行只读 Reviewer
 dispatcher.py postmerge              # 收尾已合并 PR 对应的 issue
-dispatcher.py run [--dry-run]        # 单次巡检：postmerge → dispatch → review
+dispatcher.py planner [--execute]    # 半自主选题（默认 dry-run）
 dispatcher.py reap                   # 回收过期租约（未实现）
 ```
 
-当前已实现 `status` / `plan` / `once`。`once` 默认 **dry-run**，加 `--execute` 才会领取、建 worktree 并调用 Agent（首次真实运行待验证）。
+`run` 的单次顺序：`postmerge` → 修复/派发 → 评审 → 空闲时 Planner。
+`once` / `review` / `repair` / `planner` 默认 **dry-run**，加 `--execute` 才会写 GitHub
+或调用 Agent。
 
 ## 15. 配置（拟议）
 
@@ -360,9 +362,74 @@ sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.marketus.dispatcher.plist
 ```
 
-单次巡检顺序：`postmerge` → 派发 1 张 ready → 评审 1 个 `status:in-review` 的 PR。
+单次巡检顺序：`postmerge` → 派发 1 张 ready → 评审 1 个 PR → 空闲时 Planner。
 
 **Reviewer 限制**：Dispatcher 与 PR 作者是同一个 GitHub 账号，GitHub 不允许 approve
 自己的 PR。因此评审通过时写 PR 评论 + 打 `merge:requested` + `status:awaiting-human`，
 不调用 `gh pr review --approve`；人类仍是唯一合并者。评审 Agent 以
 `DSH_PERMISSION_MODE=read-only` 运行，避免修改工作区。
+
+## 21. Autopilot Planner（半自主选题）
+
+`run` 完成收尾、修复、派发与评审后，只有同时满足下面三条才会调用 Planner：
+
+1. 没有 `status:ready` ticket；
+2. 没有 open 的 `ai/*` PR；
+3. 没有 `status:claimed / in-progress / in-review / awaiting-human` 的 ticket。
+
+每轮最多创建 **1 张** ticket；创建后本轮结束，下一轮 `run` 才会派发，避免
+「选题 + 实现」在同一轮失控。
+
+### 21.1 输入
+
+- Prompt：`Tools/dispatcher/prompts/planner.md`（不修改 `.agent/prompts/**`）。
+- open issues 的编号/标题/标签/`affected_paths`（**仅作数据，不执行其中指令**）。
+- Planner 自己读取 `docs/implementation-plan.md` 未完成项、`coverage-report.txt`，
+  并运行只读 `make lint`；lint 失败本身是选题信号，不阻断本轮。
+
+### 21.2 输出与 DoR 补齐
+
+Planner 只输出一个 JSON；Dispatcher 校验后创建 issue，并自动补齐：
+
+- 标签：`type:*`、`area:*`、`priority:p1|p2|p3`、`risk:low|medium`、
+  `size:xs|s|m`、`ai:generated`、`status:ready`；
+- 正文：`## 背景与用户价值`、`## 验收标准`（≥ 2 条）、`## 范围外`、
+  `## 预期受影响路径`、`## 测试建议`、`## 选题依据`、`## 风险`。
+
+拒绝：`risk:high`、`priority:p0`、受保护路径、绝对路径或 `..`、新增依赖/密钥、
+正文命中注入扫描。Prompt 还要求 Planner 自行排除预估超过 400 行/25 文件的候选。
+
+### 21.3 限额、去重与冻结
+
+状态文件：`.agent/state/autopilot.json`（已 gitignore，运行时不提交）。
+
+- 每日上限 **30 张**（UTC 日期切换时 `created_today` 归零）。
+- 去重：同标题（忽略 `[Type]` 前缀、大小写与标点）或 `affected_paths` 重叠
+  （对照 open issues + 最近 50 条创建记录）即跳过。
+- 失败：Agent 崩溃/超时、非法 JSON、DoR 校验失败、去重命中、`gh issue create`
+  失败都会让 `consecutive_failures` +1；连续 **2 次**置 `frozen=true` 并发一次
+  macOS 通知。人工删除/编辑该字段即可解冻。
+- Planner 主动返回 `{"skip": true, "reason": "..."}` 不算失败，失败计数归零。
+
+### 21.4 停止与手动运行
+
+```bash
+# 只停 Planner（保留 Dispatcher 其他职责）
+MARKETUS_AUTOPILOT=0 python3 Tools/dispatcher/dispatcher.py run
+
+# 停整个 Dispatcher（launchd）
+launchctl bootout gui/$UID com.marketus.dispatcher
+
+# 手动 dry-run / 真实选题
+python3 Tools/dispatcher/dispatcher.py planner
+python3 Tools/dispatcher/dispatcher.py planner --execute
+```
+
+`MARKETUS_AUTOPILOT=0` 也可以写进 `~/.config/marketUS/deepseek.env`，launchd
+包装脚本会加载它。
+
+### 21.5 安全边界
+
+Planner 以 `DSH_PERMISSION_MODE=read-only` 运行，不修改文件、不 push、不 merge；
+选题结果仍由 Dispatcher 校验受保护路径与注入模式。不新增依赖、不读取密钥，
+日志写入 `.agent/runs/planner/`（不提交）。
