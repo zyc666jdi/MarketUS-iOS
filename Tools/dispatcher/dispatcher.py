@@ -128,6 +128,11 @@ def slugify(title: str, limit: int = 40) -> str:
     return (slug[:limit].strip("-") or "ticket")
 
 
+def is_merge_command(command: list[str]) -> bool:
+    """Return True for a ``gh pr merge`` invocation; agents never merge."""
+    return len(command) >= 3 and command[0] == "gh" and command[1] == "pr" and command[2] == "merge"
+
+
 def gh(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     result = run(["gh", *args])
     if check and result.returncode != 0:
@@ -163,6 +168,8 @@ def comment(number: int, body: str) -> None:
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    if is_merge_command(cmd):
+        raise SystemExit("⛔ Agent 永不合并：拒绝执行 gh pr merge，请由人类合并。")
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
@@ -183,6 +190,26 @@ def repo_slug() -> str:
 
 def labels_of(issue: dict[str, Any]) -> set[str]:
     return {label["name"] for label in issue.get("labels", [])}
+
+
+def set_status(issue: int | dict[str, Any], target: str) -> None:
+    """Move an issue to ``target`` and clear every other status label.
+
+    ``issue`` accepts an issue number or a GitHub issue payload. ``status:done``
+    is terminal and is never removed here, even when moving to another status.
+    The target is always added, so this is idempotent.
+    """
+    if target not in STATUS_LABELS:
+        raise ValueError(f"unknown status label: {target}")
+
+    number = issue["number"] if isinstance(issue, dict) else issue
+    args = ["issue", "edit", str(number)]
+    for label in STATUS_LABELS:
+        if label in ("status:done", target):
+            continue
+        args.extend(["--remove-label", label])
+    args.extend(["--add-label", target])
+    gh(args)
 
 
 def section(body: str, title: str) -> str:
@@ -408,7 +435,7 @@ def cmd_once(args: argparse.Namespace) -> int:
         return 1
 
     run_id = make_run_id(number)
-    gh(["issue", "edit", str(number), "--remove-label", "status:ready", "--add-label", "status:claimed"])
+    set_status(number, "status:claimed")
     comment(
         number,
         f"🤖 claimed\n\n- run: `{run_id}`\n- at: `{now_iso()}`\n- branch: `{branch}`",
@@ -422,11 +449,11 @@ def cmd_once(args: argparse.Namespace) -> int:
         cmd(["git", "fetch", "origin", "main"])
         cmd(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
     except SystemExit as error:
-        gh(["issue", "edit", str(number), "--remove-label", "status:claimed", "--add-label", "status:blocked"])
+        set_status(number, "status:blocked")
         comment(number, f"⛔ 创建 worktree 失败：{error}")
         return 1
 
-    gh(["issue", "edit", str(number), "--add-label", "status:in-progress"])
+    set_status(number, "status:in-progress")
 
     run_dir = RUN_ROOT / str(number)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -452,19 +479,7 @@ def cmd_once(args: argparse.Namespace) -> int:
         (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
         agent_failed = result.returncode != 0
     except subprocess.TimeoutExpired:
-        gh(
-            [
-                "issue",
-                "edit",
-                str(number),
-                "--remove-label",
-                "status:in-progress",
-                "--remove-label",
-                "status:claimed",
-                "--add-label",
-                "status:blocked",
-            ]
-        )
+        set_status(number, "status:blocked")
         comment(number, f"⛔ Agent 超时（{args.timeout} 分钟）。日志：`.agent/runs/{number}/`")
         return 1
     except FileNotFoundError:
@@ -473,39 +488,16 @@ def cmd_once(args: argparse.Namespace) -> int:
     prs = json.loads(
         run(["gh", "pr", "list", "--head", branch, "--json", "number,url,title", "--limit", "1"]).stdout or "[]"
     )
-    gh(["issue", "edit", str(number), "--remove-label", "status:in-progress"])
 
     if prs:
         pr = prs[0]
-        gh(
-            [
-                "issue",
-                "edit",
-                str(number),
-                "--remove-label",
-                "status:claimed",
-                "--add-label",
-                "status:in-review",
-            ]
-        )
+        set_status(number, "status:in-review")
         comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
         notify("MarketUS PR 已创建", f"#{number} {pr['url']}")
         print(f"PR: {pr['url']}")
         return 0
 
-    gh(
-        [
-            "issue",
-            "edit",
-            str(number),
-            "--remove-label",
-            "status:in-progress",
-            "--remove-label",
-            "status:claimed",
-            "--add-label",
-            "status:blocked",
-        ]
-    )
+    set_status(number, "status:blocked")
     reason = "Agent 退出码非 0" if agent_failed else "未检测到 PR"
     comment(number, f"⛔ {reason}。worktree: `{worktree}`，日志：`.agent/runs/{number}/`")
     print(f"⛔ {reason}")
@@ -632,10 +624,7 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     labels = labels_of(issue)
     if "status:in-progress" in labels:
-        edit_args = ["issue", "edit", str(issue_number), "--remove-label", "status:in-progress"]
-        if "status:in-review" not in labels:
-            edit_args.extend(["--add-label", "status:in-review"])
-        gh(edit_args)
+        set_status(issue_number, "status:in-review")
 
     run_dir = RUN_ROOT / f"review-{args.pr}"
     text, code = run_review_agent(prompt, run_dir, args.timeout)
@@ -648,7 +637,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             f"## ⛔ Dispatcher Review 未能给出 verdict\n\n日志：`.agent/runs/review-{args.pr}/`\n\n"
             f"<!-- {marker} verdict=MISSING -->",
         )
-        gh(["issue", "edit", str(issue_number), "--remove-label", "status:in-review", "--add-label", "status:blocked"])
+        set_status(issue_number, "status:blocked")
         return 1
 
     body = (
@@ -660,32 +649,12 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     if verdict == "APPROVE":
         gh(["pr", "edit", str(args.pr), "--add-label", "merge:requested"])
-        gh(
-            [
-                "issue",
-                "edit",
-                str(issue_number),
-                "--remove-label",
-                "status:in-review",
-                "--add-label",
-                "status:awaiting-human",
-            ]
-        )
+        set_status(issue_number, "status:awaiting-human")
         notify("MarketUS PR 可合并", f"PR #{args.pr} 评审通过，等待你合并")
         print("✅ APPROVE — 已请求人工合并")
         return 0
 
-    gh(
-        [
-            "issue",
-            "edit",
-            str(issue_number),
-            "--remove-label",
-            "status:in-review",
-            "--add-label",
-            "status:in-progress",
-        ]
-    )
+    set_status(issue_number, "status:in-progress")
     print("⛔ REQUEST_CHANGES — 已退回实现")
     return 1
 
@@ -718,23 +687,7 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         print(f"merged PR #{pr['number']} → issue #{issue_number}")
         if args.dry_run:
             continue
-        gh(
-            [
-                "issue",
-                "edit",
-                str(issue_number),
-                "--remove-label",
-                "status:in-progress",
-                "--remove-label",
-                "status:awaiting-human",
-                "--remove-label",
-                "status:in-review",
-                "--remove-label",
-                "status:blocked",
-                "--add-label",
-                "status:done",
-            ]
-        )
+        set_status(issue_number, "status:done")
         gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}"])
         branch = pr.get("headRefName", "")
         if "/" in branch:
@@ -799,7 +752,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
         return 0
 
     if rounds >= 2:
-        gh(["issue", "edit", str(issue_number), "--add-label", "status:blocked"])
+        set_status(issue_number, "status:blocked")
         comment_pr(
             args.pr,
             f"⛔ 自动修复已达 2 轮上限，升级人类处理。\n\n<!-- {REPAIR_MARKER}{args.pr} sha={sha} round=blocked -->",
@@ -849,7 +802,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
             env=env,
         )
     except subprocess.TimeoutExpired:
-        gh(["issue", "edit", str(issue_number), "--add-label", "status:blocked"])
+        set_status(issue_number, "status:blocked")
         comment_pr(args.pr, f"⛔ 修复 Agent 超时。日志：`.agent/runs/repair-{args.pr}/`")
         return 1
 
@@ -857,22 +810,12 @@ def cmd_repair(args: argparse.Namespace) -> int:
     (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
     head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
     if head == base:
-        gh(["issue", "edit", str(issue_number), "--add-label", "status:blocked"])
+        set_status(issue_number, "status:blocked")
         comment_pr(args.pr, f"⛔ 修复未产生 commit。日志：`.agent/runs/repair-{args.pr}/`")
         return 1
 
     run(["git", "-C", str(worktree), "push", "origin", f"HEAD:{branch}"])
-    gh(
-        [
-            "issue",
-            "edit",
-            str(issue_number),
-            "--remove-label",
-            "status:in-progress",
-            "--add-label",
-            "status:in-review",
-        ]
-    )
+    set_status(issue_number, "status:in-review")
     comment_pr(
         args.pr,
         f"🤖 自动修复已提交 `{head[:8]}`，回到评审。\n\n<!-- {REPAIR_MARKER}{args.pr} sha={sha} round={rounds + 1} -->",
