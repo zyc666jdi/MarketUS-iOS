@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -173,12 +174,13 @@ class RunFallbackTests(unittest.TestCase):
             mock.patch.object(dispatcher, "age_minutes", return_value=age),
             mock.patch.object(dispatcher, "gh_json", side_effect=[[], prs]),
             mock.patch.object(dispatcher, "cmd_review") as review,
+            mock.patch.object(dispatcher, "maybe_run_planner") as planner,
         ):
             dispatcher.cmd_run(argparse.Namespace(dry_run=False, timeout=90))
-        return review, detail
+        return review, detail, planner
 
     def test_cmd_run_auto_reviews_in_progress_pr(self):
-        review, detail = self._run(
+        review, detail, _ = self._run(
             [ai_pr()],
             issue_with({"status:in-progress"}),
             details=[{"headRefOid": "abc123", "comments": []}],
@@ -190,7 +192,7 @@ class RunFallbackTests(unittest.TestCase):
     def test_cmd_run_skips_non_ai_pr(self):
         pr = ai_pr()
         pr["headRefName"] = "human/40-fallback-review-v2"
-        review, _ = self._run([pr], issue_with({"status:in-progress"}), details=[{"headRefOid": "abc123"}])
+        review, _, _ = self._run([pr], issue_with({"status:in-progress"}), details=[{"headRefOid": "abc123"}])
         review.assert_not_called()
 
     def test_cmd_run_skips_review_on_current_head(self):
@@ -198,7 +200,7 @@ class RunFallbackTests(unittest.TestCase):
             "headRefOid": "abc123",
             "comments": [{"body": "<!-- dispatcher-review pr=42 sha=abc123 verdict=APPROVE -->"}],
         }
-        review, _ = self._run([ai_pr()], issue_with({"status:in-progress"}), details=[detail])
+        review, _, _ = self._run([ai_pr()], issue_with({"status:in-progress"}), details=[detail])
         review.assert_not_called()
 
     def test_cmd_run_reviews_when_review_is_on_old_head(self):
@@ -206,12 +208,12 @@ class RunFallbackTests(unittest.TestCase):
             "headRefOid": "abc123",
             "comments": [{"body": "<!-- dispatcher-review pr=42 sha=def456 verdict=APPROVE -->"}],
         }
-        review, _ = self._run([ai_pr()], issue_with({"status:in-progress"}), details=[detail])
+        review, _, _ = self._run([ai_pr()], issue_with({"status:in-progress"}), details=[detail])
         review.assert_called_once()
         self.assertEqual(review.call_args.args[0].pr, 42)
 
     def test_cmd_run_skips_recent_pr(self):
-        review, _ = self._run(
+        review, _, _ = self._run(
             [ai_pr()],
             issue_with({"status:in-progress"}),
             details=[{"headRefOid": "abc123", "comments": []}],
@@ -222,7 +224,7 @@ class RunFallbackTests(unittest.TestCase):
     def test_cmd_run_skips_pr_without_created_at(self):
         for created_at in (None, ""):
             with self.subTest(created_at=created_at):
-                review, detail = self._run(
+                review, detail, _ = self._run(
                     [ai_pr(created_at=created_at)],
                     issue_with({"status:in-progress"}),
                     details=[{"headRefOid": "abc123", "comments": []}],
@@ -231,7 +233,7 @@ class RunFallbackTests(unittest.TestCase):
                 detail.assert_not_called()
 
     def test_cmd_run_skips_pr_detail_failure(self):
-        review, _ = self._run(
+        review, _, _ = self._run(
             [ai_pr()],
             issue_with({"status:in-progress"}),
             detail_error=SystemExit("gh failed"),
@@ -239,9 +241,15 @@ class RunFallbackTests(unittest.TestCase):
         review.assert_not_called()
 
     def test_cmd_run_reviews_in_review_pr_without_extra_detail_fetch(self):
-        review, detail = self._run([ai_pr(created_at=None)], issue_with({"status:in-review"}))
+        review, detail, _ = self._run([ai_pr(created_at=None)], issue_with({"status:in-review"}))
         review.assert_called_once()
         detail.assert_not_called()
+
+    def test_cmd_run_calls_planner_when_idle(self):
+        review, _, planner = self._run([], issue_with(set()), details=[{"headRefOid": "abc123"}])
+        review.assert_not_called()
+        planner.assert_called_once()
+        self.assertEqual(planner.call_args.args[1:], ([], [], []))
 
 
 class ReviewLabelTransitionTests(unittest.TestCase):
@@ -512,6 +520,230 @@ class ValidateTests(unittest.TestCase):
         labels = ("type:feature", "area:watchlist", "priority:p1", "risk:low", "security:suspicious")
         failures = dispatcher.validate(make_issue(VALID_BODY, labels=labels))
         self.assertTrue(any("security:suspicious" in item for item in failures))
+
+
+PLANNER_PROPOSAL = {
+    "type": "chore",
+    "area": "infra",
+    "priority": "p2",
+    "risk": "low",
+    "size": "s",
+    "title": "补充 Autopilot 状态测试",
+    "summary": "Autopilot 状态文件缺少边界测试，每日上限与冻结逻辑容易回归。",
+    "acceptance_criteria": [
+        "Given 连续失败 2 次，When Planner 再运行，Then 冻结并通知一次",
+        "Given 新的一天，Then created_today 重置为 0",
+    ],
+    "out_of_scope": ["不修改 .agent/**"],
+    "affected_paths": ["Tools/dispatcher/tests/**"],
+    "verification": ["python3 -m unittest Tools/dispatcher/tests/test_dispatcher.py"],
+    "rationale": "docs/implementation-plan.md Phase 3 要求可无人值守；当前缺少 Autopilot 测试。",
+}
+
+
+class AutopilotStateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = Path(self.tmp.name) / "autopilot.json"
+
+    def test_new_day_resets_created_today(self):
+        self.state_path.write_text(json.dumps({"date": "2000-01-01", "created_today": 30}), encoding="utf-8")
+        with mock.patch.object(dispatcher, "autopilot_today", return_value="2026-01-02"):
+            state = dispatcher.load_autopilot_state(self.state_path)
+        self.assertEqual((state["date"], state["created_today"]), ("2026-01-02", 0))
+
+    def test_gate_blocks_daily_limit_frozen_and_disabled(self):
+        state = dispatcher.default_autopilot_state()
+        state["created_today"] = dispatcher.AUTOPILOT_DAILY_LIMIT
+        with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1"}):
+            self.assertIn("上限", dispatcher.autopilot_gate(state) or "")
+        state = dispatcher.default_autopilot_state()
+        state.update({"frozen": True, "frozen_reason": "连续失败"})
+        with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1"}):
+            self.assertIn("冻结", dispatcher.autopilot_gate(state) or "")
+        with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "0"}):
+            self.assertIn("MARKETUS_AUTOPILOT=0", dispatcher.autopilot_gate(state) or "")
+
+    def test_two_failures_freeze_and_notify_once(self):
+        state = dispatcher.default_autopilot_state()
+        with mock.patch.object(dispatcher, "notify") as notify:
+            dispatcher.record_planner_failure(state, "bad json")
+            self.assertEqual((state["consecutive_failures"], state["frozen"]), (1, False))
+            notify.assert_not_called()
+            dispatcher.record_planner_failure(state, "bad json again")
+            dispatcher.record_planner_failure(state, "third")
+        self.assertEqual((state["consecutive_failures"], state["frozen"]), (3, True))
+        notify.assert_called_once()
+
+
+class ProposalTests(unittest.TestCase):
+    def test_valid_proposal_passes_dor_and_builds_labels(self):
+        proposal = dispatcher.normalize_proposal(PLANNER_PROPOSAL)
+        self.assertEqual(dispatcher.validate_proposal(proposal, patterns=[]), [])
+        labels = dispatcher.proposal_labels(proposal)
+        self.assertTrue({"risk:low", "status:ready", "ai:generated"} <= set(labels))
+        body = dispatcher.build_issue_body(proposal)
+        self.assertIn("## 验收标准", body)
+        self.assertEqual(dispatcher.validate({"labels": [{"name": n} for n in labels], "body": body}), [])
+
+    def test_rejects_unsafe_values(self):
+        cases = [
+            (dict(PLANNER_PROPOSAL, risk="high"), "risk"),
+            (dict(PLANNER_PROPOSAL, affected_paths=["AGENTS.md"]), "受保护路径"),
+            (dict(PLANNER_PROPOSAL, affected_paths=["MarketUS.entitlements"]), "受保护路径"),
+            (dict(PLANNER_PROPOSAL, affected_paths=["Tools/../AGENTS.md"]), "非法路径"),
+            (dict(PLANNER_PROPOSAL, acceptance_criteria=["只有一条"]), "验收标准"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(expected=expected):
+                failures = dispatcher.validate_proposal(
+                    dispatcher.normalize_proposal(raw),
+                    patterns=dispatcher.DEFAULT_PROTECTED_PATHS,
+                )
+                self.assertTrue(any(expected in item for item in failures), failures)
+
+    def test_find_duplicate_by_title_path_and_none(self):
+        proposal = dispatcher.normalize_proposal(PLANNER_PROPOSAL)
+        title_issue = {"number": 7, "title": "[Chore] 补充 Autopilot 状态测试", "body": ""}
+        self.assertIn("#7", dispatcher.find_duplicate(proposal, [title_issue]) or "")
+        path_issue = {
+            "number": 8,
+            "title": "[Chore] 另一个任务",
+            "body": "## 预期受影响路径\n- Tools/dispatcher/tests/**\n",
+        }
+        self.assertIn("#8", dispatcher.find_duplicate(proposal, [path_issue]) or "")
+        other = {"number": 9, "title": "[Chore] 无关任务", "body": "## 预期受影响路径\n- docs/dispatcher.md\n"}
+        self.assertIsNone(dispatcher.find_duplicate(proposal, [other]))
+
+
+class PlannerOutputTests(unittest.TestCase):
+    def test_parses_plain_fenced_and_ndjson(self):
+        expected = {"skip": True, "reason": "none"}
+        outputs = [
+            json.dumps(expected),
+            '说明\n```json\n{"skip": true, "reason": "none"}\n```\n',
+            '{"type":"status"}\n{"type":"final","text":"{\\"skip\\": true, \\"reason\\": \\"none\\"}"}\n',
+        ]
+        for output in outputs:
+            with self.subTest(output=output):
+                self.assertEqual(dispatcher.parse_planner_output(output), expected)
+
+
+class PlannerGateTests(unittest.TestCase):
+    def test_idle_and_blocking_conditions(self):
+        cases = [([], [], [], True), ([{"number": 1}], [], [], False)]
+        cases += [([], [{"number": 2}], [], False), ([], [], [{"number": 3}], False)]
+        for ready, prs, active, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(dispatcher.should_run_planner(ready, prs, active), expected)
+
+    def test_maybe_run_planner_honors_disabled_env(self):
+        with (
+            mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "0"}),
+            mock.patch.object(dispatcher, "cmd_planner") as planner,
+        ):
+            code = dispatcher.maybe_run_planner(argparse.Namespace(dry_run=False, planner_timeout=20), [], [], [])
+        self.assertEqual(code, 0)
+        planner.assert_not_called()
+
+
+class PlannerCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.prompt = self.root / "planner.md"
+        self.prompt.write_text("# planner\n只输出 JSON。", encoding="utf-8")
+        self.state_path = self.root / "state/autopilot.json"
+        self.run_root = self.root / "runs"
+
+    def _call(self, *, state=None, issues=None, proposal=PLANNER_PROPOSAL, execute=True):
+        if state is not None:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        text = json.dumps(proposal, ensure_ascii=False) if isinstance(proposal, dict) else proposal
+        with (
+            mock.patch.object(dispatcher, "AUTOPILOT_STATE", self.state_path),
+            mock.patch.object(dispatcher, "RUN_ROOT", self.run_root),
+            mock.patch.object(dispatcher, "AUTOPILOT_PROMPT", self.prompt),
+            mock.patch.object(dispatcher, "list_issues", return_value=issues or []),
+            mock.patch.object(dispatcher, "run_review_agent", return_value=(text, 0)) as agent_run,
+            mock.patch.object(dispatcher, "gh") as gh,
+            mock.patch.object(dispatcher, "notify") as notify,
+            mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1"}),
+        ):
+            gh.return_value = subprocess.CompletedProcess([], 0, "https://example/issues/99\n", "")
+            code = dispatcher.cmd_planner(argparse.Namespace(execute=execute, timeout=20))
+        return code, agent_run, gh, notify
+
+    def _saved_state(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_creates_one_ticket_and_updates_state(self):
+        code, agent_run, gh, notify = self._call()
+        self.assertEqual(code, 0)
+        agent_run.assert_called_once()
+        args = gh.call_args.args[0]
+        self.assertEqual(args[:3], ["issue", "create", "--title"])
+        self.assertTrue({"risk:low", "status:ready", "ai:generated"} <= set(args))
+        state = self._saved_state()
+        self.assertEqual((state["created_today"], state["consecutive_failures"]), (1, 0))
+        self.assertEqual(len(state["recent"]), 1)
+        notify.assert_called_once()
+
+    def test_dry_run_and_gates_skip_without_agent(self):
+        code, agent_run, gh, _ = self._call(execute=False)
+        self.assertEqual((code, gh.called), (0, False))
+        agent_run.assert_not_called()
+        self.assertFalse(self.state_path.exists())
+        for kwargs in [
+            {"state": {"date": dispatcher.autopilot_today(), "created_today": 30}},
+            {"state": {"frozen": True, "frozen_reason": "bad"}},
+        ]:
+            with self.subTest(kwargs=kwargs):
+                code, agent_run, gh, _ = self._call(**kwargs)
+                self.assertEqual(code, 0)
+                agent_run.assert_not_called()
+                gh.assert_not_called()
+
+    def test_dry_run_input_error_does_not_write_state(self):
+        with (
+            mock.patch.object(dispatcher, "AUTOPILOT_STATE", self.state_path),
+            mock.patch.object(dispatcher, "AUTOPILOT_PROMPT", self.root / "missing.md"),
+            mock.patch.object(dispatcher, "list_issues", return_value=[]),
+            mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1"}),
+        ):
+            code = dispatcher.cmd_planner(argparse.Namespace(execute=False, timeout=20))
+        self.assertEqual(code, 1)
+        self.assertFalse(self.state_path.exists())
+
+    def test_invalid_json_freezes_after_two_failures(self):
+        code, _, gh, _ = self._call(proposal="not json")
+        self.assertEqual((code, gh.called, self._saved_state()["consecutive_failures"]), (1, False, 1))
+        code, _, _, notify = self._call(proposal="not json")
+        state = self._saved_state()
+        self.assertEqual((code, state["consecutive_failures"], state["frozen"]), (1, 2, True))
+        notify.assert_called_once()
+
+    def test_duplicate_and_unsafe_proposals_are_not_created(self):
+        cases = [
+            ([{"number": 7, "title": "[Chore] 补充 Autopilot 状态测试", "body": ""}], PLANNER_PROPOSAL),
+            ([], dict(PLANNER_PROPOSAL, affected_paths=["AGENTS.md"])),
+            ([], dict(PLANNER_PROPOSAL, risk="high")),
+        ]
+        for issues, proposal in cases:
+            with self.subTest(proposal=proposal):
+                self.state_path.unlink(missing_ok=True)
+                code, _, gh, _ = self._call(issues=issues, proposal=proposal)
+                self.assertEqual(code, 1)
+                gh.assert_not_called()
+
+    def test_skip_output_does_not_create_ticket(self):
+        code, _, gh, _ = self._call(proposal={"skip": True, "reason": "no safe candidate"})
+        self.assertEqual((code, gh.called), (0, False))
+        state = self._saved_state()
+        self.assertEqual((state["created_today"], state["last_skip"]), (0, "no safe candidate"))
 
 
 if __name__ == "__main__":
