@@ -500,6 +500,14 @@ class ValidateTests(unittest.TestCase):
         failures = dispatcher.validate(make_issue(body))
         self.assertTrue(any("可疑" in item for item in failures))
 
+    def test_negated_merge_is_not_flagged(self):
+        self.assertEqual(dispatcher.suspicious_hits("不自动合并"), [])
+        self.assertEqual(dispatcher.suspicious_hits("禁止 Agent 执行 merge"), [])
+
+    def test_scope_out_section_is_exempt(self):
+        body = "## 范围外\n- 自动合并\n"
+        self.assertEqual(dispatcher.suspicious_hits(body), [])
+
     def test_suspicious_label_is_flagged(self):
         labels = ("type:feature", "area:watchlist", "priority:p1", "risk:low", "security:suspicious")
         failures = dispatcher.validate(make_issue(VALID_BODY, labels=labels))

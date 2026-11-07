@@ -235,8 +235,24 @@ def acceptance_lines(body: str) -> list[str]:
     return [line for line in block.splitlines() if re.match(r"^\s*[-*]\s+\S", line)]
 
 
+NEGATION_PATTERN = re.compile(r"(不|禁止|不得|勿|严禁|never|do\s+not|don't|no)", re.IGNORECASE)
+
+
+def _is_negated(text: str, start: int) -> bool:
+    prefix = text[max(0, start - 24):start]
+    return bool(NEGATION_PATTERN.search(prefix))
+
+
 def suspicious_hits(body: str) -> list[str]:
-    return [pattern for pattern in SUSPICIOUS_PATTERNS if re.search(pattern, body, re.IGNORECASE)]
+    scope = section(body, "范围外")
+    scanned = body.replace(scope, "") if scope else body
+    hits: list[str] = []
+    for pattern in SUSPICIOUS_PATTERNS:
+        for match in re.finditer(pattern, scanned, re.IGNORECASE):
+            if not _is_negated(scanned, match.start()):
+                hits.append(pattern)
+                break
+    return hits
 
 
 def validate(issue: dict[str, Any]) -> list[str]:
