@@ -489,6 +489,7 @@ def cmd_once(args: argparse.Namespace) -> int:
             ]
         )
         comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
+        notify("MarketUS PR 已创建", f"#{number} {pr['url']}")
         print(f"PR: {pr['url']}")
         return 0
 
@@ -898,6 +899,20 @@ def should_auto_review(labels: set[str], has_review: bool, age: float) -> bool:
     return not has_review and "status:in-progress" in labels and age > FALLBACK_REVIEW_MINUTES
 
 
+def cmd_watch(_args: argparse.Namespace) -> int:
+    """检查 open PR 的冲突与 CI 失败并通知。"""
+    prs = gh_json(["pr", "list", "--state", "open", "--limit", "50", "--json", "number,title,headRefName,mergeable,statusCheckRollup"])
+    for pr in prs:
+        if not pr.get("headRefName", "").startswith("ai/"):
+            continue
+        if pr.get("mergeable") == "CONFLICTING":
+            notify("MarketUS PR 有冲突", f"#{pr['number']} {pr['title']}")
+        failed = [c for c in (pr.get("statusCheckRollup") or []) if c.get("conclusion") in ("FAILURE", "CANCELLED")]
+        if failed:
+            notify("MarketUS PR CI 失败", f"#{pr['number']} {len(failed)} 个 check 失败")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     state_dir = Path(".agent/state")
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -911,6 +926,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
+        cmd_watch(argparse.Namespace())
 
         prs = gh_json(
             [
@@ -1041,6 +1057,8 @@ def main() -> int:
     repair_parser.add_argument("--execute", action="store_true")
     repair_parser.add_argument("--timeout", type=int, default=90)
 
+    subparsers.add_parser("watch", help="检查 open PR 冲突/CI 失败并通知")
+
     review_parser = subparsers.add_parser("review", help="对 PR 运行只读 Reviewer（默认 dry-run）")
     review_parser.add_argument("--pr", type=int, required=True)
     review_parser.add_argument("--execute", action="store_true")
@@ -1060,6 +1078,8 @@ def main() -> int:
         return cmd_plan(args)
     if args.command == "once":
         return cmd_once(args)
+    if args.command == "watch":
+        return cmd_watch(args)
     if args.command == "repair":
         return cmd_repair(args)
     if args.command == "review":
