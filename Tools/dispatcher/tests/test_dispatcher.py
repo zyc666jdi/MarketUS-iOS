@@ -139,6 +139,7 @@ class RunFallbackTests(unittest.TestCase):
         )
         with (
             mock.patch.object(dispatcher, "cmd_postmerge"),
+            mock.patch.object(dispatcher, "cmd_watch"),
             mock.patch.object(dispatcher, "list_issues", return_value=[]),
             mock.patch.object(dispatcher, "issue_detail", return_value=issue),
             detail_patch as detail,

@@ -900,17 +900,72 @@ def should_auto_review(labels: set[str], has_review: bool, age: float) -> bool:
 
 
 def cmd_watch(_args: argparse.Namespace) -> int:
-    """检查 open PR 的冲突与 CI 失败并通知。"""
-    prs = gh_json(["pr", "list", "--state", "open", "--limit", "50", "--json", "number,title,headRefName,mergeable,statusCheckRollup"])
+    """持久化跟踪 ai/* PR 的创建/合并/关闭/冲突/CI 失败，去重通知。"""
+    state_path = Path(".agent/state/pr-watch.json")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    known: dict[str, str] = state.get("known", {})
+    notified: set[str] = set(state.get("notified", []))
+    initialized = bool(known)
+
+    prs = gh_json(
+        [
+            "pr", "list", "--state", "open", "--limit", "50",
+            "--json", "number,title,headRefName,headRefOid,mergeable,statusCheckRollup",
+        ]
+    )
+    events: list[tuple[str, str, str]] = []
+    current: dict[str, str] = {}
     for pr in prs:
         if not pr.get("headRefName", "").startswith("ai/"):
             continue
+        n = str(pr["number"]); current[n] = "OPEN"
+        sha = pr.get("headRefOid", "")
+        if initialized and n not in known:
+            events.append(("MarketUS PR 已创建", f"#{n} {pr['title']}", f"created:{n}"))
         if pr.get("mergeable") == "CONFLICTING":
-            notify("MarketUS PR 有冲突", f"#{pr['number']} {pr['title']}")
+            events.append(("MarketUS PR 有冲突", f"#{n} {pr['title']}", f"conflict:{n}:{sha}"))
         failed = [c for c in (pr.get("statusCheckRollup") or []) if c.get("conclusion") in ("FAILURE", "CANCELLED")]
         if failed:
-            notify("MarketUS PR CI 失败", f"#{pr['number']} {len(failed)} 个 check 失败")
+            events.append(("MarketUS PR CI 失败", f"#{n} {len(failed)} 个 check 失败", f"ci:{n}:{sha}"))
+
+    for n in set(known) - set(current):
+        try:
+            detail = gh_json(["pr", "view", n, "--json", "state,title,url"])
+        except SystemExit:
+            continue
+        state_value = detail.get("state")
+        if state_value == "MERGED":
+            events.append(("MarketUS PR 已合并", f"#{n} {detail.get('title','')}", f"merged:{n}"))
+        elif state_value == "CLOSED":
+            events.append(("MarketUS PR 已关闭", f"#{n} {detail.get('title','')}", f"closed:{n}"))
+
+    for title, message, key in events:
+        if key in notified:
+            continue
+        notify(title, message)
+        print(f"watch: {title} — {message}")
+        notified.add(key)
+
+    state_path.write_text(
+        json.dumps({"known": current, "notified": sorted(notified)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return 0
+
+
+def flag_dor(issue: dict[str, Any], failures: list[str]) -> None:
+    number = issue["number"]
+    gh(["issue", "edit", str(number), "--add-label", "ai:needs-human-decision"])
+    detail = gh_json(["issue", "view", str(number), "--json", "comments"])
+    if any("<!-- dispatcher-dor -->" in (c.get("body") or "") for c in detail.get("comments", [])):
+        return
+    body = "⛔ **DoR 未通过，暂不派发**\n\n" + "\n".join(f"- {f}" for f in failures) + "\n\n<!-- dispatcher-dor -->"
+    comment(number, body)
+    notify("MarketUS DoR 未通过", f"#{number} 需要补充字段")
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -969,7 +1024,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         for issue in ready:
             failures = validate(issue)
             if failures:
+                print(f"DoR failed #{issue['number']}: {'; '.join(failures)}")
+                if not args.dry_run:
+                    flag_dor(issue, failures)
                 continue
+            if "ai:needs-human-decision" in labels_of(issue) and not args.dry_run:
+                gh(["issue", "edit", str(issue["number"]), "--remove-label", "ai:needs-human-decision"])
             print(f"dispatch #{issue['number']} {issue['title']}")
             cmd_once(
                 argparse.Namespace(
