@@ -67,6 +67,10 @@ class ParsingTests(unittest.TestCase):
         )
         self.assertIsNone(dispatcher.parse_verdict("no verdict"))
 
+    def test_agent_text_ignores_non_dict_json(self):
+        output = '"just-a-string"\n{"type":"final","text":"OK"}\n'
+        self.assertEqual(dispatcher.agent_text(output), "OK")
+
     def test_agent_text_reads_final_event(self):
         output = '{"type":"status"}\n{"type":"final","text":"OK"}\n'
         self.assertEqual(dispatcher.agent_text(output), "OK")

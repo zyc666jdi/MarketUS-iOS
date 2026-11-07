@@ -570,7 +570,7 @@ def agent_text(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") == "final" and event.get("text"):
+        if isinstance(event, dict) and event.get("type") == "final" and event.get("text"):
             final.append(str(event["text"]))
     return "\n".join(final) if final else output
 
