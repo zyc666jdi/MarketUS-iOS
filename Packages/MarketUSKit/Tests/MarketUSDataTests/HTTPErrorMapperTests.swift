@@ -57,6 +57,35 @@ final class HTTPErrorMapperTests: XCTestCase {
         XCTAssertEqual(HTTPErrorMapper.map(URLError(.cancelled)), .cancelled)
     }
 
+    func test_map_cancellationError_returnsCancelled() {
+        XCTAssertEqual(HTTPErrorMapper.map(CancellationError()), .cancelled)
+    }
+
+    func test_map_offlineURLErrors_returnsOffline() {
+        let codes: [URLError.Code] = [
+            .notConnectedToInternet,
+            .networkConnectionLost,
+            .dataNotAllowed,
+            .internationalRoamingOff,
+        ]
+
+        for code in codes {
+            XCTAssertEqual(HTTPErrorMapper.map(URLError(code)), .offline, "code \(code.rawValue)")
+        }
+    }
+
+    func test_map_timedOutURLError_returnsUnknownWithErrorCode() {
+        let code = URLError.Code.timedOut
+
+        XCTAssertEqual(HTTPErrorMapper.map(URLError(code)), .unknown("transport: \(code.rawValue)"))
+    }
+
+    func test_map_badURLURLError_returnsUnknownWithErrorCode() {
+        let code = URLError.Code.badURL
+
+        XCTAssertEqual(HTTPErrorMapper.map(URLError(code)), .unknown("transport: \(code.rawValue)"))
+    }
+
     func test_map_decodingError_returnsDecoding() {
         let error = DecodingError.dataCorrupted(
             DecodingError.Context(codingPath: [], debugDescription: "malformed payload")

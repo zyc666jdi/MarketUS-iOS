@@ -24,8 +24,18 @@ enum HTTPErrorMapper {
         if error is DecodingError {
             return .decoding
         }
-        if let urlError = error as? URLError, urlError.code == .cancelled {
+        if error is CancellationError {
             return .cancelled
+        }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .cancelled:
+                return .cancelled
+            case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
+                return .offline
+            default:
+                return .unknown("transport: \(urlError.code.rawValue)")
+            }
         }
         return .unknown(String(describing: error))
     }

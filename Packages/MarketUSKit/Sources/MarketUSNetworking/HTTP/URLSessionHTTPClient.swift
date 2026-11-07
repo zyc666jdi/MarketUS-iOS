@@ -42,12 +42,21 @@ public struct URLSessionHTTPClient: HTTPClient, @unchecked Sendable {
                 throw MarketError.unknown("non-http response")
             }
             return (data, http)
-        } catch let error as URLError where error.code == .cancelled {
-            throw MarketError.cancelled
         } catch is CancellationError {
             throw MarketError.cancelled
         } catch let error as URLError {
-            throw MarketError.unknown("transport: \(error.code.rawValue)")
+            throw Self.marketError(for: error)
+        }
+    }
+
+    private static func marketError(for error: URLError) -> MarketError {
+        switch error.code {
+        case .cancelled:
+            return .cancelled
+        case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
+            return .offline
+        default:
+            return .unknown("transport: \(error.code.rawValue)")
         }
     }
 }
