@@ -939,9 +939,8 @@ def cmd_watch(_args: argparse.Namespace) -> int:
             continue
         state_value = detail.get("state")
         if state_value == "MERGED":
-            events.append(("MarketUS PR 已合并", f"#{n} {detail.get('title','')}", f"merged:{n}"))
-        elif state_value == "CLOSED":
-            events.append(("MarketUS PR 已关闭", f"#{n} {detail.get('title','')}", f"closed:{n}"))
+            print(f"merged PR #{n}: running postmerge")
+            cmd_postmerge(argparse.Namespace(dry_run=False))
 
     for title, message, key in events:
         if key in notified:
