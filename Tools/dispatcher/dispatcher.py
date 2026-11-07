@@ -629,6 +629,13 @@ def cmd_review(args: argparse.Namespace) -> int:
         print("\n(dry-run) 未调用 Reviewer；加 --execute 执行。")
         return 0
 
+    labels = labels_of(issue)
+    if "status:in-progress" in labels:
+        edit_args = ["issue", "edit", str(issue_number), "--remove-label", "status:in-progress"]
+        if "status:in-review" not in labels:
+            edit_args.extend(["--add-label", "status:in-review"])
+        gh(edit_args)
+
     run_dir = RUN_ROOT / f"review-{args.pr}"
     text, code = run_review_agent(prompt, run_dir, args.timeout)
     verdict = parse_verdict(text)
@@ -874,6 +881,23 @@ def cmd_repair(args: argparse.Namespace) -> int:
     return 0
 
 
+FALLBACK_REVIEW_MINUTES = 10
+
+
+def age_minutes(iso_timestamp: str) -> float:
+    created = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - created).total_seconds() / 60
+
+
+def should_auto_review(labels: set[str], has_review: bool, age: float) -> bool:
+    """Return True only for stale in-progress PRs without a current-head review.
+
+    Callers must filter to non-draft ai/* PRs and pass has_review based on the
+    PR's current head SHA; this predicate only applies the label and age rules.
+    """
+    return not has_review and "status:in-progress" in labels and age > FALLBACK_REVIEW_MINUTES
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     state_dir = Path(".agent/state")
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -949,7 +973,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "--limit",
                 "20",
                 "--json",
-                "number,body,headRefName,isDraft",
+                "number,body,headRefName,isDraft,createdAt",
             ]
         )
         for pr in prs:
@@ -962,8 +986,26 @@ def cmd_run(args: argparse.Namespace) -> int:
                 issue = issue_detail(issue_number)
             except SystemExit:
                 continue
-            if "status:in-review" not in labels_of(issue):
-                continue
+            labels = labels_of(issue)
+            if "status:in-review" not in labels:
+                if "status:in-progress" not in labels:
+                    continue
+                created_at = pr.get("createdAt")
+                if not isinstance(created_at, str) or not created_at:
+                    continue
+                try:
+                    age = age_minutes(created_at)
+                except ValueError:
+                    continue
+                try:
+                    detail = pr_detail(pr["number"])
+                except SystemExit:
+                    continue
+                sha, verdict, _ = last_review(detail)
+                has_review = verdict is not None and sha == detail.get("headRefOid")
+                if not should_auto_review(labels, has_review, age):
+                    continue
+                print(f"fallback review PR #{pr['number']} (in-progress, no current-head review)")
             print(f"review PR #{pr['number']} (issue #{issue_number})")
             cmd_review(
                 argparse.Namespace(
