@@ -577,7 +577,7 @@ def build_auto_pr_body(issue: dict[str, Any]) -> str:
         f"## 关联 Ticket\n\nFixes #{number}\n\n"
         f"## 变更类型\n\n- [x] {change_type}（Dispatcher 自动收尾）\n\n"
         "## 摘要\n\n- Agent 退出时未创建 PR，但分支存在改动。\n"
-        "- Dispatcher 已自动 add/commit/push 并创建 **draft** PR；"
+        "- Dispatcher 已自动 add/commit/push 并创建 PR；"
         "需人工补齐验收证据并标记 ready 后再进入评审。\n\n"
         "## 验收标准对照\n\n| 验收标准 | 状态 | 证据 |\n| --- | --- | --- |\n"
         f"{rows}\n\n"
@@ -632,7 +632,7 @@ def ensure_agent_pr(
     created = run(
         [
             "gh", "pr", "create", "--base", "main", "--head", branch,
-            "--title", title, "--body", build_auto_pr_body(issue), "--draft",
+            "--title", title, "--body", build_auto_pr_body(issue),
             *[item for label in auto_pr_labels(issue) for item in ("--label", label)],
         ]
     )
@@ -648,7 +648,7 @@ def ensure_agent_pr(
         "url": url,
         "title": title,
         "headRefName": branch,
-        "isDraft": True,
+        "isDraft": False,
     }, ""
 
 

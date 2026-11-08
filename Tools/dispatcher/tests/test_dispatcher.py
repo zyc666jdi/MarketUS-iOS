@@ -929,7 +929,7 @@ class AutoSalvageTests(unittest.TestCase):
         self.assertTrue(any("commit" in args for args in calls))
         self.assertTrue(any("push" in args for args in calls))
         create = next(args for args in calls if args[:3] == ["gh", "pr", "create"])
-        self.assertIn("--draft", create)
+        self.assertNotIn("--draft", create)
         self.assertIn("ai:generated", create)
         self.assertIn("risk:medium", create)
         self.assertIn("size:s", create)
@@ -1029,7 +1029,7 @@ class AutoPrBodyTests(unittest.TestCase):
         self.assertIn("- [x] feature", body)
         self.assertIn("`risk:low`", body)
         self.assertIn("`size:s`", body)
-        self.assertIn("draft", body)
+        self.assertIn("创建 PR", body)
         self.assertEqual(
             dispatcher.auto_pr_labels(issue),
             ["ai:generated", "risk:low", "size:s"],
