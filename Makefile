@@ -6,7 +6,7 @@ BUILD_DEST ?= generic/platform=iOS Simulator
 PACKAGE := Packages/MarketUSKit
 RESULT  := TestResults/MarketUS.xcresult
 
-.PHONY: bootstrap lint format build test test-package coverage secret-scan verify simulator-stop clean
+.PHONY: bootstrap lint format build test test-package test-dispatcher coverage secret-scan verify simulator-stop clean
 
 bootstrap:
 	@command -v xcodegen >/dev/null 2>&1 || { echo "缺少 xcodegen：请先运行 brew bundle"; exit 1; }
@@ -25,6 +25,9 @@ format:
 test-package:
 	swift test --package-path $(PACKAGE)
 
+test-dispatcher:
+	python3 -m unittest discover -s Tools/dispatcher/tests -p 'test_*.py'
+
 build: bootstrap
 	xcodebuild -scheme $(SCHEME) -destination '$(BUILD_DEST)' build CODE_SIGNING_ALLOWED=NO
 
@@ -40,8 +43,8 @@ secret-scan:
 	@command -v gitleaks >/dev/null 2>&1 || { echo "缺少 gitleaks：请先运行 brew bundle"; exit 1; }
 	gitleaks detect --no-git --redact -v
 
-verify: lint test-package build test coverage
-	@echo "✅ verify 通过（lint + package tests + build + UI test + coverage 报告）"
+verify: lint test-dispatcher test-package build test coverage
+	@echo "✅ verify 通过（lint + dispatcher tests + package tests + build + UI test + coverage 报告）"
 
 simulator-stop:
 	@xcrun simctl shutdown all 2>/dev/null; \
