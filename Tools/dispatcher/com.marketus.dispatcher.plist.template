@@ -29,6 +29,8 @@
         <string>__HOME__/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
+        <key>MARKETUS_TICKET_SOURCE</key>
+        <string>human</string>
     </dict>
 
     <key>ProcessType</key>
