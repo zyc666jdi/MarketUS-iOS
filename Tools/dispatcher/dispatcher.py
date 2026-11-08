@@ -1223,7 +1223,7 @@ def ticket_source() -> str:
 
     非法值回落到最保守的 ``human``，避免拼写错误意外打开自动开票。
     """
-    value = os.environ.get("MARKETUS_TICKET_SOURCE", "ai").strip().lower()
+    value = os.environ.get("MARKETUS_TICKET_SOURCE", "human").strip().lower()
     return value if value in TICKET_SOURCES else "human"
 
 
@@ -1628,6 +1628,26 @@ def maybe_run_planner(
         return 1
 
 
+def reap_worktrees(_args: argparse.Namespace | None = None) -> None:
+    """清理已关闭/已完成 issue 的 worktree；不碰 open/blocked。"""
+    if not WORKTREE_ROOT.exists():
+        return
+    for path in sorted(WORKTREE_ROOT.iterdir()):
+        if not path.is_dir():
+            continue
+        branch = run(["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+        match = re.match(r"ai/(\d+)-", branch)
+        if not match:
+            continue
+        try:
+            issue = issue_detail(int(match.group(1)))
+        except SystemExit:
+            continue
+        if issue.get("state") == "CLOSED" or "status:done" in labels_of(issue):
+            print(f"reap worktree {path.name} ({branch})")
+            run(["git", "worktree", "remove", str(path), "--force"])
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     state_dir = Path(".agent/state")
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -1641,6 +1661,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
+        if not args.dry_run:
+            reap_worktrees()
         cmd_watch(argparse.Namespace())
 
         prs = gh_json(

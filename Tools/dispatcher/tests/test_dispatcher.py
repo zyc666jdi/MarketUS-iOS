@@ -560,11 +560,11 @@ class AutopilotStateTests(unittest.TestCase):
     def test_gate_blocks_daily_limit_frozen_and_disabled(self):
         state = dispatcher.default_autopilot_state()
         state["created_today"] = dispatcher.AUTOPILOT_DAILY_LIMIT
-        with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1"}):
+        with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1", "MARKETUS_TICKET_SOURCE": "ai"}):
             self.assertIn("上限", dispatcher.autopilot_gate(state) or "")
         state = dispatcher.default_autopilot_state()
         state.update({"frozen": True, "frozen_reason": "连续失败"})
-        with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1"}):
+        with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1", "MARKETUS_TICKET_SOURCE": "ai"}):
             self.assertIn("冻结", dispatcher.autopilot_gate(state) or "")
         with mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "0"}):
             self.assertIn("MARKETUS_AUTOPILOT=0", dispatcher.autopilot_gate(state) or "")
@@ -1122,7 +1122,7 @@ class TicketSourceTests(unittest.TestCase):
     def test_default_and_explicit_sources(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MARKETUS_TICKET_SOURCE", None)
-            self.assertEqual(dispatcher.ticket_source(), "ai")
+            self.assertEqual(dispatcher.ticket_source(), "human")
         with mock.patch.dict(os.environ, {"MARKETUS_TICKET_SOURCE": "human"}):
             self.assertEqual(dispatcher.ticket_source(), "human")
             self.assertFalse(dispatcher.planner_can_create_tickets())
