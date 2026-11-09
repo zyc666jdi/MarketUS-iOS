@@ -1161,19 +1161,24 @@ class PrepareRepairWorktreeTests(unittest.TestCase):
                 mock.Mock(returncode=verify_rc),  # rev-parse
             ]
             reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", worktree)
-        return reason, cmd
+        return reason, run, cmd
 
     def test_missing_branch_is_not_an_error(self):
-        reason, cmd = self._run(delete_rc=1, verify_rc=1)
+        reason, run, cmd = self._run(delete_rc=1, verify_rc=1)
         self.assertEqual(reason, "")
+        self.assertIn(["git", "branch", "-D", "repair/80"], [c.args[0] for c in run.call_args_list])
         cmd.assert_called_once()
 
     def test_still_existing_branch_blocks(self):
-        reason, cmd = self._run(delete_rc=1, verify_rc=0)
+        reason, run, cmd = self._run(delete_rc=1, verify_rc=0)
         self.assertIn("无法删除", reason)
         cmd.assert_not_called()
 
     def test_existing_branch_deleted_then_add(self):
-        reason, cmd = self._run(delete_rc=0, verify_rc=1)
+        reason, run, cmd = self._run(delete_rc=0, verify_rc=1)
         self.assertEqual(reason, "")
-        cmd.assert_called_once()
+        self.assertIn(["git", "branch", "-D", "repair/80"], [c.args[0] for c in run.call_args_list])
+        cmd.assert_called_once_with(
+            ["git", "worktree", "add", "-b", "repair/80",
+             "/tmp/does-not-exist-repair", "origin/ai/79-test"]
+        )
