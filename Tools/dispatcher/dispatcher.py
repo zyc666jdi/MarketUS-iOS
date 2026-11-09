@@ -188,9 +188,19 @@ def notify(title: str, message: str) -> None:
         return
     safe_title = title.replace('"', '\\"')
     safe_message = message.replace('"', '\\"')
-    script = f'display notification "{safe_message}" with title "{safe_title}" sound name "Glass"'
+    if shutil.which("terminal-notifier"):
+        command = [
+            "terminal-notifier",
+            "-title", safe_title,
+            "-message", safe_message,
+            "-sound", "Glass",
+            "-group", "marketus-dispatcher",
+        ]
+    else:
+        script = f'display notification "{safe_message}" with title "{safe_title}" sound name "Glass"'
+        command = ["osascript", "-e", script]
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+        subprocess.run(command, capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         pass
 
