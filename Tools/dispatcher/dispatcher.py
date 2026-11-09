@@ -1069,6 +1069,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
         run(["git", "worktree", "remove", str(worktree), "--force"])
 
     run(["git", "fetch", "origin", branch])
+    run(["git", "branch", "-D", f"repair/{args.pr}"])
     cmd(["git", "worktree", "add", "-b", f"repair/{args.pr}", str(worktree), f"origin/{branch}"])
     base = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
 
