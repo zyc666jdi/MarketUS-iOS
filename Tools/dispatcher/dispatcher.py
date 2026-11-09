@@ -1032,6 +1032,21 @@ def repair_rounds(pr: dict[str, Any]) -> int:
     return sum(1 for comment in pr.get("comments", []) if REPAIR_MARKER in (comment.get("body") or ""))
 
 
+def prepare_repair_worktree(pr: int, branch: str, worktree: Path) -> str:
+    """Prepare a clean repair worktree; returns an error reason or empty string."""
+    if worktree.exists():
+        run(["git", "worktree", "remove", str(worktree), "--force"])
+    run(["git", "fetch", "origin", branch])
+    run(["git", "worktree", "prune"])
+    deleted = run(["git", "branch", "-D", f"repair/{pr}"])
+    if deleted.returncode != 0:
+        still_exists = run(["git", "rev-parse", "--verify", f"refs/heads/repair/{pr}"])
+        if still_exists.returncode == 0:
+            return "无法删除旧 repair 分支，请人工清理后重试"
+    cmd(["git", "worktree", "add", "-b", f"repair/{pr}", str(worktree), f"origin/{branch}"])
+    return ""
+
+
 def cmd_repair(args: argparse.Namespace) -> int:
     pr = pr_detail(args.pr)
     sha, verdict, feedback = last_review(pr)
@@ -1065,12 +1080,11 @@ def cmd_repair(args: argparse.Namespace) -> int:
 
     branch = pr["headRefName"]
     worktree = WORKTREE_ROOT / f"repair-{args.pr}"
-    if worktree.exists():
-        run(["git", "worktree", "remove", str(worktree), "--force"])
-
-    run(["git", "fetch", "origin", branch])
-    run(["git", "branch", "-D", f"repair/{args.pr}"])
-    cmd(["git", "worktree", "add", "-b", f"repair/{args.pr}", str(worktree), f"origin/{branch}"])
+    error = prepare_repair_worktree(args.pr, branch, worktree)
+    if error:
+        set_status(issue_number, "status:blocked")
+        comment_pr(args.pr, f"⛔ {error}")
+        return 1
     base = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
 
     prompt = (

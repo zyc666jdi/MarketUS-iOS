@@ -1145,3 +1145,35 @@ class TicketSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrepareRepairWorktreeTests(unittest.TestCase):
+    def _run(self, delete_rc, verify_rc):
+        worktree = Path("/tmp/does-not-exist-repair")
+        with (
+            mock.patch.object(dispatcher, "run") as run,
+            mock.patch.object(dispatcher, "cmd") as cmd,
+        ):
+            run.side_effect = [
+                mock.Mock(returncode=0),   # fetch
+                mock.Mock(returncode=0),   # prune
+                mock.Mock(returncode=delete_rc),  # branch -D
+                mock.Mock(returncode=verify_rc),  # rev-parse
+            ]
+            reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", worktree)
+        return reason, cmd
+
+    def test_missing_branch_is_not_an_error(self):
+        reason, cmd = self._run(delete_rc=1, verify_rc=1)
+        self.assertEqual(reason, "")
+        cmd.assert_called_once()
+
+    def test_still_existing_branch_blocks(self):
+        reason, cmd = self._run(delete_rc=1, verify_rc=0)
+        self.assertIn("无法删除", reason)
+        cmd.assert_not_called()
+
+    def test_existing_branch_deleted_then_add(self):
+        reason, cmd = self._run(delete_rc=0, verify_rc=1)
+        self.assertEqual(reason, "")
+        cmd.assert_called_once()
