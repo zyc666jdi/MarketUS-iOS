@@ -526,6 +526,13 @@ class NotifyTests(unittest.TestCase):
         run = self._notify_with("darwin", None, message=payload)
         command = run.call_args.args[0]
         self.assertEqual(command[-1], payload)
+        self.assertEqual(
+            command[4],
+            'display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass"',
+        )
+        scripts = " ".join(command[2:7:2])
+        self.assertNotIn(payload, scripts)
+        self.assertNotIn("do shell script", scripts)
 
     def test_marketus_notify_zero_skips_all_commands(self):
         run = self._notify_with(
