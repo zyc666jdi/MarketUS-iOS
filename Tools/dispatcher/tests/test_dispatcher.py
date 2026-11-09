@@ -1143,42 +1143,91 @@ class TicketSourceTests(unittest.TestCase):
             self.assertIn("MARKETUS_TICKET_SOURCE=human", dispatcher.autopilot_gate(state) or "")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PrepareRepairWorktreeTests(unittest.TestCase):
-    def _run(self, delete_rc, verify_rc):
-        worktree = Path("/tmp/does-not-exist-repair")
-        with (
-            mock.patch.object(dispatcher, "run") as run,
-            mock.patch.object(dispatcher, "cmd") as cmd,
-        ):
-            run.side_effect = [
-                mock.Mock(returncode=0),   # fetch
-                mock.Mock(returncode=0),   # prune
-                mock.Mock(returncode=delete_rc),  # branch -D
-                mock.Mock(returncode=verify_rc),  # rev-parse
-            ]
-            reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", worktree)
-        return reason, run, cmd
+    def _run(self, delete_rc, verify_rc, worktree_exists=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "repair-80"
+            if worktree_exists:
+                worktree.mkdir()
+            with (
+                mock.patch.object(dispatcher, "run") as run,
+                mock.patch.object(dispatcher, "cmd") as cmd,
+            ):
+                def fake_run(command):
+                    if command[:3] == ["git", "branch", "-D"]:
+                        return mock.Mock(returncode=delete_rc)
+                    if command[:2] == ["git", "rev-parse"]:
+                        return mock.Mock(returncode=verify_rc)
+                    return mock.Mock(returncode=0)
+
+                run.side_effect = fake_run
+                reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", worktree)
+            return reason, run, cmd, str(worktree)
 
     def test_missing_branch_is_not_an_error(self):
-        reason, run, cmd = self._run(delete_rc=1, verify_rc=1)
+        reason, run, cmd, worktree = self._run(delete_rc=1, verify_rc=1)
         self.assertEqual(reason, "")
-        self.assertIn(["git", "branch", "-D", "repair/80"], [c.args[0] for c in run.call_args_list])
-        cmd.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["git", "fetch", "origin", "ai/79-test"],
+                ["git", "worktree", "prune"],
+                ["git", "branch", "-D", "repair/80"],
+                ["git", "rev-parse", "--verify", "refs/heads/repair/80"],
+            ],
+        )
+        cmd.assert_called_once_with(
+            ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]
+        )
 
     def test_still_existing_branch_blocks(self):
-        reason, run, cmd = self._run(delete_rc=1, verify_rc=0)
-        self.assertIn("无法删除", reason)
+        reason, run, cmd, _ = self._run(delete_rc=1, verify_rc=0)
+        self.assertEqual(reason, "无法删除旧 repair 分支，请人工清理后重试")
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["git", "fetch", "origin", "ai/79-test"],
+                ["git", "worktree", "prune"],
+                ["git", "branch", "-D", "repair/80"],
+                ["git", "rev-parse", "--verify", "refs/heads/repair/80"],
+            ],
+        )
         cmd.assert_not_called()
 
     def test_existing_branch_deleted_then_add(self):
-        reason, run, cmd = self._run(delete_rc=0, verify_rc=1)
+        reason, run, cmd, worktree = self._run(delete_rc=0, verify_rc=0)
         self.assertEqual(reason, "")
-        self.assertIn(["git", "branch", "-D", "repair/80"], [c.args[0] for c in run.call_args_list])
-        cmd.assert_called_once_with(
-            ["git", "worktree", "add", "-b", "repair/80",
-             "/tmp/does-not-exist-repair", "origin/ai/79-test"]
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["git", "fetch", "origin", "ai/79-test"],
+                ["git", "worktree", "prune"],
+                ["git", "branch", "-D", "repair/80"],
+            ],
         )
+        cmd.assert_called_once_with(
+            ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]
+        )
+
+    def test_existing_worktree_removed_before_branch_delete(self):
+        reason, run, cmd, worktree = self._run(
+            delete_rc=1, verify_rc=1, worktree_exists=True
+        )
+        self.assertEqual(reason, "")
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["git", "worktree", "remove", worktree, "--force"],
+                ["git", "fetch", "origin", "ai/79-test"],
+                ["git", "worktree", "prune"],
+                ["git", "branch", "-D", "repair/80"],
+                ["git", "rev-parse", "--verify", "refs/heads/repair/80"],
+            ],
+        )
+        cmd.assert_called_once_with(
+            ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
