@@ -1113,6 +1113,14 @@ def cmd_repair(args: argparse.Namespace) -> int:
     (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
     head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
     if head == base:
+        committed, reason = commit_agent_work(worktree, issue_number, f"repair-{args.pr}")
+        if not committed:
+            set_status(issue_number, "status:blocked")
+            comment_pr(args.pr, f"⛔ 修复未提交且自动收尾失败：{reason}")
+            return 1
+        head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
+
+    if head == base:
         set_status(issue_number, "status:blocked")
         comment_pr(args.pr, f"⛔ 修复未产生 commit。日志：`.agent/runs/repair-{args.pr}/`")
         return 1
