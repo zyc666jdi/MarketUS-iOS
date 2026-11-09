@@ -160,3 +160,11 @@ Agent 的 bot 账号**不得**拥有 admin 权限。
 - 可以读日志、定位、修复代码、重新 push。
 - 不可以：改 workflow、改阈值、加 `|| true`、跳过 job、使用 `--admin` 合并。
 - 同一失败连续 2 次 → 换方案；第 3 次 → 升级人类并附原始日志。
+
+
+## merge-gate
+
+PR 必须带 `merge:requested` 标签才能合并。`merge-gate` workflow 在
+opened / reopened / synchronize / labeled / unlabeled 时检查。
+
+启用强制门禁：在分支保护中把 `merge-gate / require-merge-requested` 设为 required check。

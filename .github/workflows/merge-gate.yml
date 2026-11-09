@@ -1,0 +1,24 @@
+name: merge-gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  require-merge-requested:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require merge:requested label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          labels="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(",")')"
+          case ",$labels," in
+            *,merge:requested,*) echo "merge:requested present" ;;
+            *) echo "::error::missing merge:requested label"; exit 1 ;;
+          esac
