@@ -491,7 +491,7 @@ class CredentialTests(unittest.TestCase):
 
 
 class NotifyTests(unittest.TestCase):
-    def _notify_with(self, platform, which_result, run_side_effect=None, env=None):
+    def _notify_with(self, platform, which_result, run_side_effect=None, env=None, message='PR #1 "quoted"'):
         run = mock.Mock(side_effect=run_side_effect)
         environment = {"MARKETUS_NOTIFY": "1"}
         environment.update(env or {})
@@ -501,7 +501,7 @@ class NotifyTests(unittest.TestCase):
             mock.patch.object(dispatcher.subprocess, "run", run),
             mock.patch.dict(os.environ, environment),
         ):
-            dispatcher.notify('MarketUS "quoted"', 'PR #1 "quoted"')
+            dispatcher.notify('MarketUS "quoted"', message)
         return run
 
     def test_terminal_notifier_receives_raw_quoted_arguments(self):
@@ -513,14 +513,19 @@ class NotifyTests(unittest.TestCase):
         )
         self.assertNotIn('\\"', " ".join(command))
 
-    def test_osascript_fallback_escapes_quotes_when_terminal_notifier_missing(self):
+    def test_osascript_fallback_passes_argv_without_interpolation(self):
         run = self._notify_with("darwin", None)
         command = run.call_args.args[0]
         self.assertEqual(command[:2], ["osascript", "-e"])
-        self.assertEqual(
-            command[2],
-            r'display notification "PR #1 \"quoted\"" with title "MarketUS \"quoted\"" sound name "Glass"',
-        )
+        self.assertIn("on run argv", command)
+        self.assertEqual(command[-2:], ['MarketUS "quoted"', 'PR #1 "quoted"'])
+        self.assertNotIn('\\"', " ".join(command))
+
+    def test_osascript_fallback_resists_script_breakout(self):
+        payload = 'x\\" & (do shell script "true") --'
+        run = self._notify_with("darwin", None, message=payload)
+        command = run.call_args.args[0]
+        self.assertEqual(command[-1], payload)
 
     def test_marketus_notify_zero_skips_all_commands(self):
         run = self._notify_with(

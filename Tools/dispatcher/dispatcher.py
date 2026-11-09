@@ -195,10 +195,13 @@ def notify(title: str, message: str) -> None:
             "-group", "marketus-dispatcher",
         ]
     else:
-        safe_title = title.replace('"', '\\"')
-        safe_message = message.replace('"', '\\"')
-        script = f'display notification "{safe_message}" with title "{safe_title}" sound name "Glass"'
-        command = ["osascript", "-e", script]
+        command = [
+            "osascript",
+            "-e", "on run argv",
+            "-e", 'display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass"',
+            "-e", "end run",
+            "--", title, message,
+        ]
     try:
         subprocess.run(command, capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
