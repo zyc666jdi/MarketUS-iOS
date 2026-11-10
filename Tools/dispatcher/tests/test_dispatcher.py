@@ -1210,5 +1210,88 @@ class TicketSourceTests(unittest.TestCase):
             self.assertIn("MARKETUS_TICKET_SOURCE=human", dispatcher.autopilot_gate(state) or "")
 
 
+class PrepareRepairWorktreeTests(unittest.TestCase):
+    def _run(self, delete_rc, verify_rc, worktree_exists=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "repair-80"
+            if worktree_exists:
+                worktree.mkdir()
+            with mock.patch.object(dispatcher, "run") as run:
+                def fake_run(command):
+                    if command[:3] == ["git", "branch", "-D"]:
+                        return mock.Mock(returncode=delete_rc, stderr="")
+                    if command[:2] == ["git", "rev-parse"]:
+                        return mock.Mock(returncode=verify_rc, stderr="")
+                    return mock.Mock(returncode=0, stderr="")
+
+                run.side_effect = fake_run
+                reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", worktree)
+            return reason, [call.args[0] for call in run.call_args_list], str(worktree)
+
+    @staticmethod
+    def _index(calls, command):
+        return calls.index(command)
+
+    def test_missing_branch_is_not_an_error(self):
+        reason, calls, worktree = self._run(delete_rc=1, verify_rc=1)
+        self.assertEqual(reason, "")
+        self.assertIn(["git", "branch", "-D", "repair/80"], calls)
+        self.assertLess(
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+            self._index(calls, ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]),
+        )
+
+    def test_still_existing_branch_blocks(self):
+        reason, calls, _ = self._run(delete_rc=1, verify_rc=0)
+        self.assertIn("无法删除", reason)
+        self.assertFalse(any(call[:3] == ["git", "worktree", "add"] for call in calls))
+
+    def test_existing_branch_deleted_then_add(self):
+        reason, calls, worktree = self._run(delete_rc=0, verify_rc=0)
+        self.assertEqual(reason, "")
+        self.assertLess(
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+            self._index(calls, ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]),
+        )
+
+    def test_existing_worktree_and_branch_are_replaced_in_order(self):
+        reason, calls, worktree = self._run(delete_rc=0, verify_rc=0, worktree_exists=True)
+        self.assertEqual(reason, "")
+        self.assertLess(
+            self._index(calls, ["git", "worktree", "remove", worktree, "--force"]),
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+        )
+        self.assertLess(
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+            self._index(calls, ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]),
+        )
+
+    def test_fetch_failure_blocks_before_branch_delete(self):
+        with mock.patch.object(dispatcher, "run", return_value=mock.Mock(returncode=1, stderr="network")) as run:
+            reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", Path("/tmp/none"))
+        self.assertIn("fetch", reason)
+        self.assertFalse(any(call.args[0][:3] == ["git", "branch", "-D"] for call in run.call_args_list))
+
+
+class RepairWiringTests(unittest.TestCase):
+    def test_prepare_error_marks_blocked_and_comments(self):
+        pr = {"number": 80, "title": "test", "headRefName": "ai/79-test", "state": "OPEN", "comments": []}
+        args = argparse.Namespace(pr=80, execute=True, timeout=90)
+        with (
+            mock.patch.object(dispatcher, "pr_detail", return_value=pr),
+            mock.patch.object(dispatcher, "last_review", return_value=("abc", "REQUEST_CHANGES", "fix")),
+            mock.patch.object(dispatcher, "repair_rounds", return_value=0),
+            mock.patch.object(dispatcher, "issue_detail", return_value={"number": 79, "body": "ticket"}),
+            mock.patch.object(dispatcher, "prepare_repair_worktree", return_value="无法删除旧分支") as prepare,
+            mock.patch.object(dispatcher, "set_status") as set_status,
+            mock.patch.object(dispatcher, "comment_pr") as comment,
+        ):
+            code = dispatcher.cmd_repair(args)
+        self.assertEqual(code, 1)
+        prepare.assert_called_once_with(80, "ai/79-test", Path(".worktrees/repair-80"))
+        set_status.assert_called_once_with(79, "status:blocked")
+        self.assertIn("无法删除旧分支", comment.call_args.args[1])
+
+
 if __name__ == "__main__":
     unittest.main()

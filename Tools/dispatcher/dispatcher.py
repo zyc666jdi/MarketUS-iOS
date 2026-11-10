@@ -1045,6 +1045,27 @@ def repair_rounds(pr: dict[str, Any]) -> int:
     return sum(1 for comment in pr.get("comments", []) if REPAIR_MARKER in (comment.get("body") or ""))
 
 
+def prepare_repair_worktree(pr: int, branch: str, worktree: Path) -> str:
+    """Prepare a clean repair worktree; returns an error reason or empty string."""
+    if worktree.exists():
+        removed = run(["git", "worktree", "remove", str(worktree), "--force"])
+        if removed.returncode != 0:
+            return f"无法清理旧 worktree：{removed.stderr.strip() or 'unknown'}"
+    fetched = run(["git", "fetch", "origin", branch])
+    if fetched.returncode != 0:
+        return f"git fetch 失败：{fetched.stderr.strip() or 'unknown'}"
+    run(["git", "worktree", "prune"])
+    deleted = run(["git", "branch", "-D", f"repair/{pr}"])
+    if deleted.returncode != 0:
+        still_exists = run(["git", "rev-parse", "--verify", f"refs/heads/repair/{pr}"])
+        if still_exists.returncode == 0:
+            return "无法删除旧 repair 分支，请人工清理后重试"
+    added = run(["git", "worktree", "add", "-b", f"repair/{pr}", str(worktree), f"origin/{branch}"])
+    if added.returncode != 0:
+        return f"git worktree add 失败：{added.stderr.strip() or 'unknown'}"
+    return ""
+
+
 def cmd_repair(args: argparse.Namespace) -> int:
     pr = pr_detail(args.pr)
     sha, verdict, feedback = last_review(pr)
@@ -1078,11 +1099,11 @@ def cmd_repair(args: argparse.Namespace) -> int:
 
     branch = pr["headRefName"]
     worktree = WORKTREE_ROOT / f"repair-{args.pr}"
-    if worktree.exists():
-        run(["git", "worktree", "remove", str(worktree), "--force"])
-
-    run(["git", "fetch", "origin", branch])
-    cmd(["git", "worktree", "add", "-b", f"repair/{args.pr}", str(worktree), f"origin/{branch}"])
+    error = prepare_repair_worktree(args.pr, branch, worktree)
+    if error:
+        set_status(issue_number, "status:blocked")
+        comment_pr(args.pr, f"⛔ {error}")
+        return 1
     base = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
 
     prompt = (
@@ -1138,7 +1159,11 @@ def cmd_repair(args: argparse.Namespace) -> int:
         comment_pr(args.pr, f"⛔ 修复未产生 commit。日志：`.agent/runs/repair-{args.pr}/`")
         return 1
 
-    run(["git", "-C", str(worktree), "push", "origin", f"HEAD:{branch}"])
+    pushed = run(["git", "-C", str(worktree), "push", "origin", f"HEAD:{branch}"])
+    if pushed.returncode != 0:
+        set_status(issue_number, "status:blocked")
+        comment_pr(args.pr, f"⛔ 修复 push 失败：{pushed.stderr.strip() or 'unknown'}")
+        return 1
     set_status(issue_number, "status:in-review")
     comment_pr(
         args.pr,
