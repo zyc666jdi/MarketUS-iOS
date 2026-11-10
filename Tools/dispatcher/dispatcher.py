@@ -665,6 +665,28 @@ def ensure_agent_pr(
     }, ""
 
 
+def run_agent_streaming(
+    command: list[str], prompt: str, cwd: str, env: dict[str, str],
+    timeout_seconds: int, run_dir: Path,
+) -> tuple[int, str]:
+    """Run an agent while streaming stdout/stderr to run_dir/agent.log live."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / "agent.log"
+    err_path = run_dir / "agent.stderr.log"
+    with out_path.open("w", encoding="utf-8") as out, err_path.open("w", encoding="utf-8") as err:
+        proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=out, stderr=err,
+            text=True, cwd=cwd, env=env,
+        )
+        try:
+            proc.communicate(prompt, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+    return proc.returncode, out_path.read_text(encoding="utf-8")
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     number = args.issue
     issue = issue_detail(number)
@@ -750,18 +772,10 @@ def cmd_once(args: argparse.Namespace) -> int:
     timeout_seconds = args.timeout * 60
     command = agent_command()
     try:
-        result = subprocess.run(
-            command,
-            input=prompt,
-            text=True,
-            cwd=str(worktree),
-            capture_output=True,
-            timeout=timeout_seconds,
-            env=env,
+        returncode, _stdout = run_agent_streaming(
+            command, prompt, str(worktree), env, timeout_seconds, run_dir
         )
-        (run_dir / "agent.log").write_text(result.stdout, encoding="utf-8")
-        (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
-        agent_failed = result.returncode != 0
+        agent_failed = returncode != 0
     except subprocess.TimeoutExpired:
         set_status(number, "status:blocked")
         comment(number, f"⛔ Agent 超时（{args.timeout} 分钟）。日志：`.agent/runs/{number}/`")
@@ -850,22 +864,15 @@ def run_review_agent(prompt: str, run_dir: Path, timeout_minutes: int) -> tuple[
         env["DSH_PERMISSION_MODE"] = "read-only"
 
     try:
-        result = subprocess.run(
-            command,
-            input=prompt,
-            text=True,
-            capture_output=True,
-            timeout=timeout_minutes * 60,
-            env=env,
+        returncode, stdout = run_agent_streaming(
+            command, prompt, os.getcwd(), env, timeout_minutes * 60, run_dir
         )
     except subprocess.TimeoutExpired:
         return "reviewer timeout", 1
     except FileNotFoundError:
         return f"agent not found: {command[0] if command else '<empty>'}", 1
 
-    (run_dir / "agent.log").write_text(result.stdout, encoding="utf-8")
-    (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
-    return agent_text(result.stdout), result.returncode
+    return agent_text(stdout), returncode
 
 
 def comment_pr(number: int, body: str) -> None:
@@ -1129,15 +1136,7 @@ def cmd_repair(args: argparse.Namespace) -> int:
         env["DSH_PERMISSION_MODE"] = os.environ.get("AGENT_PERMISSION_MODE", "danger-full-access")
 
     try:
-        result = subprocess.run(
-            command,
-            input=prompt,
-            text=True,
-            cwd=str(worktree),
-            capture_output=True,
-            timeout=args.timeout * 60,
-            env=env,
-        )
+        run_agent_streaming(command, prompt, str(worktree), env, args.timeout * 60, run_dir)
     except subprocess.TimeoutExpired:
         set_status(issue_number, "status:blocked")
         comment_pr(args.pr, f"⛔ 修复 Agent 超时。日志：`.agent/runs/repair-{args.pr}/`")

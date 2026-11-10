@@ -1129,11 +1129,7 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
                 mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
                 mock.patch.object(dispatcher, "cmd"),
-                mock.patch.object(
-                    dispatcher.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess([], 0, "", ""),
-                ),
+                mock.patch.object(dispatcher, "run_agent_streaming", return_value=(0, "")),
                 mock.patch.object(dispatcher, "ensure_agent_pr", return_value=(salvage, reason)) as ensure,
                 mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
                 mock.patch.object(dispatcher, "comment", side_effect=fake_comment),
