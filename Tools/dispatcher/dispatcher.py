@@ -23,7 +23,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 STATUS_LABELS = [
     "status:ready",
@@ -68,6 +68,7 @@ ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url,state"
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
+STATE_ROOT = Path(".agent/state")
 
 # Autopilot Planner：只在没有 ready / 进行中工作时选题，永远只读运行。
 AUTOPILOT_STATE = Path(".agent/state/autopilot.json")
@@ -665,8 +666,13 @@ def ensure_agent_pr(
     }, ""
 
 
-def acquire_named_lock(name: str):
-    state = Path(".agent/state")
+def acquire_named_lock(name: str, state_dir: Path | None = None) -> TextIO | None:
+    """Try to take an exclusive non-blocking per-name lock.
+
+    Returns the open handle (keep it alive for as long as the lock is needed)
+    or ``None`` when another process already holds the same lock.
+    """
+    state = Path(state_dir) if state_dir is not None else STATE_ROOT
     state.mkdir(parents=True, exist_ok=True)
     handle = (state / f"{name}.lock").open("w")
     try:
@@ -674,7 +680,18 @@ def acquire_named_lock(name: str):
     except BlockingIOError:
         handle.close()
         return None
+    except OSError:
+        handle.close()
+        raise
     return handle
+
+
+def release_named_lock(handle: TextIO) -> None:
+    """Release and close a handle returned by :func:`acquire_named_lock`."""
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def run_agent_streaming(
@@ -896,6 +913,10 @@ def comment_pr(number: int, body: str) -> None:
 
 MAX_REVIEW_ROUNDS = 2
 
+# cmd_run treats this exit code as "another run holds this PR's lock", so it
+# can skip the PR and try the next one instead of ending the sweep.
+EXIT_LOCK_BUSY = 2
+
 
 def request_changes_rounds(pr: dict[str, Any]) -> int:
     return sum(
@@ -910,7 +931,14 @@ def cmd_review(args: argparse.Namespace) -> int:
     review_lock = acquire_named_lock(f"review-{args.pr}")
     if review_lock is None:
         print(f"PR #{args.pr} 已有 review 在运行，跳过")
-        return 0
+        return EXIT_LOCK_BUSY
+    try:
+        return _cmd_review_locked(args)
+    finally:
+        release_named_lock(review_lock)
+
+
+def _cmd_review_locked(args: argparse.Namespace) -> int:
     pr = gh_json(
         [
             "pr",
@@ -1116,7 +1144,14 @@ def cmd_repair(args: argparse.Namespace) -> int:
     repair_lock = acquire_named_lock(f"repair-{args.pr}")
     if repair_lock is None:
         print(f"PR #{args.pr} 已有 repair 在运行，跳过")
-        return 0
+        return EXIT_LOCK_BUSY
+    try:
+        return _cmd_repair_locked(args)
+    finally:
+        release_named_lock(repair_lock)
+
+
+def _cmd_repair_locked(args: argparse.Namespace) -> int:
     pr = pr_detail(args.pr)
     sha, verdict, feedback = last_review(pr)
     if verdict != "REQUEST_CHANGES":
@@ -1768,7 +1803,7 @@ def cmd_observe(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    state_dir = Path(".agent/state")
+    state_dir = STATE_ROOT
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "dispatcher.lock"
     lock = lock_path.open("w")
@@ -1811,16 +1846,30 @@ def cmd_run(args: argparse.Namespace) -> int:
             detail = pr_detail(pr["number"])
             _, verdict, _ = last_review(detail)
             if verdict == "REQUEST_CHANGES":
-                print(f"repair PR #{pr['number']} (issue #{issue_number}) [background]")
-                if not args.dry_run:
-                    log_path = RUN_ROOT / f"repair-{pr['number']}.out"
-                    RUN_ROOT.mkdir(parents=True, exist_ok=True)
-                    with log_path.open("w", encoding="utf-8") as log:
-                        subprocess.Popen(
+                number = pr["number"]
+                print(f"repair PR #{number} (issue #{issue_number}) [background]")
+                if args.dry_run:
+                    continue
+                RUN_ROOT.mkdir(parents=True, exist_ok=True)
+                log_path = RUN_ROOT / f"repair-{number}.out"
+                try:
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(
+                            f"\n=== {datetime.now(timezone.utc).isoformat()} "
+                            f"dispatcher repair sweep ===\n"
+                        )
+                        proc = subprocess.Popen(
                             [sys.executable, str(Path(__file__).resolve()), "repair",
-                             "--pr", str(pr["number"]), "--execute", "--timeout", str(args.timeout)],
+                             "--pr", str(number), "--execute", "--timeout", str(args.timeout)],
                             stdout=log, stderr=log, start_new_session=True,
                         )
+                except OSError as error:
+                    print(f"⛔ 启动 repair 失败：{error}")
+                    continue
+                print(f"repair PR #{number} 已在后台启动 pid={proc.pid} log={log_path}")
+                # One background repair per sweep keeps the host from running
+                # many 90-minute full-access agents (and git operations) at once.
+                break
 
         ready = sorted(list_issues("status:ready"), key=lambda issue: (priority_rank(issue), issue["number"]))
         for issue in ready:
@@ -1885,13 +1934,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                     continue
                 print(f"fallback review PR #{pr['number']} (in-progress, no current-head review)")
             print(f"review PR #{pr['number']} (issue #{issue_number})")
-            cmd_review(
+            code = cmd_review(
                 argparse.Namespace(
                     pr=pr["number"],
                     execute=not args.dry_run,
                     timeout=args.timeout,
                 )
             )
+            if code == EXIT_LOCK_BUSY:
+                # This PR already has a review running; try the next one.
+                continue
             break
 
         # 只有完全空闲时才让 Planner 选题；每轮最多创建 1 张，下一轮才会被派发。
