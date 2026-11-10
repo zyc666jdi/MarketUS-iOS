@@ -2,8 +2,11 @@ import argparse
 import importlib.util
 import json
 import os
+import select
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -451,6 +454,58 @@ class RepairStatusTests(unittest.TestCase):
             code = dispatcher.cmd_repair(argparse.Namespace(pr=38, execute=True, timeout=30))
         self.assertEqual(code, 1)
         self.assertEqual(status_after(labels, calls), {"status:blocked"})
+
+    def test_repair_success_pushes_and_returns_to_review(self):
+        labels = {"status:in-progress", "status:claimed"}
+        pr = {
+            "number": 38,
+            "title": "test",
+            "body": "",
+            "headRefName": "ai/40-test",
+            "comments": [
+                {"body": "<!-- dispatcher-review pr=38 sha=abc123 verdict=REQUEST_CHANGES -->"},
+            ],
+        }
+        issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
+        calls = []
+        results = [
+            subprocess.CompletedProcess([], 0, "base000\n", ""),
+            subprocess.CompletedProcess([], 0, "head111\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "repair-38"
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "RUN_ROOT", Path(tmp) / "runs"),
+                mock.patch.object(dispatcher, "pr_detail", return_value=pr),
+                mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+                mock.patch.object(dispatcher, "prepare_repair_worktree", return_value=""),
+                mock.patch.object(dispatcher, "agent_command", return_value=["agent"]),
+                mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/agent"),
+                mock.patch.object(dispatcher, "load_agent_secrets"),
+                mock.patch.object(dispatcher, "run", side_effect=results) as run,
+                mock.patch.object(dispatcher, "run_agent_streaming", return_value=(0, "output")) as stream,
+                mock.patch.object(Path, "read_text", return_value="prompt"),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+                mock.patch.object(dispatcher, "comment_pr") as comment_pr,
+                mock.patch.object(dispatcher, "notify"),
+            ):
+                code = dispatcher.cmd_repair(argparse.Namespace(pr=38, execute=True, timeout=30))
+        self.assertEqual(code, 0)
+        self.assertEqual(status_after(labels, calls), {"status:in-review"})
+        stream.assert_called_once()
+        stream_args = stream.call_args.args
+        self.assertEqual(stream_args[0], ["agent"])
+        self.assertEqual(stream_args[2], str(worktree))
+        self.assertEqual(stream_args[4], 30 * 60)
+        self.assertEqual(stream_args[5], Path(tmp) / "runs" / "repair-38")
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ["git", "-C", str(worktree), "push", "origin", "HEAD:ai/40-test"],
+        )
+        self.assertIn("自动修复已提交 `head111`", comment_pr.call_args.args[1])
 
 
 class MergeGuardTests(unittest.TestCase):
@@ -1129,21 +1184,17 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
                 mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
                 mock.patch.object(dispatcher, "cmd"),
-                mock.patch.object(
-                    dispatcher.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess([], 0, "", ""),
-                ),
+                mock.patch.object(dispatcher, "run_agent_streaming", return_value=(0, "")) as stream,
                 mock.patch.object(dispatcher, "ensure_agent_pr", return_value=(salvage, reason)) as ensure,
                 mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
                 mock.patch.object(dispatcher, "comment", side_effect=fake_comment),
                 mock.patch.object(dispatcher, "notify"),
             ):
                 code = dispatcher.cmd_once(argparse.Namespace(issue=40, execute=True, timeout=90))
-        return code, calls, ensure, comments
+        return code, calls, ensure, comments, stream
 
     def test_agent_exit_with_changes_creates_draft_and_awaits_human(self):
-        code, calls, ensure, _ = self._run(
+        code, calls, ensure, _, stream = self._run(
             {"number": 77, "url": "https://example/pull/77", "title": "chore(agent)", "isDraft": True}
         )
         self.assertEqual(code, 0)
@@ -1154,18 +1205,86 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
         self.assertEqual(args[2]["number"], 40)
         self.assertTrue(args[3])
         self.assertEqual(status_after({"status:ready", "status:claimed"}, calls), {"status:awaiting-human"})
+        stream.assert_called_once()
+        stream_args = stream.call_args.args
+        self.assertEqual(stream_args[0], ["true"])
+        self.assertEqual(Path(stream_args[2]).name, "40-test")
+        self.assertEqual(stream_args[4], 90 * 60)
+        self.assertEqual(Path(stream_args[5]).name, "40")
 
     def test_agent_exit_without_changes_is_blocked(self):
-        code, calls, ensure, _ = self._run(None)
+        code, calls, ensure, _, _ = self._run(None)
         self.assertEqual(code, 1)
         ensure.assert_called_once()
         self.assertEqual(status_after({"status:ready", "status:claimed"}, calls), {"status:blocked"})
 
     def test_salvage_failure_reason_is_reported(self):
-        code, calls, _, comments = self._run(None, "git push 失败：denied")
+        code, calls, _, comments, _ = self._run(None, "git push 失败：denied")
         self.assertEqual(code, 1)
         self.assertEqual(status_after({"status:ready", "status:claimed"}, calls), {"status:blocked"})
         self.assertTrue(any("git push 失败：denied" in body for body in comments))
+
+
+class RunAgentStreamingTests(unittest.TestCase):
+    def test_stdout_and_stderr_are_logged_before_process_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release = root / "release"
+            ready = root / "ready.fifo"
+            os.mkfifo(ready)
+            script = root / "agent.py"
+            script.write_text(
+                "import sys\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "release = Path(sys.argv[1])\n"
+                "with open(sys.argv[2], 'w') as ready:\n"
+                "    print('first line', flush=True)\n"
+                "    print('stderr line', file=sys.stderr, flush=True)\n"
+                "    ready.write('ready\\n')\n"
+                "    ready.flush()\n"
+                "while not release.exists():\n"
+                "    time.sleep(0.01)\n"
+                "print('last line', flush=True)\n",
+                encoding="utf-8",
+            )
+            run_dir = root / "run"
+            outcome: dict[str, object] = {}
+
+            def run_child() -> None:
+                try:
+                    outcome["result"] = dispatcher.run_agent_streaming(
+                        [sys.executable, "-u", str(script), str(release), str(ready)],
+                        "prompt",
+                        str(root),
+                        os.environ.copy(),
+                        30,
+                        run_dir,
+                    )
+                except BaseException as error:  # surfaced in the test thread
+                    outcome["error"] = error
+
+            worker = threading.Thread(target=run_child)
+            worker.start()
+            descriptor = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                readable, _, _ = select.select([descriptor], [], [], 10)
+                self.assertEqual(readable, [descriptor], "agent did not signal readiness")
+                self.assertEqual(os.read(descriptor, 64), b"ready\n")
+                log_text = (run_dir / "agent.log").read_text(encoding="utf-8")
+                self.assertIn("first line", log_text, "stdout was not streamed")
+                self.assertIn("stderr line", log_text, "stderr was not streamed")
+                self.assertTrue(worker.is_alive(), "agent exited before the log was observed")
+            finally:
+                os.close(descriptor)
+                release.write_text("go", encoding="utf-8")
+                worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "run_agent_streaming did not exit")
+            self.assertNotIn("error", outcome)
+            returncode, output = outcome["result"]
+            self.assertEqual(returncode, 0)
+            self.assertIn("last line", output)
+            self.assertIn("last line", (run_dir / "agent.log").read_text(encoding="utf-8"))
 
 
 class PlannerOpenIssueTests(unittest.TestCase):
