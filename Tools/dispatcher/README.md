@@ -119,3 +119,13 @@ Implementer 在 PR 分支的临时 worktree 修复、push，issue 回到 `status
 当前 head 没有 `dispatcher-review` 标记、创建超过 10 分钟（严格大于）。用于手动创建或标签未更新的 PR。
 
 - Workflow watcher dummy PR（验证后删除）
+
+
+## 实时观测
+
+```bash
+python3 Tools/dispatcher/dispatcher.py observe
+python3 Tools/dispatcher/dispatcher.py observe --watch
+```
+
+显示 launchd 状态、当前 agent/dispatcher PID 与耗时、open PR、最近 run 日志。
