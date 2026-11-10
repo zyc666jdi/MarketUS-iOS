@@ -1694,6 +1694,39 @@ def reap_worktrees(_args: argparse.Namespace | None = None) -> None:
             run(["git", "worktree", "remove", str(path), "--force"])
 
 
+def cmd_observe(args: argparse.Namespace) -> int:
+    """本地实时观测：launchd、agent、PR、最后日志。"""
+    import time
+
+    while True:
+        print(f"\n=== {datetime.now().strftime('%H:%M:%S')} ===")
+        launch = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/com.marketus.dispatcher"],
+            capture_output=True, text=True,
+        )
+        for line in launch.stdout.splitlines():
+            if line.strip().startswith(("state =", "runs =", "last exit code =")):
+                print(line.strip())
+        for pattern, label in (("dsh --profile headless", "agent"), ("dispatcher.py", "dispatcher")):
+            procs = subprocess.run(["pgrep", "-fl", pattern], capture_output=True, text=True).stdout.splitlines()
+            for proc in procs[:3]:
+                pid = proc.split()[0]
+                elapsed = subprocess.run(["ps", "-o", "etime=", "-p", pid], capture_output=True, text=True).stdout.strip()
+                print(f"{label:10} pid={pid} elapsed={elapsed} {proc.split(' ', 1)[-1][:80]}")
+        prs = gh_json(["pr", "list", "--state", "open", "--limit", "5", "--json", "number,title,labels"])
+        for pr in prs:
+            labels = ",".join(item["name"] for item in pr.get("labels", []))
+            print(f"PR #{pr['number']} {pr['title'][:50]} [{labels}]")
+        runs = sorted(RUN_ROOT.glob("*/agent.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if runs:
+            print(f"log {runs[0]}")
+            for line in runs[0].read_text(errors="ignore").splitlines()[-5:]:
+                print("  " + line[:160])
+        if not args.watch:
+            return 0
+        time.sleep(args.interval)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     state_dir = Path(".agent/state")
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -1865,6 +1898,10 @@ def main() -> int:
     postmerge_parser = subparsers.add_parser("postmerge", help="收尾已合并 PR 对应的 issue")
     postmerge_parser.add_argument("--dry-run", action="store_true")
 
+    observe_parser = subparsers.add_parser("observe", help="实时观测 workflow")
+    observe_parser.add_argument("--watch", action="store_true")
+    observe_parser.add_argument("--interval", type=int, default=2)
+
     run_parser = subparsers.add_parser("run", help="单次巡检：postmerge → dispatch → review → planner")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--timeout", type=int, default=90)
@@ -1893,6 +1930,10 @@ def main() -> int:
         return cmd_postmerge(args)
     if args.command == "planner":
         return cmd_planner(args)
+    if args.command == "observe":
+        return cmd_observe(args)
+    if args.command == "observe":
+        return cmd_observe(args)
     if args.command == "run":
         return cmd_run(args)
     parser.print_help()
