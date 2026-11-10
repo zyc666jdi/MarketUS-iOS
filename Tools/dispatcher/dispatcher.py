@@ -669,13 +669,12 @@ def run_agent_streaming(
     command: list[str], prompt: str, cwd: str, env: dict[str, str],
     timeout_seconds: int, run_dir: Path,
 ) -> tuple[int, str]:
-    """Run an agent while streaming stdout/stderr to run_dir/agent.log live."""
+    """Run an agent while streaming stdout and stderr to run_dir/agent.log live."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    out_path = run_dir / "agent.log"
-    err_path = run_dir / "agent.stderr.log"
-    with out_path.open("w", encoding="utf-8") as out, err_path.open("w", encoding="utf-8") as err:
+    log_path = run_dir / "agent.log"
+    with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=out, stderr=err,
+            command, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
             text=True, cwd=cwd, env=env,
         )
         try:
@@ -684,7 +683,11 @@ def run_agent_streaming(
             proc.kill()
             proc.communicate()
             raise
-    return proc.returncode, out_path.read_text(encoding="utf-8")
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+    return proc.returncode, log_path.read_text(encoding="utf-8")
 
 
 def cmd_once(args: argparse.Namespace) -> int:
@@ -1142,8 +1145,6 @@ def cmd_repair(args: argparse.Namespace) -> int:
         comment_pr(args.pr, f"⛔ 修复 Agent 超时。日志：`.agent/runs/repair-{args.pr}/`")
         return 1
 
-    (run_dir / "agent.log").write_text(result.stdout, encoding="utf-8")
-    (run_dir / "agent.stderr.log").write_text(result.stderr, encoding="utf-8")
     head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
     if head == base:
         committed, reason = commit_agent_work(worktree, issue_number, f"repair-{args.pr}")
