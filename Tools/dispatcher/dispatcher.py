@@ -665,6 +665,18 @@ def ensure_agent_pr(
     }, ""
 
 
+def acquire_named_lock(name: str):
+    state = Path(".agent/state")
+    state.mkdir(parents=True, exist_ok=True)
+    handle = (state / f"{name}.lock").open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
 def run_agent_streaming(
     command: list[str], prompt: str, cwd: str, env: dict[str, str],
     timeout_seconds: int, run_dir: Path,
@@ -895,6 +907,10 @@ def request_changes_rounds(pr: dict[str, Any]) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
+    review_lock = acquire_named_lock(f"review-{args.pr}")
+    if review_lock is None:
+        print(f"PR #{args.pr} 已有 review 在运行，跳过")
+        return 0
     pr = gh_json(
         [
             "pr",
@@ -1097,6 +1113,10 @@ def prepare_repair_worktree(pr: int, branch: str, worktree: Path) -> str:
 
 
 def cmd_repair(args: argparse.Namespace) -> int:
+    repair_lock = acquire_named_lock(f"repair-{args.pr}")
+    if repair_lock is None:
+        print(f"PR #{args.pr} 已有 repair 在运行，跳过")
+        return 0
     pr = pr_detail(args.pr)
     sha, verdict, feedback = last_review(pr)
     if verdict != "REQUEST_CHANGES":
@@ -1791,15 +1811,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             detail = pr_detail(pr["number"])
             _, verdict, _ = last_review(detail)
             if verdict == "REQUEST_CHANGES":
-                print(f"repair PR #{pr['number']} (issue #{issue_number})")
-                cmd_repair(
-                    argparse.Namespace(
-                        pr=pr["number"],
-                        execute=not args.dry_run,
-                        timeout=args.timeout,
-                    )
-                )
-                return 0
+                print(f"repair PR #{pr['number']} (issue #{issue_number}) [background]")
+                if not args.dry_run:
+                    log_path = RUN_ROOT / f"repair-{pr['number']}.out"
+                    RUN_ROOT.mkdir(parents=True, exist_ok=True)
+                    with log_path.open("w", encoding="utf-8") as log:
+                        subprocess.Popen(
+                            [sys.executable, str(Path(__file__).resolve()), "repair",
+                             "--pr", str(pr["number"]), "--execute", "--timeout", str(args.timeout)],
+                            stdout=log, stderr=log, start_new_session=True,
+                        )
 
         ready = sorted(list_issues("status:ready"), key=lambda issue: (priority_rank(issue), issue["number"]))
         for issue in ready:
