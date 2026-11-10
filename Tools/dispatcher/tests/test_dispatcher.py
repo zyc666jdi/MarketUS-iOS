@@ -2,11 +2,11 @@ import argparse
 import importlib.util
 import json
 import os
+import select
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1230,14 +1230,19 @@ class RunAgentStreamingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             release = root / "release"
+            ready = root / "ready.fifo"
+            os.mkfifo(ready)
             script = root / "agent.py"
             script.write_text(
                 "import sys\n"
                 "import time\n"
                 "from pathlib import Path\n"
                 "release = Path(sys.argv[1])\n"
-                "print('first line', flush=True)\n"
-                "print('stderr line', file=sys.stderr, flush=True)\n"
+                "with open(sys.argv[2], 'w') as ready:\n"
+                "    print('first line', flush=True)\n"
+                "    print('stderr line', file=sys.stderr, flush=True)\n"
+                "    ready.write('ready\\n')\n"
+                "    ready.flush()\n"
                 "while not release.exists():\n"
                 "    time.sleep(0.01)\n"
                 "print('last line', flush=True)\n",
@@ -1246,10 +1251,10 @@ class RunAgentStreamingTests(unittest.TestCase):
             run_dir = root / "run"
             outcome: dict[str, object] = {}
 
-            def run_child(row: dict[str, object] = outcome) -> None:
+            def run_child() -> None:
                 try:
-                    row["result"] = dispatcher.run_agent_streaming(
-                        [sys.executable, "-u", str(script), str(release)],
+                    outcome["result"] = dispatcher.run_agent_streaming(
+                        [sys.executable, "-u", str(script), str(release), str(ready)],
                         "prompt",
                         str(root),
                         os.environ.copy(),
@@ -1257,16 +1262,21 @@ class RunAgentStreamingTests(unittest.TestCase):
                         run_dir,
                     )
                 except BaseException as error:  # surfaced in the test thread
-                    row["error"] = error
+                    outcome["error"] = error
 
             worker = threading.Thread(target=run_child)
             worker.start()
+            descriptor = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
             try:
-                log = run_dir / "agent.log"
-                self.assertTrue(self._wait_for(log, "first line"), "stdout was not streamed")
-                self.assertTrue(self._wait_for(log, "stderr line"), "stderr was not streamed")
+                readable, _, _ = select.select([descriptor], [], [], 10)
+                self.assertEqual(readable, [descriptor], "agent did not signal readiness")
+                self.assertEqual(os.read(descriptor, 64), b"ready\n")
+                log_text = (run_dir / "agent.log").read_text(encoding="utf-8")
+                self.assertIn("first line", log_text, "stdout was not streamed")
+                self.assertIn("stderr line", log_text, "stderr was not streamed")
                 self.assertTrue(worker.is_alive(), "agent exited before the log was observed")
             finally:
+                os.close(descriptor)
                 release.write_text("go", encoding="utf-8")
                 worker.join(timeout=10)
             self.assertFalse(worker.is_alive(), "run_agent_streaming did not exit")
@@ -1275,18 +1285,6 @@ class RunAgentStreamingTests(unittest.TestCase):
             self.assertEqual(returncode, 0)
             self.assertIn("last line", output)
             self.assertIn("last line", (run_dir / "agent.log").read_text(encoding="utf-8"))
-
-    @staticmethod
-    def _wait_for(path: Path, needle: str, timeout: float = 10.0) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                if needle in path.read_text(encoding="utf-8"):
-                    return True
-            except FileNotFoundError:
-                pass
-            time.sleep(0.01)
-        return False
 
 
 class PlannerOpenIssueTests(unittest.TestCase):
