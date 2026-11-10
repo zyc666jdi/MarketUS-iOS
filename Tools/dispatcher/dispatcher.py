@@ -882,6 +882,18 @@ def comment_pr(number: int, body: str) -> None:
     gh(["pr", "comment", str(number), "--body", body])
 
 
+MAX_REVIEW_ROUNDS = 2
+
+
+def request_changes_rounds(pr: dict[str, Any]) -> int:
+    return sum(
+        1
+        for comment in pr.get("comments", [])
+        if "dispatcher-review" in (comment.get("body") or "")
+        and "verdict=REQUEST_CHANGES" in (comment.get("body") or "")
+    )
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     pr = gh_json(
         [
@@ -963,6 +975,14 @@ def cmd_review(args: argparse.Namespace) -> int:
         notify("MarketUS PR 可合并", f"PR #{args.pr} 评审通过，等待你合并")
         print("✅ APPROVE — 已请求人工合并")
         return 0
+
+    rounds = request_changes_rounds(pr) + 1
+    if rounds >= MAX_REVIEW_ROUNDS:
+        set_status(issue_number, "status:blocked")
+        notify("MarketUS 评审升级", f"PR #{args.pr} 已 {rounds} 轮 REQUEST_CHANGES，转人工")
+        comment_pr(args.pr, f"⛔ 已达 {MAX_REVIEW_ROUNDS} 轮 REQUEST_CHANGES，停止自动修复，升级人类。")
+        print("⛔ REQUEST_CHANGES 达到上限 — 已升级人类")
+        return 1
 
     set_status(issue_number, "status:in-progress")
     print("⛔ REQUEST_CHANGES — 已退回实现")

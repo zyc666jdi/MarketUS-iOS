@@ -1414,3 +1414,15 @@ class RepairWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRoundTests(unittest.TestCase):
+    def test_counts_request_changes_rounds(self):
+        pr = {
+            "comments": [
+                {"body": "<!-- dispatcher-review pr=1 sha=a verdict=REQUEST_CHANGES -->"},
+                {"body": "<!-- dispatcher-review pr=1 sha=b verdict=APPROVE -->"},
+                {"body": "<!-- dispatcher-review pr=1 sha=c verdict=REQUEST_CHANGES -->"},
+            ]
+        }
+        self.assertEqual(dispatcher.request_changes_rounds(pr), 2)
