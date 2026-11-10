@@ -1231,3 +1231,22 @@ class PrepareRepairWorktreeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepairWiringTests(unittest.TestCase):
+    def test_prepare_error_marks_blocked_and_comments(self):
+        pr = {"number": 80, "title": "test", "headRefName": "ai/79-test", "state": "OPEN", "comments": []}
+        args = argparse.Namespace(pr=80, execute=True, timeout=90)
+        with (
+            mock.patch.object(dispatcher, "pr_detail", return_value=pr),
+            mock.patch.object(dispatcher, "last_review", return_value=("abc", "REQUEST_CHANGES", "fix")),
+            mock.patch.object(dispatcher, "repair_rounds", return_value=0),
+            mock.patch.object(dispatcher, "issue_detail", return_value={"number": 79, "body": "ticket"}),
+            mock.patch.object(dispatcher, "prepare_repair_worktree", return_value="无法删除旧分支"),
+            mock.patch.object(dispatcher, "set_status") as set_status,
+            mock.patch.object(dispatcher, "comment_pr") as comment,
+        ):
+            code = dispatcher.cmd_repair(args)
+        self.assertEqual(code, 1)
+        set_status.assert_called_once_with(79, "status:blocked")
+        self.assertIn("无法删除旧分支", comment.call_args.args[1])
