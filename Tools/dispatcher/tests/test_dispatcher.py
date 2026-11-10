@@ -1152,21 +1152,26 @@ class PrepareRepairWorktreeTests(unittest.TestCase):
             with mock.patch.object(dispatcher, "run") as run:
                 def fake_run(command):
                     if command[:3] == ["git", "branch", "-D"]:
-                        return mock.Mock(returncode=delete_rc)
+                        return mock.Mock(returncode=delete_rc, stderr="")
                     if command[:2] == ["git", "rev-parse"]:
-                        return mock.Mock(returncode=verify_rc)
-                    return mock.Mock(returncode=0)
+                        return mock.Mock(returncode=verify_rc, stderr="")
+                    return mock.Mock(returncode=0, stderr="")
 
                 run.side_effect = fake_run
                 reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", worktree)
             return reason, [call.args[0] for call in run.call_args_list], str(worktree)
 
+    @staticmethod
+    def _index(calls, command):
+        return calls.index(command)
+
     def test_missing_branch_is_not_an_error(self):
         reason, calls, worktree = self._run(delete_rc=1, verify_rc=1)
         self.assertEqual(reason, "")
         self.assertIn(["git", "branch", "-D", "repair/80"], calls)
-        self.assertIn(
-            ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"], calls
+        self.assertLess(
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+            self._index(calls, ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]),
         )
 
     def test_still_existing_branch_blocks(self):
@@ -1177,22 +1182,28 @@ class PrepareRepairWorktreeTests(unittest.TestCase):
     def test_existing_branch_deleted_then_add(self):
         reason, calls, worktree = self._run(delete_rc=0, verify_rc=0)
         self.assertEqual(reason, "")
-        self.assertIn(
-            ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"], calls
+        self.assertLess(
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+            self._index(calls, ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]),
         )
 
-    def test_existing_worktree_removed_before_branch_delete(self):
-        reason, calls, worktree = self._run(delete_rc=1, verify_rc=1, worktree_exists=True)
+    def test_existing_worktree_and_branch_are_replaced_in_order(self):
+        reason, calls, worktree = self._run(delete_rc=0, verify_rc=0, worktree_exists=True)
         self.assertEqual(reason, "")
-        self.assertIn(["git", "worktree", "remove", worktree, "--force"], calls)
-        self.assertIn(
-            ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"], calls
+        self.assertLess(
+            self._index(calls, ["git", "worktree", "remove", worktree, "--force"]),
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+        )
+        self.assertLess(
+            self._index(calls, ["git", "branch", "-D", "repair/80"]),
+            self._index(calls, ["git", "worktree", "add", "-b", "repair/80", worktree, "origin/ai/79-test"]),
         )
 
     def test_fetch_failure_blocks_before_branch_delete(self):
-        with mock.patch.object(dispatcher, "run", return_value=mock.Mock(returncode=1, stderr="network")):
+        with mock.patch.object(dispatcher, "run", return_value=mock.Mock(returncode=1, stderr="network")) as run:
             reason = dispatcher.prepare_repair_worktree(80, "ai/79-test", Path("/tmp/none"))
         self.assertIn("fetch", reason)
+        self.assertFalse(any(call.args[0][:3] == ["git", "branch", "-D"] for call in run.call_args_list))
 
 
 class RepairWiringTests(unittest.TestCase):
