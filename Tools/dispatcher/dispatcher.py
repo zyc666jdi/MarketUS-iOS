@@ -71,6 +71,11 @@ WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
 STATE_ROOT = Path(".agent/state")
 
+# gh pr list window for the review rotation. It must stay comfortably above
+# the number of concurrently open ai/* PRs so the cursor can reach every
+# candidate instead of starving the ones outside the window.
+OPEN_PR_LIMIT = 200
+
 # Autopilot Planner：只在没有 ready / 进行中工作时选题，永远只读运行。
 AUTOPILOT_STATE = Path(".agent/state/autopilot.json")
 AUTOPILOT_PROMPT = Path("Tools/dispatcher/prompts/planner.md")
@@ -1517,17 +1522,58 @@ def should_auto_review(labels: set[str], has_review: bool, age: float) -> bool:
     return not has_review and "status:in-progress" in labels and age > FALLBACK_REVIEW_MINUTES
 
 
-def cmd_watch(_args: argparse.Namespace) -> int:
-    """持久化跟踪 ai/* PR 的创建/合并/关闭/冲突/CI 失败，去重通知。"""
-    state_path = Path(".agent/state/pr-watch.json")
-    state_path.parent.mkdir(parents=True, exist_ok=True)
+WATCH_STATE_NAME = "pr-watch.json"
+WATCH_CONFLICT_MARKER = "<!-- dispatcher-conflict pr={} sha={} -->"
+WATCH_BEHIND_MARKER = "<!-- dispatcher-behind pr={} sha={} -->"
+
+
+def _acquire_watch_update_locks(number: int) -> list[TextIO] | None:
+    """Lock a PR for a remote branch update.
+
+    Returns ``None`` when a review or repair already owns the PR: moving the
+    remote base under an active worktree would make its later push
+    non-fast-forward. The caller must release every returned handle.
+    """
+    held: list[TextIO] = []
+    for name in (f"review-{number}", f"repair-{number}"):
+        lock = acquire_named_lock(name)
+        if lock is None:
+            for item in held:
+                release_named_lock(item)
+            return None
+        held.append(lock)
+    return held
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """跟踪 ai/* PR 的创建/合并/关闭/冲突/CI 失败，去重通知。
+
+    ``dry_run`` 时只打印计划：不更新远端分支、不评论、不改 issue 状态，也不写
+    本地 watch 状态，保证 ``run --dry-run`` 是纯预览。
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    state_path = STATE_ROOT / WATCH_STATE_NAME
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         state = {}
-    known: dict[str, str] = state.get("known", {})
-    notified: set[str] = set(state.get("notified", []))
+    if not isinstance(state, dict):
+        state = {}
+    known = state.get("known", {})
+    if not isinstance(known, dict):
+        known = {}
+    raw_notified = state.get("notified", [])
+    notified = (
+        {item for item in raw_notified if isinstance(item, str)}
+        if isinstance(raw_notified, list) else set()
+    )
+    raw_handled = state.get("handled", [])
+    handled = (
+        {item for item in raw_handled if isinstance(item, str)}
+        if isinstance(raw_handled, list) else set()
+    )
     initialized = bool(known)
+    slug = ""
 
     prs = gh_json(
         [
@@ -1541,18 +1587,59 @@ def cmd_watch(_args: argparse.Namespace) -> int:
         if not pr.get("headRefName", "").startswith("ai/"):
             continue
         n = str(pr["number"]); current[n] = "OPEN"
-        sha = pr.get("headRefOid", "")
+        sha = str(pr.get("headRefOid") or "")
+        issue_number = extract_issue_number(pr)
         if initialized and n not in known:
             events.append(("MarketUS PR 已创建", f"#{n} {pr['title']}", f"created:{n}"))
-        if pr.get("mergeStateStatus") == "BEHIND":
-            updated = run(["gh", "api", "-X", "PUT", f"repos/{repo_slug()}/pulls/{pr['number']}/update-branch", "-f", "update_method=merge"])
-            if updated.returncode == 0:
-                print(f"update-branch PR #{pr['number']}")
-            else:
-                comment_pr(pr["number"], "⛔ 分支落后 main 且自动更新失败，请人工 rebase。")
-                events.append(("MarketUS PR 无法自动更新", f"#{n} {pr['title']}", f"behind:{n}:{sha}"))
         if pr.get("mergeable") == "CONFLICTING":
-            events.append(("MarketUS PR 有冲突", f"#{n} {pr['title']}", f"conflict:{n}:{sha}"))
+            key = f"conflict:{n}:{sha}"
+            if key not in handled:
+                if not dry_run:
+                    comment_pr(
+                        pr["number"],
+                        "⛔ PR 与 main 冲突，自动 update-branch 不可用。"
+                        "请人工 rebase 后重新推送。\n\n"
+                        + WATCH_CONFLICT_MARKER.format(n, sha),
+                    )
+                    if issue_number is not None:
+                        set_status(issue_number, "status:blocked")
+                handled.add(key)
+                events.append(("MarketUS PR 有冲突", f"#{n} {pr['title']}", key))
+        elif pr.get("mergeStateStatus") == "BEHIND":
+            key = f"behind:{n}:{sha}"
+            if key not in handled and dry_run:
+                print(f"(dry-run) 将 update-branch PR #{n} ({sha[:8]})")
+            elif key not in handled:
+                locks = _acquire_watch_update_locks(pr["number"])
+                if locks is None:
+                    print(f"skip update-branch PR #{n}: review/repair 正在运行")
+                else:
+                    if not slug:
+                        slug = repo_slug()
+                    command = [
+                        "gh", "api", "-X", "PUT",
+                        f"repos/{slug}/pulls/{pr['number']}/update-branch",
+                        "-f", "update_method=merge",
+                    ]
+                    if sha:
+                        command.extend(["-f", f"expected_head_sha={sha}"])
+                    try:
+                        updated = run(command)
+                    finally:
+                        for lock in locks:
+                            release_named_lock(lock)
+                    handled.add(key)
+                    if updated.returncode == 0:
+                        print(f"update-branch PR #{pr['number']} ({sha[:8]})")
+                    else:
+                        comment_pr(
+                            pr["number"],
+                            "⛔ 分支落后 main 且自动更新失败，请人工 rebase 后重新推送。\n\n"
+                            + WATCH_BEHIND_MARKER.format(n, sha),
+                        )
+                        if issue_number is not None:
+                            set_status(issue_number, "status:blocked")
+                        events.append(("MarketUS PR 无法自动更新", f"#{n} {pr['title']}", key))
         failed = [c for c in (pr.get("statusCheckRollup") or []) if c.get("conclusion") in ("FAILURE", "CANCELLED")]
         if failed:
             events.append(("MarketUS PR CI 失败", f"#{n} {len(failed)} 个 check 失败", f"ci:{n}:{sha}"))
@@ -1565,19 +1652,21 @@ def cmd_watch(_args: argparse.Namespace) -> int:
         state_value = detail.get("state")
         if state_value == "MERGED":
             print(f"merged PR #{n}: running postmerge")
-            cmd_postmerge(argparse.Namespace(dry_run=False))
+            cmd_postmerge(argparse.Namespace(dry_run=dry_run))
 
     for title, message, key in events:
         if key in notified:
             continue
-        notify(title, message)
+        if not dry_run:
+            notify(title, message)
+            notified.add(key)
         print(f"watch: {title} — {message}")
-        notified.add(key)
 
-    state_path.write_text(
-        json.dumps({"known": current, "notified": sorted(notified)}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    if not dry_run:
+        _write_state_file(
+            state_path,
+            {"known": current, "notified": sorted(notified), "handled": sorted(handled)},
+        )
     return 0
 
 
@@ -2060,17 +2149,33 @@ def cmd_observe(args: argparse.Namespace) -> int:
         time.sleep(args.interval)
 
 
+def _review_cursor_path() -> Path:
+    return STATE_ROOT / "review-cursor.json"
+
+
 def _read_review_cursor() -> int:
     try:
-        return int(json.loads(Path(".agent/state/review-cursor.json").read_text())["last_pr"])
-    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        data = json.loads(_review_cursor_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return 0
+    if not isinstance(data, dict):
+        return 0
+    value = data.get("last_pr")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _write_review_cursor(pr: int) -> None:
-    path = Path(".agent/state/review-cursor.json")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"last_pr": pr}), encoding="utf-8")
+    """Persist the last PR considered for review so the next sweep rotates past it."""
+    _write_state_file(_review_cursor_path(), {"last_pr": pr})
+
+
+def rotate_from_cursor(prs: list[dict[str, Any]], cursor: int) -> list[dict[str, Any]]:
+    """Return PRs ordered after ``cursor``, wrapping around to the beginning."""
+    ordered = sorted(prs, key=lambda item: item["number"])
+    start = next((i for i, item in enumerate(ordered) if item["number"] > cursor), 0)
+    return ordered[start:] + ordered[:start]
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -2090,7 +2195,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
         if not args.dry_run:
             reap_worktrees()
-        cmd_watch(argparse.Namespace())
+        cmd_watch(argparse.Namespace(dry_run=args.dry_run))
 
         prs = gh_json(
             [
@@ -2099,7 +2204,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "--state",
                 "open",
                 "--limit",
-                "20",
+                str(OPEN_PR_LIMIT),
                 "--json",
                 "number,body,headRefName,isDraft",
             ]
@@ -2178,15 +2283,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "--state",
                 "open",
                 "--limit",
-                "20",
+                str(OPEN_PR_LIMIT),
                 "--json",
                 "number,body,headRefName,isDraft,createdAt",
             ]
         )
-        prs.sort(key=lambda item: item["number"])
-        cursor = _read_review_cursor()
-        start = next((i for i, item in enumerate(prs) if item["number"] > cursor), 0)
-        prs = prs[start:] + prs[:start]
+        prs = rotate_from_cursor(prs, _read_review_cursor())
 
         for pr in prs:
             if pr.get("isDraft") or not pr.get("headRefName", "").startswith("ai/"):
@@ -2226,11 +2328,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                     timeout=args.timeout,
                 )
             )
-            if not args.dry_run:
-                _write_review_cursor(pr["number"])
             if code == EXIT_LOCK_BUSY:
                 # This PR already has a review running; try the next one.
+                # Do not advance the cursor: the PR was never reviewed.
                 continue
+            if not args.dry_run:
+                _write_review_cursor(pr["number"])
             break
 
         # 只有完全空闲时才让 Planner 选题；每轮最多创建 1 张，下一轮才会被派发。
@@ -2268,7 +2371,10 @@ def main() -> int:
     repair_parser.add_argument("--execute", action="store_true")
     repair_parser.add_argument("--timeout", type=int, default=90)
 
-    subparsers.add_parser("watch", help="检查 open PR 冲突/CI 失败并通知")
+    watch_parser = subparsers.add_parser(
+        "watch", help="检查 open PR 冲突/CI 失败，自动 update-branch 并通知"
+    )
+    watch_parser.add_argument("--dry-run", action="store_true", help="只预览，不写分支/评论/状态")
 
     review_parser = subparsers.add_parser("review", help="对 PR 运行只读 Reviewer（默认 dry-run）")
     review_parser.add_argument("--pr", type=int, required=True)

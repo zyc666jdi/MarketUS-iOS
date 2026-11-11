@@ -365,18 +365,20 @@ class RunParallelLockTests(IsolatedStateTestCase):
         with (
             mock.patch.object(dispatcher, "cmd_postmerge"),
             mock.patch.object(dispatcher, "reap_worktrees"),
-            mock.patch.object(dispatcher, "cmd_watch"),
+            mock.patch.object(dispatcher, "cmd_watch") as watch,
             mock.patch.object(dispatcher, "RUN_ROOT", Path(self._state_tmp.name) / "runs"),
             mock.patch.object(dispatcher, "list_issues", return_value=[]),
             mock.patch.object(dispatcher, "issue_detail", side_effect=issue_for),
             mock.patch.object(dispatcher, "pr_detail", return_value=request_changes),
-            mock.patch.object(dispatcher, "gh_json", side_effect=[repair_prs, review_prs]),
+            mock.patch.object(dispatcher, "gh_json", side_effect=[repair_prs, review_prs]) as gh_json,
             mock.patch.object(dispatcher, "cmd_review", side_effect=review_codes) as review,
             mock.patch.object(dispatcher, "maybe_run_planner"),
             mock.patch.object(dispatcher.subprocess, "Popen") as popen,
         ):
             popen.return_value.pid = 4242
             code = dispatcher.cmd_run(argparse.Namespace(dry_run=dry_run, timeout=90))
+        self.watch = watch
+        self.gh_json = gh_json
         return code, review, popen
 
     def test_one_repair_spawned_per_sweep_then_review_continues(self):
@@ -451,6 +453,42 @@ class RunParallelLockTests(IsolatedStateTestCase):
             code, _, _ = self._run([], [])
         self.assertEqual(code, 0)
         self.assertFalse(stale.exists())
+
+    def test_dry_run_passes_dry_run_to_watch(self):
+        self._run([], [], dry_run=True)
+        self.watch.assert_called_once()
+        self.assertTrue(self.watch.call_args.args[0].dry_run)
+
+    def test_non_dry_run_watch_is_not_dry_run(self):
+        self._run([], [])
+        self.assertFalse(self.watch.call_args.args[0].dry_run)
+
+    def test_cursor_only_advances_after_a_review_runs(self):
+        self._run(
+            [],
+            [numbered_ai_pr(84), numbered_ai_pr(86)],
+            review_codes=[dispatcher.EXIT_LOCK_BUSY, 0],
+        )
+        self.assertEqual(dispatcher._read_review_cursor(), 86)
+
+    def test_all_locked_reviews_leave_cursor_unchanged(self):
+        self._run(
+            [],
+            [numbered_ai_pr(84), numbered_ai_pr(86)],
+            review_codes=[dispatcher.EXIT_LOCK_BUSY, dispatcher.EXIT_LOCK_BUSY],
+        )
+        self.assertEqual(dispatcher._read_review_cursor(), 0)
+
+    def test_cursor_rotates_to_the_next_pr(self):
+        dispatcher._write_review_cursor(84)
+        _, review, _ = self._run([], [numbered_ai_pr(84), numbered_ai_pr(86)])
+        self.assertEqual([call.args[0].pr for call in review.call_args_list], [86])
+
+    def test_review_query_window_covers_more_than_twenty_prs(self):
+        self._run([], [numbered_ai_pr(84)])
+        query = self.gh_json.call_args_list[1].args[0]
+        limit = int(query[query.index("--limit") + 1])
+        self.assertGreater(limit, 20)
 
 
 P1_REVIEW = """
@@ -1816,3 +1854,162 @@ class ReviewRoundTests(unittest.TestCase):
             ]
         }
         self.assertEqual(dispatcher.request_changes_rounds(pr), 2)
+
+
+def watch_pr(
+    number: int = 91,
+    *,
+    mergeable: str = "MERGEABLE",
+    merge_state: str = "BEHIND",
+    sha: str = "abc123",
+    title: str = "test PR",
+) -> dict:
+    return {
+        "number": number,
+        "title": title,
+        "headRefName": f"ai/{number}-test",
+        "headRefOid": sha,
+        "mergeable": mergeable,
+        "mergeStateStatus": merge_state,
+        "statusCheckRollup": [],
+    }
+
+
+class WatchTests(IsolatedStateTestCase):
+    def _watch(self, prs, *, dry_run=False, update_rc=0):
+        with (
+            mock.patch.object(dispatcher, "gh_json", return_value=prs) as gh_json,
+            mock.patch.object(dispatcher, "repo_slug", return_value="owner/repo") as slug,
+            mock.patch.object(
+                dispatcher,
+                "run",
+                return_value=subprocess.CompletedProcess([], update_rc, "", "update failed"),
+            ) as run,
+            mock.patch.object(dispatcher, "comment_pr") as comment,
+            mock.patch.object(dispatcher, "set_status") as status,
+            mock.patch.object(dispatcher, "notify") as notify,
+        ):
+            code = dispatcher.cmd_watch(argparse.Namespace(dry_run=dry_run))
+        return code, run, comment, status, notify, slug, gh_json
+
+    def test_behind_pr_updates_branch_with_expected_head(self):
+        code, run, comment, status, _, _, _ = self._watch([watch_pr()])
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertTrue(any("update-branch" in part for part in command))
+        self.assertIn("expected_head_sha=abc123", command)
+        comment.assert_not_called()
+        status.assert_not_called()
+
+    def test_behind_pr_is_not_updated_twice_for_same_head(self):
+        self._watch([watch_pr()])
+        _, run, comment, status, _, _, _ = self._watch([watch_pr()])
+        run.assert_not_called()
+        comment.assert_not_called()
+        status.assert_not_called()
+
+    def test_behind_update_failure_comments_and_blocks(self):
+        _, run, comment, status, _, _, _ = self._watch([watch_pr()], update_rc=1)
+        run.assert_called_once()
+        comment.assert_called_once()
+        self.assertIn("dispatcher-behind pr=91 sha=abc123", comment.call_args.args[1])
+        status.assert_called_once_with(91, "status:blocked")
+
+    def test_conflicting_pr_comments_blocks_and_skips_update(self):
+        _, run, comment, status, _, _, _ = self._watch(
+            [watch_pr(mergeable="CONFLICTING")]
+        )
+        run.assert_not_called()
+        comment.assert_called_once()
+        self.assertIn("dispatcher-conflict pr=91 sha=abc123", comment.call_args.args[1])
+        status.assert_called_once_with(91, "status:blocked")
+
+    def test_conflicting_pr_is_commented_once(self):
+        self._watch([watch_pr(mergeable="CONFLICTING")])
+        _, _, comment, status, _, _, _ = self._watch(
+            [watch_pr(mergeable="CONFLICTING")]
+        )
+        comment.assert_not_called()
+        status.assert_not_called()
+
+    def test_dry_run_never_writes_remote_comment_or_state(self):
+        _, run, comment, status, notify, slug, _ = self._watch([watch_pr()], dry_run=True)
+        run.assert_not_called()
+        comment.assert_not_called()
+        status.assert_not_called()
+        notify.assert_not_called()
+        slug.assert_not_called()
+        self.assertFalse((dispatcher.STATE_ROOT / "pr-watch.json").exists())
+
+    def test_active_repair_lock_skips_update_then_retries(self):
+        held = dispatcher.acquire_named_lock("repair-91")
+        self.assertIsNotNone(held)
+        try:
+            _, run, comment, status, _, _, _ = self._watch([watch_pr()])
+        finally:
+            dispatcher.release_named_lock(held)
+        run.assert_not_called()
+        comment.assert_not_called()
+        status.assert_not_called()
+
+        _, retry, _, _, _, _, _ = self._watch([watch_pr()])
+        retry.assert_called_once()
+
+    def test_active_review_lock_skips_update(self):
+        held = dispatcher.acquire_named_lock("review-91")
+        self.assertIsNotNone(held)
+        try:
+            _, run, comment, status, _, _, _ = self._watch([watch_pr()])
+        finally:
+            dispatcher.release_named_lock(held)
+        run.assert_not_called()
+        comment.assert_not_called()
+        status.assert_not_called()
+
+    def test_repo_slug_is_resolved_once_per_sweep(self):
+        _, run, _, _, _, slug, _ = self._watch([watch_pr(91), watch_pr(92)])
+        self.assertEqual(slug.call_count, 1)
+        self.assertEqual(run.call_count, 2)
+
+
+class ReviewCursorTests(IsolatedStateTestCase):
+    def test_missing_cursor_is_zero(self):
+        self.assertEqual(dispatcher._read_review_cursor(), 0)
+
+    def test_cursor_lives_under_state_root_and_round_trips(self):
+        dispatcher._write_review_cursor(84)
+        path = dispatcher.STATE_ROOT / "review-cursor.json"
+        self.assertTrue(path.exists())
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"last_pr": 84})
+        self.assertEqual(dispatcher._read_review_cursor(), 84)
+        self.assertEqual(list(dispatcher.STATE_ROOT.glob("*.tmp")), [])
+
+    def test_malformed_cursor_shapes_are_zero(self):
+        path = dispatcher.STATE_ROOT / "review-cursor.json"
+        dispatcher.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        for body in ("[]", "null", '{"last_pr": null}', '{"last_pr": "84"}', "not-json"):
+            with self.subTest(body=body):
+                path.write_text(body, encoding="utf-8")
+                self.assertEqual(dispatcher._read_review_cursor(), 0)
+
+    def test_rotation_starts_after_cursor_and_wraps(self):
+        prs = [{"number": number} for number in (10, 20, 30, 40)]
+        self.assertEqual(
+            [pr["number"] for pr in dispatcher.rotate_from_cursor(prs, 20)],
+            [30, 40, 10, 20],
+        )
+        self.assertEqual(
+            [pr["number"] for pr in dispatcher.rotate_from_cursor(prs, 40)],
+            [10, 20, 30, 40],
+        )
+        self.assertEqual(
+            [pr["number"] for pr in dispatcher.rotate_from_cursor(prs, 0)],
+            [10, 20, 30, 40],
+        )
+
+    def test_rotation_reaches_prs_outside_a_twenty_item_window(self):
+        prs = [{"number": number} for number in range(1, 26)]
+        rotated = dispatcher.rotate_from_cursor(prs, 20)
+        self.assertEqual(rotated[0]["number"], 21)
+        self.assertEqual(rotated[-1]["number"], 20)
