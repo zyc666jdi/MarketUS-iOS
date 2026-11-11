@@ -1532,7 +1532,7 @@ def cmd_watch(_args: argparse.Namespace) -> int:
     prs = gh_json(
         [
             "pr", "list", "--state", "open", "--limit", "50",
-            "--json", "number,title,headRefName,headRefOid,mergeable,statusCheckRollup",
+            "--json", "number,title,headRefName,headRefOid,mergeable,mergeStateStatus,statusCheckRollup",
         ]
     )
     events: list[tuple[str, str, str]] = []
@@ -1544,6 +1544,13 @@ def cmd_watch(_args: argparse.Namespace) -> int:
         sha = pr.get("headRefOid", "")
         if initialized and n not in known:
             events.append(("MarketUS PR 已创建", f"#{n} {pr['title']}", f"created:{n}"))
+        if pr.get("mergeStateStatus") == "BEHIND":
+            updated = run(["gh", "api", "-X", "PUT", f"repos/{repo_slug()}/pulls/{pr['number']}/update-branch", "-f", "update_method=merge"])
+            if updated.returncode == 0:
+                print(f"update-branch PR #{pr['number']}")
+            else:
+                comment_pr(pr["number"], "⛔ 分支落后 main 且自动更新失败，请人工 rebase。")
+                events.append(("MarketUS PR 无法自动更新", f"#{n} {pr['title']}", f"behind:{n}:{sha}"))
         if pr.get("mergeable") == "CONFLICTING":
             events.append(("MarketUS PR 有冲突", f"#{n} {pr['title']}", f"conflict:{n}:{sha}"))
         failed = [c for c in (pr.get("statusCheckRollup") or []) if c.get("conclusion") in ("FAILURE", "CANCELLED")]
@@ -2053,6 +2060,19 @@ def cmd_observe(args: argparse.Namespace) -> int:
         time.sleep(args.interval)
 
 
+def _read_review_cursor() -> int:
+    try:
+        return int(json.loads(Path(".agent/state/review-cursor.json").read_text())["last_pr"])
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return 0
+
+
+def _write_review_cursor(pr: int) -> None:
+    path = Path(".agent/state/review-cursor.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"last_pr": pr}), encoding="utf-8")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     state_dir = STATE_ROOT
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -2163,6 +2183,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "number,body,headRefName,isDraft,createdAt",
             ]
         )
+        prs.sort(key=lambda item: item["number"])
+        cursor = _read_review_cursor()
+        start = next((i for i, item in enumerate(prs) if item["number"] > cursor), 0)
+        prs = prs[start:] + prs[:start]
+
         for pr in prs:
             if pr.get("isDraft") or not pr.get("headRefName", "").startswith("ai/"):
                 continue
@@ -2201,6 +2226,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                     timeout=args.timeout,
                 )
             )
+            if not args.dry_run:
+                _write_review_cursor(pr["number"])
             if code == EXIT_LOCK_BUSY:
                 # This PR already has a review running; try the next one.
                 continue
