@@ -699,25 +699,48 @@ def run_agent_streaming(
     command: list[str], prompt: str, cwd: str, env: dict[str, str],
     timeout_seconds: int, run_dir: Path,
 ) -> tuple[int, str]:
-    """Run an agent while streaming stdout and stderr to run_dir/agent.log live."""
+    """Run an agent, streaming logs, and stop 2s after a final event."""
+    import threading
+    import time
+
     run_dir.mkdir(parents=True, exist_ok=True)
-    log_path = run_dir / "agent.log"
-    with log_path.open("w", encoding="utf-8") as log:
+    out_path = run_dir / "agent.log"
+    err_path = run_dir / "agent.stderr.log"
+    with out_path.open("w", encoding="utf-8") as out:
+        err_path.touch()
         proc = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+            command, stdin=subprocess.PIPE, stdout=out, stderr=out,
             text=True, cwd=cwd, env=env,
         )
-        try:
-            proc.communicate(prompt, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            raise
-        except BaseException:
-            proc.kill()
-            proc.wait()
-            raise
-    return proc.returncode, log_path.read_text(encoding="utf-8")
+
+        def feed() -> None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write(prompt)
+                    proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        threading.Thread(target=feed, daemon=True).start()
+        deadline = time.time() + timeout_seconds
+        final_seen_at: float | None = None
+        while proc.poll() is None:
+            if time.time() > deadline:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            if final_seen_at is None:
+                try:
+                    if '"type":"final"' in out_path.read_text(errors="ignore"):
+                        final_seen_at = time.time()
+                except OSError:
+                    pass
+            elif time.time() - final_seen_at >= 2:
+                proc.kill()
+                break
+            time.sleep(0.5)
+        proc.wait()
+    return proc.returncode, out_path.read_text(encoding="utf-8")
 
 
 def cmd_once(args: argparse.Namespace) -> int:
@@ -1035,6 +1058,19 @@ def format_review_tests(passed: bool | None, command: str, output: str) -> str:
 
 
 MAX_REVIEW_ROUNDS = 2
+REVIEW_POLICY = """你是 MarketUS 的只读 Reviewer。只审查提供的 diff，不探索无关文件，不运行全仓库命令；最多 5 次工具调用。
+
+P1（唯一可阻塞）：正确性错误、安全漏洞、数据损坏、生产不可用。
+P2/P3（不得单独 REQUEST_CHANGES）：测试覆盖、PR 描述、文档、命名、风格、性能建议。
+
+只输出：
+## Verdict: APPROVE | REQUEST_CHANGES
+## Blockers（P1，若无写“无”）
+## Major（P2，可选）
+## Nits（P3，可选）
+"""
+
+
 
 # cmd_run treats this exit code as "another run holds this PR's lock", so it
 # can skip the PR and try the next one instead of ending the sweep.
@@ -1093,9 +1129,7 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
         diff = diff[:60_000] + "\n\n[diff truncated]\n"
 
     prompt = (
-        Path(".agent/prompts/reviewer.md").read_text(encoding="utf-8")
-        + "\n\n---\n\n"
-        + Path("docs/code-review.md").read_text(encoding="utf-8")
+        REVIEW_POLICY
         + f"\n\n---\n\n# PR #{args.pr}: {pr['title']}\n\n{pr.get('body') or ''}"
         + f"\n\n---\n\n# Ticket #{issue_number}\n\n{issue.get('body') or ''}"
         + f"\n\n---\n\n# Diff\n\n```diff\n{diff}\n```\n"
