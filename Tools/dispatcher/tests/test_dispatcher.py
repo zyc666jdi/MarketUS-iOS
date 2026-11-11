@@ -338,7 +338,7 @@ def numbered_ai_pr(number: int, created_at: str | None = "2026-01-01T00:00:00Z")
 
 
 class RunParallelLockTests(IsolatedStateTestCase):
-    def _run(self, repair_prs, review_prs, *, dry_run=False, review_codes=None):
+    def _run(self, repair_prs, review_prs, *, dry_run=False, review_codes=None, review_comment=None):
         issue_labels = {
             82: {"status:in-progress"},
             83: {"status:in-progress"},
@@ -355,7 +355,11 @@ class RunParallelLockTests(IsolatedStateTestCase):
         request_changes = {
             "headRefOid": "abc123",
             "comments": [
-                {"body": "<!-- dispatcher-review pr=82 sha=abc123 verdict=REQUEST_CHANGES -->"}
+                {
+                    "body": review_comment
+                    or "<!-- dispatcher-review pr=82 sha=abc123 verdict=REQUEST_CHANGES p1=1 -->\n"
+                    "## Blockers (P1)\n- [ ] fix"
+                }
             ],
         }
         with (
@@ -371,6 +375,7 @@ class RunParallelLockTests(IsolatedStateTestCase):
             mock.patch.object(dispatcher, "maybe_run_planner"),
             mock.patch.object(dispatcher.subprocess, "Popen") as popen,
         ):
+            popen.return_value.pid = 4242
             code = dispatcher.cmd_run(argparse.Namespace(dry_run=dry_run, timeout=90))
         return code, review, popen
 
@@ -416,11 +421,67 @@ class RunParallelLockTests(IsolatedStateTestCase):
         self.assertIn("previous sweep", text)
         self.assertIn("dispatcher repair sweep", text)
 
+    def test_repair_spawn_writes_pid_and_heartbeat_state(self):
+        code, _, _ = self._run([numbered_ai_pr(82)], [])
+        self.assertEqual(code, 0)
+        state = json.loads(
+            (Path(self._state_tmp.name) / "repair-82.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["pr"], 82)
+        self.assertEqual(state["pid"], 4242)
+        self.assertEqual(state["status"], "running")
+        self.assertIn("startedAt", state)
+        self.assertIn("heartbeatAt", state)
+        self.assertIn("repair-82.out", state["log"])
+
+    def test_p2_only_review_does_not_spawn_repair(self):
+        code, review, popen = self._run(
+            [numbered_ai_pr(82)],
+            [numbered_ai_pr(84)],
+            review_comment="<!-- dispatcher-review pr=82 sha=abc123 verdict=REQUEST_CHANGES p1=0 -->",
+        )
+        self.assertEqual(code, 0)
+        popen.assert_not_called()
+        review.assert_called_once()
+
+    def test_stale_repair_state_is_cleaned_on_run(self):
+        stale = Path(self._state_tmp.name) / "repair-99.json"
+        stale.write_text(json.dumps({"pr": 99, "pid": 999999}), encoding="utf-8")
+        with mock.patch.object(dispatcher, "_pid_alive", return_value=False):
+            code, _, _ = self._run([], [])
+        self.assertEqual(code, 0)
+        self.assertFalse(stale.exists())
+
+
+P1_REVIEW = """
+## Blockers (P1)
+- [ ] `Tools/dispatcher/dispatcher.py:1` — P1 blocker
+
+## Major (P2)
+- [ ] suggestion
+"""
+
+P2_REVIEW = """
+## Major (P2)
+- [ ] suggestion
+
+## Nits (P3)
+- [ ] nit
+"""
+
 
 class ReviewLabelTransitionTests(IsolatedStateTestCase):
-    """The review exits must leave exactly one status label behind."""
+    """Review exits must leave exactly one status label and honor P1 policy."""
 
-    def _review(self, labels: set[str], verdict: str | None):
+    def _review(
+        self,
+        labels: set[str],
+        verdict: str | None,
+        review_body: str = P1_REVIEW,
+        *,
+        test_passed: bool | None = True,
+        comments: list[dict] | None = None,
+    ):
         pr = {
             "number": 38,
             "title": "test",
@@ -429,13 +490,13 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
             "headRefOid": "abc123",
             "state": "OPEN",
             "url": "",
-            "comments": [],
+            "comments": comments or [],
         }
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
 
         def fake_review_agent(_prompt, _run_dir, _timeout):
-            return (f"## Verdict: {verdict}\n" if verdict else "no verdict", 0)
+            return (f"## Verdict: {verdict}\n{review_body}" if verdict else "no verdict", 0)
 
         old_cwd = os.getcwd()
         os.chdir(ROOT)
@@ -445,6 +506,11 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
                 mock.patch.object(dispatcher, "issue_detail", return_value=issue),
                 mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
                 mock.patch.object(dispatcher, "run_review_agent", side_effect=fake_review_agent),
+                mock.patch.object(
+                    dispatcher,
+                    "run_review_tests",
+                    return_value=(test_passed, "make test-dispatcher", "OK"),
+                ),
                 mock.patch.object(dispatcher, "comment_pr"),
                 mock.patch.object(dispatcher, "notify"),
             ):
@@ -454,42 +520,122 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         lock = dispatcher.acquire_named_lock("review-38")
         self.assertIsNotNone(lock)
         dispatcher.release_named_lock(lock)
-        return code, status_after(labels, calls)
+        pr_edits = [args for args in calls if args[:2] == ["pr", "edit"]]
+        return code, status_after(labels, calls), pr_edits
 
     def test_approve_from_in_progress_leaves_only_awaiting_human(self):
-        code, final = self._review({"status:in-progress"}, "APPROVE")
+        code, final, _ = self._review({"status:in-progress"}, "APPROVE")
         self.assertEqual(code, 0)
         self.assertEqual(final, {"status:awaiting-human"})
 
     def test_missing_from_in_progress_leaves_only_blocked(self):
-        code, final = self._review({"status:in-progress"}, None)
+        code, final, _ = self._review({"status:in-progress"}, None)
         self.assertEqual(code, 1)
         self.assertEqual(final, {"status:blocked"})
 
     def test_approve_with_duplicate_status_labels_leaves_only_awaiting_human(self):
-        code, final = self._review({"status:in-progress", "status:in-review"}, "APPROVE")
+        code, final, _ = self._review({"status:in-progress", "status:in-review"}, "APPROVE")
         self.assertEqual(code, 0)
         self.assertEqual(final, {"status:awaiting-human"})
 
     def test_approve_from_claimed_and_in_progress_leaves_only_awaiting_human(self):
-        code, final = self._review({"status:in-progress", "status:claimed"}, "APPROVE")
+        code, final, _ = self._review({"status:in-progress", "status:claimed"}, "APPROVE")
         self.assertEqual(code, 0)
         self.assertEqual(final, {"status:awaiting-human"})
 
-    def test_request_changes_from_claimed_and_in_progress_leaves_only_in_progress(self):
-        code, final = self._review({"status:in-progress", "status:claimed"}, "REQUEST_CHANGES")
+    def test_request_changes_with_p1_returns_to_in_progress(self):
+        code, final, pr_edits = self._review(
+            {"status:in-progress", "status:claimed"}, "REQUEST_CHANGES"
+        )
         self.assertEqual(code, 1)
         self.assertEqual(final, {"status:in-progress"})
+        self.assertEqual(pr_edits, [])
 
     def test_approve_from_blocked_and_in_progress_leaves_only_awaiting_human(self):
-        code, final = self._review({"status:in-progress", "status:blocked"}, "APPROVE")
+        code, final, _ = self._review({"status:in-progress", "status:blocked"}, "APPROVE")
         self.assertEqual(code, 0)
         self.assertEqual(final, {"status:awaiting-human"})
 
-    def test_request_changes_from_blocked_and_in_progress_leaves_only_in_progress(self):
-        code, final = self._review({"status:in-progress", "status:blocked"}, "REQUEST_CHANGES")
+    def test_request_changes_with_p1_from_blocked_returns_to_in_progress(self):
+        code, final, _ = self._review({"status:in-progress", "status:blocked"}, "REQUEST_CHANGES")
         self.assertEqual(code, 1)
         self.assertEqual(final, {"status:in-progress"})
+
+    def test_request_changes_with_p2_only_is_advisory_approval(self):
+        code, final, pr_edits = self._review(
+            {"status:in-progress"}, "REQUEST_CHANGES", P2_REVIEW
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        self.assertEqual(len(pr_edits), 1)
+        self.assertEqual(pr_edits[0][:2], ["pr", "edit"])
+        self.assertIn("--add-label", pr_edits[0])
+        self.assertIn("merge:requested", pr_edits[0])
+
+    def test_second_p1_round_blocks_instead_of_looping(self):
+        prior = {
+            "body": "<!-- dispatcher-review pr=38 sha=111111 verdict=REQUEST_CHANGES p1=1 -->\n"
+            + P1_REVIEW
+        }
+        code, final, _ = self._review(
+            {"status:in-progress"}, "REQUEST_CHANGES", comments=[prior]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+
+    def test_prior_p2_only_round_does_not_count_toward_p1_cap(self):
+        prior = {
+            "body": "<!-- dispatcher-review pr=38 sha=222222 verdict=REQUEST_CHANGES p1=0 -->\n"
+            + P2_REVIEW
+        }
+        code, final, _ = self._review(
+            {"status:in-progress"}, "REQUEST_CHANGES", comments=[prior]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+
+    def test_failed_dispatcher_tests_escalate_approve_to_p1(self):
+        code, final, pr_edits = self._review(
+            {"status:in-progress"}, "APPROVE", test_passed=False
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+        self.assertEqual(pr_edits, [])
+
+
+class P1BlockingPolicyTests(unittest.TestCase):
+    def test_p1_section_is_the_only_blocking_section(self):
+        body = (
+            "## Verdict: REQUEST_CHANGES\n\n"
+            "## Blockers (P1)\n"
+            "- [ ] `A.swift:10` — real blocker\n\n"
+            "## Major (P2)\n"
+            "- [ ] hint only\n\n"
+            "## Nits (P3)\n"
+            "- [ ] nit\n"
+        )
+        self.assertEqual(dispatcher.parse_p1_blockers(body), ["`A.swift:10` — real blocker"])
+
+    def test_p2_only_body_has_no_blockers(self):
+        self.assertEqual(dispatcher.parse_p1_blockers(P2_REVIEW), [])
+
+    def test_empty_blockers_section_has_no_blockers(self):
+        body = "## Blockers (P1)\n- 无\n\n## Major (P2)\n- [ ] P1 might appear later\n"
+        self.assertEqual(dispatcher.parse_p1_blockers(body), [])
+
+    def test_inline_p1_bullet_counts(self):
+        body = "## Verdict: REQUEST_CHANGES\n- [ ] P1: concurrency bug\n"
+        self.assertEqual(dispatcher.parse_p1_blockers(body), ["P1: concurrency bug"])
+
+    def test_p2_rounds_are_not_counted_as_p1_rounds(self):
+        pr = {
+            "comments": [
+                {"body": "<!-- dispatcher-review pr=1 sha=a verdict=REQUEST_CHANGES p1=0 -->\n" + P2_REVIEW},
+                {"body": "<!-- dispatcher-review pr=1 sha=b verdict=REQUEST_CHANGES p1=1 -->\n" + P1_REVIEW},
+                {"body": "<!-- dispatcher-review pr=1 sha=c verdict=APPROVE -->"},
+            ]
+        }
+        self.assertEqual(dispatcher.p1_request_changes_rounds(pr), 1)
 
 
 class SetStatusTests(unittest.TestCase):
@@ -1577,6 +1723,83 @@ class RepairWiringTests(IsolatedStateTestCase):
         prepare.assert_called_once_with(80, "ai/79-test", Path(".worktrees/repair-80"))
         set_status.assert_called_once_with(79, "status:blocked")
         self.assertIn("无法删除旧分支", comment.call_args.args[1])
+
+
+class RepairStateTests(IsolatedStateTestCase):
+    def test_write_and_heartbeat_preserve_started_at(self):
+        with mock.patch.object(dispatcher, "now_iso", side_effect=["t1", "t2"]):
+            path = dispatcher.write_repair_state(82, pid=111, log="/tmp/repair.log")
+            dispatcher.update_repair_heartbeat(82, status="agent-running")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["pid"], os.getpid())
+        self.assertEqual(data["startedAt"], "t1")
+        self.assertEqual(data["heartbeatAt"], "t2")
+        self.assertEqual(data["status"], "agent-running")
+        self.assertEqual(data["log"], "/tmp/repair.log")
+
+    def test_cleanup_removes_dead_and_malformed_keeps_live(self):
+        live = dispatcher.write_repair_state(1, pid=111)
+        dead = dispatcher.write_repair_state(2, pid=222)
+        malformed = dispatcher.STATE_ROOT / "repair-3.json"
+        malformed.write_text("not-json", encoding="utf-8")
+        with mock.patch.object(dispatcher, "_pid_alive", side_effect=lambda pid: pid == 111):
+            removed = dispatcher.cleanup_stale_repair_state()
+        self.assertTrue(live.exists())
+        self.assertFalse(dead.exists())
+        self.assertFalse(malformed.exists())
+        self.assertEqual(set(removed), {dead, malformed})
+
+
+class ReviewTestCheckoutTests(unittest.TestCase):
+    def test_fetch_failure_is_reported_as_not_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/make"),
+                mock.patch.object(
+                    dispatcher,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 1, "", "network"),
+                ),
+            ):
+                passed, command, output = dispatcher.run_review_tests(38)
+        self.assertIsNone(passed)
+        self.assertEqual(command, "git fetch")
+        self.assertIn("network", output)
+
+    def _run_with_result(self, result):
+        commands = []
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_run(args):
+                commands.append(args)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/make"),
+                mock.patch.object(dispatcher, "run", side_effect=fake_run),
+                mock.patch.object(dispatcher.subprocess, "run", return_value=result) as test_run,
+            ):
+                outcome = dispatcher.run_review_tests(38)
+        return outcome, commands, test_run
+
+    def test_success_runs_make_then_cleans_worktree_and_ref(self):
+        result = subprocess.CompletedProcess([], 0, "Ran 1 test in 0.1s\nOK\n", "")
+        (passed, command, output), commands, test_run = self._run_with_result(result)
+        self.assertTrue(passed)
+        self.assertEqual(command, "make test-dispatcher")
+        self.assertIn("OK", output)
+        self.assertEqual(test_run.call_args.args[0], ["make", "test-dispatcher"])
+        self.assertEqual(Path(test_run.call_args.kwargs["cwd"]), Path(commands[1][4]))
+        self.assertTrue(any(args[:3] == ["git", "worktree", "remove"] for args in commands))
+        self.assertTrue(any(args[:2] == ["git", "update-ref"] for args in commands))
+
+    def test_failing_suite_returns_false(self):
+        result = subprocess.CompletedProcess([], 1, "FAILED (failures=1)\n", "")
+        (passed, command, output), _, _ = self._run_with_result(result)
+        self.assertFalse(passed)
+        self.assertEqual(command, "make test-dispatcher")
+        self.assertIn("FAILED", output)
 
 
 if __name__ == "__main__":

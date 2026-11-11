@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
@@ -853,6 +854,7 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 ISSUE_PATTERN = re.compile(r"(?:Fixes|Closes|Refs)\s*#(\d+)", re.IGNORECASE)
 VERDICT_PATTERN = re.compile(r"##\s*Verdict:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
+REVIEW_MARKER = re.compile(r"dispatcher-review pr=\d+ sha=([0-9a-f]+) verdict=(\w+)")
 
 
 def extract_issue_number(pr: dict[str, Any]) -> int | None:
@@ -869,6 +871,70 @@ def extract_issue_number(pr: dict[str, Any]) -> int | None:
 def parse_verdict(text: str) -> str | None:
     match = VERDICT_PATTERN.search(text)
     return match.group(1).upper() if match else None
+
+
+P1_MARKER = re.compile(r"\bP1\b", re.IGNORECASE)
+BLOCKER_HEADING = re.compile(r"\bblockers?\b", re.IGNORECASE)
+P2_P3_MARKER = re.compile(r"\bP[23]\b", re.IGNORECASE)
+INLINE_P1 = re.compile(r"^(?:\[P1\]|P1)\b", re.IGNORECASE)
+BULLET_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s*)?(.+)$")
+EMPTY_FINDINGS = {"无", "none", "n/a", "na", "—", "-", "暂无", "nothing"}
+
+
+def parse_p1_blockers(text: str) -> list[str]:
+    """Extract P1 blockers from a Reviewer verdict body.
+
+    Only the blockers/P1 section (and bullets that explicitly start with a P1
+    marker) count. P2/P3 sections are advisory by policy and never block a PR.
+    """
+    blockers: list[str] = []
+    in_p1_section = False
+    in_advisory_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        heading = re.match(r"^#{2,4}\s+(.+)$", line)
+        if heading:
+            title = heading.group(1)
+            in_advisory_section = bool(P2_P3_MARKER.search(title))
+            in_p1_section = not in_advisory_section and (
+                bool(P1_MARKER.search(title)) or bool(BLOCKER_HEADING.search(title))
+            )
+            continue
+        bullet = BULLET_ITEM.match(line)
+        if bullet is None:
+            continue
+        content = bullet.group(1).strip()
+        if not content or content.lower().strip("。.!！:：") in EMPTY_FINDINGS:
+            continue
+        if in_p1_section or (not in_advisory_section and INLINE_P1.match(content)):
+            blockers.append(content)
+    return blockers
+
+
+def review_has_p1(body: str) -> bool:
+    """Return True when a review comment carries a P1 blocker.
+
+    Legacy comments predate the ``p1=0`` advisory marker and were always
+    treated as blocking; only the explicit ``p1=0`` flag opts out.
+    """
+    if re.search(r"verdict=REQUEST_CHANGES p1=0", body):
+        return bool(parse_p1_blockers(body))
+    return True
+
+
+def p1_request_changes_rounds(pr: dict[str, Any]) -> int:
+    """Count REQUEST_CHANGES rounds that actually contained a P1 blocker."""
+    rounds = 0
+    for comment in pr.get("comments", []):
+        body = comment.get("body") or ""
+        match = REVIEW_MARKER.search(body)
+        if not match or match.group(2).upper() != "REQUEST_CHANGES":
+            continue
+        if review_has_p1(body):
+            rounds += 1
+    return rounds
 
 
 def agent_text(output: str) -> str:
@@ -911,6 +977,63 @@ def comment_pr(number: int, body: str) -> None:
     gh(["pr", "comment", str(number), "--body", body])
 
 
+REVIEW_TEST_TIMEOUT_SECONDS = 600
+
+
+def run_review_tests(pr: int) -> tuple[bool | None, str, str]:
+    """Run ``make test-dispatcher`` on a throwaway checkout of the PR head.
+
+    Returns ``(passed, command, output)``. ``passed`` is ``None`` when the
+    checkout itself failed, so callers can distinguish a real test failure from
+    an environment problem. The PR branch is never modified: a detached
+    worktree is used and removed (including its temporary ref) afterwards.
+    """
+    if shutil.which("make") is None:
+        return None, "make test-dispatcher", "make not found"
+    WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
+    worktree = Path(tempfile.mkdtemp(prefix=f"review-{pr}-", dir=str(WORKTREE_ROOT)))
+    worktree.rmdir()
+    ref = f"refs/dispatcher-review/pr-{pr}"
+    fetched = run(["git", "fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{ref}"])
+    if fetched.returncode != 0:
+        return None, "git fetch", fetched.stderr.strip() or "git fetch failed"
+    try:
+        added = run(["git", "worktree", "add", "--detach", str(worktree), ref])
+        if added.returncode != 0:
+            return None, "git worktree add", added.stderr.strip() or "git worktree add failed"
+        try:
+            result = subprocess.run(
+                ["make", "test-dispatcher"],
+                cwd=str(worktree),
+                capture_output=True,
+                text=True,
+                timeout=REVIEW_TEST_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return None, "make test-dispatcher", str(error)
+        output = ((result.stdout or "") + (result.stderr or "")).strip()
+        return result.returncode == 0, "make test-dispatcher", output[-4000:]
+    finally:
+        removed = run(["git", "worktree", "remove", "--force", str(worktree)])
+        if removed.returncode != 0:
+            shutil.rmtree(worktree, ignore_errors=True)
+            run(["git", "worktree", "prune"])
+        run(["git", "update-ref", "-d", ref])
+
+
+def format_review_tests(passed: bool | None, command: str, output: str) -> str:
+    if passed is True:
+        state = "✅ 通过"
+    elif passed is False:
+        state = "❌ 失败（P1）"
+    else:
+        state = "⚠️ 未能运行（环境问题，不阻塞）"
+    text = f"## Dispatcher 独立测试\n\n- 命令：`{command}`\n- 结果：{state}\n"
+    if output:
+        text += f"\n```\n{output[-2000:]}\n```\n"
+    return text
+
+
 MAX_REVIEW_ROUNDS = 2
 
 # cmd_run treats this exit code as "another run holds this PR's lock", so it
@@ -945,7 +1068,7 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
             "view",
             str(args.pr),
             "--json",
-            "number,title,body,headRefName,headRefOid,state,url,comments",
+            "number,title,body,headRefName,headRefOid,state,url,comments,isCrossRepository",
         ]
     )
     if pr.get("state") != "OPEN":
@@ -992,23 +1115,50 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     if "status:in-progress" in labels:
         set_status(issue_number, "status:in-review")
 
+    if pr.get("isCrossRepository"):
+        # AGENTS.md forbids checking out and executing fork code.
+        test_passed, test_command, test_output = (
+            None,
+            "make test-dispatcher",
+            "fork PR：按安全约束不检出运行",
+        )
+    else:
+        test_passed, test_command, test_output = run_review_tests(args.pr)
+    test_evidence = format_review_tests(test_passed, test_command, test_output)
+    prompt += f"\n\n---\n\n# Dispatcher 独立测试（read-only worktree）\n\n{test_evidence}\n"
+
     run_dir = RUN_ROOT / f"review-{args.pr}"
     text, code = run_review_agent(prompt, run_dir, args.timeout)
     verdict = parse_verdict(text)
     print(f"verdict  {verdict or 'MISSING'} (exit={code})")
+    print(f"tests    {test_passed if test_passed is not None else 'not-run'}")
 
     if verdict is None:
         comment_pr(
             args.pr,
-            f"## ⛔ Dispatcher Review 未能给出 verdict\n\n日志：`.agent/runs/review-{args.pr}/`\n\n"
+            f"## ⛔ Dispatcher Review 未能给出 verdict\n\n{test_evidence}\n\n"
+            f"日志：`.agent/runs/review-{args.pr}/`\n\n"
             f"<!-- {marker} verdict=MISSING -->",
         )
         set_status(issue_number, "status:blocked")
         return 1
 
+    blockers = parse_p1_blockers(text)
+    test_blocker = test_passed is False
+    if test_blocker:
+        # A failing dispatcher suite is objective P1 evidence; never let the
+        # Reviewer's prose downgrade it to an advisory approval.
+        verdict = "REQUEST_CHANGES"
+        blockers = ["独立测试 `make test-dispatcher` 在 PR head 上失败"] + blockers
+        text = (
+            f"{text.rstrip()}\n\n## Blockers (P1) — Dispatcher 独立测试\n\n"
+            "- [ ] `make test-dispatcher` 在 PR head 上失败（见上方测试输出）\n"
+        )
+
+    p1_flag = 1 if blockers else 0
     body = (
-        f"{text}\n\n---\n\n"
-        f"<!-- {marker} verdict={verdict} -->\n"
+        f"{text}\n\n---\n\n{test_evidence}\n\n"
+        f"<!-- {marker} verdict={verdict} p1={p1_flag} -->\n"
         f"评审日志：`.agent/runs/review-{args.pr}/`\n"
     )
     comment_pr(args.pr, body)
@@ -1020,16 +1170,23 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
         print("✅ APPROVE — 已请求人工合并")
         return 0
 
-    rounds = request_changes_rounds(pr) + 1
+    if not blockers:
+        gh(["pr", "edit", str(args.pr), "--add-label", "merge:requested"])
+        set_status(issue_number, "status:awaiting-human")
+        notify("MarketUS PR 仅有建议", f"PR #{args.pr} 无 P1，按 advisory approval 请求人工合并")
+        print("✅ REQUEST_CHANGES 仅含 P2/P3 — 按 advisory approval 处理")
+        return 0
+
+    rounds = p1_request_changes_rounds(pr) + 1
     if rounds >= MAX_REVIEW_ROUNDS:
         set_status(issue_number, "status:blocked")
-        notify("MarketUS 评审升级", f"PR #{args.pr} 已 {rounds} 轮 REQUEST_CHANGES，转人工")
-        comment_pr(args.pr, f"⛔ 已达 {MAX_REVIEW_ROUNDS} 轮 REQUEST_CHANGES，停止自动修复，升级人类。")
-        print("⛔ REQUEST_CHANGES 达到上限 — 已升级人类")
+        notify("MarketUS 评审升级", f"PR #{args.pr} 已 {rounds} 轮 P1，转人工")
+        comment_pr(args.pr, f"⛔ 已达 {MAX_REVIEW_ROUNDS} 轮 P1 REQUEST_CHANGES，停止自动修复，升级人类。")
+        print("⛔ P1 达到上限 — 已升级人类")
         return 1
 
     set_status(issue_number, "status:in-progress")
-    print("⛔ REQUEST_CHANGES — 已退回实现")
+    print("⛔ REQUEST_CHANGES 含 P1 — 已退回实现")
     return 1
 
 
@@ -1090,8 +1247,93 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
 
 
 
-REVIEW_MARKER = re.compile(r"dispatcher-review pr=\d+ sha=([0-9a-f]+) verdict=(\w+)")
 REPAIR_MARKER = "dispatcher-repair pr="
+
+
+def repair_state_path(pr: int) -> Path:
+    return STATE_ROOT / f"repair-{pr}.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _write_state_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
+def write_repair_state(pr: int, pid: int, log: str = "", status: str = "running") -> Path:
+    """Create or replace the observable state file for a background repair."""
+    timestamp = now_iso()
+    path = repair_state_path(pr)
+    _write_state_file(
+        path,
+        {
+            "pr": pr,
+            "pid": pid,
+            "status": status,
+            "startedAt": timestamp,
+            "heartbeatAt": timestamp,
+            "log": log,
+        },
+    )
+    return path
+
+
+def update_repair_heartbeat(pr: int, *, status: str = "running", pid: int | None = None) -> None:
+    """Refresh heartbeat/status without losing the original startedAt."""
+    path = repair_state_path(pr)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    timestamp = now_iso()
+    data.update(
+        {
+            "pr": pr,
+            "pid": os.getpid() if pid is None else pid,
+            "status": status,
+            "heartbeatAt": timestamp,
+        }
+    )
+    data.setdefault("startedAt", timestamp)
+    _write_state_file(path, data)
+
+
+def cleanup_stale_repair_state(state_dir: Path | None = None) -> list[Path]:
+    """Remove repair state files whose process is no longer alive."""
+    state = Path(state_dir) if state_dir is not None else STATE_ROOT
+    removed: list[Path] = []
+    for path in sorted(state.glob("repair-*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            pid = int(data.get("pid", 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pid = 0
+        if _pid_alive(pid):
+            continue
+        path.unlink(missing_ok=True)
+        removed.append(path)
+        print(f"清理过期 repair 状态：{path.name}")
+    return removed
+
 
 
 def pr_detail(number: int) -> dict[str, Any]:
@@ -1173,8 +1415,11 @@ def _cmd_repair_locked(args: argparse.Namespace) -> int:
         print("\n(dry-run) 未调用修复 Agent；加 --execute 执行。")
         return 0
 
+    update_repair_heartbeat(args.pr, status="running", pid=os.getpid())
+
     if rounds >= 2:
         set_status(issue_number, "status:blocked")
+        update_repair_heartbeat(args.pr, status="blocked")
         comment_pr(
             args.pr,
             f"⛔ 自动修复已达 2 轮上限，升级人类处理。\n\n<!-- {REPAIR_MARKER}{args.pr} sha={sha} round=blocked -->",
@@ -1187,6 +1432,7 @@ def _cmd_repair_locked(args: argparse.Namespace) -> int:
     error = prepare_repair_worktree(args.pr, branch, worktree)
     if error:
         set_status(issue_number, "status:blocked")
+        update_repair_heartbeat(args.pr, status="blocked")
         comment_pr(args.pr, f"⛔ {error}")
         return 1
     base = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
@@ -1214,11 +1460,14 @@ def _cmd_repair_locked(args: argparse.Namespace) -> int:
         env["DSH_PERMISSION_MODE"] = os.environ.get("AGENT_PERMISSION_MODE", "danger-full-access")
 
     try:
+        update_repair_heartbeat(args.pr, status="agent-running")
         run_agent_streaming(command, prompt, str(worktree), env, args.timeout * 60, run_dir)
     except subprocess.TimeoutExpired:
         set_status(issue_number, "status:blocked")
+        update_repair_heartbeat(args.pr, status="timeout")
         comment_pr(args.pr, f"⛔ 修复 Agent 超时。日志：`.agent/runs/repair-{args.pr}/`")
         return 1
+    update_repair_heartbeat(args.pr, status="committing")
 
     head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
     if head == base:
@@ -1237,9 +1486,11 @@ def _cmd_repair_locked(args: argparse.Namespace) -> int:
     pushed = run(["git", "-C", str(worktree), "push", "origin", f"HEAD:{branch}"])
     if pushed.returncode != 0:
         set_status(issue_number, "status:blocked")
+        update_repair_heartbeat(args.pr, status="failed")
         comment_pr(args.pr, f"⛔ 修复 push 失败：{pushed.stderr.strip() or 'unknown'}")
         return 1
     set_status(issue_number, "status:in-review")
+    update_repair_heartbeat(args.pr, status="completed")
     comment_pr(
         args.pr,
         f"🤖 自动修复已提交 `{head[:8]}`，回到评审。\n\n<!-- {REPAIR_MARKER}{args.pr} sha={sha} round={rounds + 1} -->",
@@ -1814,6 +2065,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     try:
+        if not args.dry_run:
+            cleanup_stale_repair_state()
         cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
         if not args.dry_run:
             reap_worktrees()
@@ -1844,8 +2097,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             if "status:in-progress" not in labels_of(linked):
                 continue
             detail = pr_detail(pr["number"])
-            _, verdict, _ = last_review(detail)
-            if verdict == "REQUEST_CHANGES":
+            _, verdict, feedback = last_review(detail)
+            if verdict == "REQUEST_CHANGES" and review_has_p1(feedback):
                 number = pr["number"]
                 print(f"repair PR #{number} (issue #{issue_number}) [background]")
                 if args.dry_run:
@@ -1866,7 +2119,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 except OSError as error:
                     print(f"⛔ 启动 repair 失败：{error}")
                     continue
-                print(f"repair PR #{number} 已在后台启动 pid={proc.pid} log={log_path}")
+                try:
+                    repair_state = write_repair_state(number, proc.pid, str(log_path))
+                except (OSError, TypeError, ValueError) as error:
+                    repair_state = f"<写入失败：{error}>"
+                print(
+                    f"repair PR #{number} 已在后台启动 pid={proc.pid} "
+                    f"log={log_path} state={repair_state}"
+                )
                 # One background repair per sweep keeps the host from running
                 # many 90-minute full-access agents (and git operations) at once.
                 break
