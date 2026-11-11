@@ -93,6 +93,74 @@ class ReviewRepairTests(unittest.TestCase):
         self.assertEqual(dispatcher.repair_rounds(pr), 1)
 
 
+class IsolatedStateTestCase(unittest.TestCase):
+    """Keep per-PR lock files out of the real .agent/state during tests."""
+
+    def setUp(self):
+        super().setUp()
+        self._state_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._state_tmp.cleanup)
+        state_patch = mock.patch.object(dispatcher, "STATE_ROOT", Path(self._state_tmp.name))
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
+
+
+class NamedLockTests(IsolatedStateTestCase):
+    def test_same_name_is_exclusive(self):
+        first = dispatcher.acquire_named_lock("review-38")
+        self.assertIsNotNone(first)
+        try:
+            self.assertIsNone(dispatcher.acquire_named_lock("review-38"))
+        finally:
+            dispatcher.release_named_lock(first)
+
+        again = dispatcher.acquire_named_lock("review-38")
+        self.assertIsNotNone(again)
+        dispatcher.release_named_lock(again)
+
+    def test_review_and_repair_locks_are_independent(self):
+        review = dispatcher.acquire_named_lock("review-38")
+        self.assertIsNotNone(review)
+        repair = dispatcher.acquire_named_lock("repair-38")
+        self.assertIsNotNone(repair)
+        dispatcher.release_named_lock(repair)
+        dispatcher.release_named_lock(review)
+
+
+class ReviewLockTests(IsolatedStateTestCase):
+    def test_busy_lock_skips_before_reading_or_running_agent(self):
+        held = dispatcher.acquire_named_lock("review-38")
+        self.assertIsNotNone(held)
+        try:
+            with (
+                mock.patch.object(dispatcher, "gh_json") as gh_json,
+                mock.patch.object(dispatcher, "run_review_agent") as agent,
+            ):
+                code = dispatcher.cmd_review(argparse.Namespace(pr=38, execute=True, timeout=30))
+        finally:
+            dispatcher.release_named_lock(held)
+        self.assertEqual(code, dispatcher.EXIT_LOCK_BUSY)
+        gh_json.assert_not_called()
+        agent.assert_not_called()
+
+
+class RepairLockTests(IsolatedStateTestCase):
+    def test_busy_lock_skips_before_reading_or_running_agent(self):
+        held = dispatcher.acquire_named_lock("repair-38")
+        self.assertIsNotNone(held)
+        try:
+            with (
+                mock.patch.object(dispatcher, "pr_detail") as pr_detail,
+                mock.patch.object(dispatcher, "run_agent_streaming") as agent,
+            ):
+                code = dispatcher.cmd_repair(argparse.Namespace(pr=38, execute=True, timeout=30))
+        finally:
+            dispatcher.release_named_lock(held)
+        self.assertEqual(code, dispatcher.EXIT_LOCK_BUSY)
+        pr_detail.assert_not_called()
+        agent.assert_not_called()
+
+
 class FallbackReviewTests(unittest.TestCase):
     def test_auto_review_when_in_progress_without_review(self):
         self.assertTrue(dispatcher.should_auto_review({"status:in-progress"}, False, 11))
@@ -259,7 +327,97 @@ class RunFallbackTests(unittest.TestCase):
         self.assertEqual(planner.call_args.args[1:], ([], [], []))
 
 
-class ReviewLabelTransitionTests(unittest.TestCase):
+def numbered_ai_pr(number: int, created_at: str | None = "2026-01-01T00:00:00Z") -> dict:
+    return {
+        "number": number,
+        "body": "",
+        "headRefName": f"ai/{number}-test",
+        "isDraft": False,
+        "createdAt": created_at,
+    }
+
+
+class RunParallelLockTests(IsolatedStateTestCase):
+    def _run(self, repair_prs, review_prs, *, dry_run=False, review_codes=None):
+        issue_labels = {
+            82: {"status:in-progress"},
+            83: {"status:in-progress"},
+            84: {"status:in-review"},
+            86: {"status:in-review"},
+        }
+
+        def issue_for(number):
+            return {
+                "number": number,
+                "labels": [{"name": name} for name in issue_labels.get(number, set())],
+            }
+
+        request_changes = {
+            "headRefOid": "abc123",
+            "comments": [
+                {"body": "<!-- dispatcher-review pr=82 sha=abc123 verdict=REQUEST_CHANGES -->"}
+            ],
+        }
+        with (
+            mock.patch.object(dispatcher, "cmd_postmerge"),
+            mock.patch.object(dispatcher, "reap_worktrees"),
+            mock.patch.object(dispatcher, "cmd_watch"),
+            mock.patch.object(dispatcher, "RUN_ROOT", Path(self._state_tmp.name) / "runs"),
+            mock.patch.object(dispatcher, "list_issues", return_value=[]),
+            mock.patch.object(dispatcher, "issue_detail", side_effect=issue_for),
+            mock.patch.object(dispatcher, "pr_detail", return_value=request_changes),
+            mock.patch.object(dispatcher, "gh_json", side_effect=[repair_prs, review_prs]),
+            mock.patch.object(dispatcher, "cmd_review", side_effect=review_codes) as review,
+            mock.patch.object(dispatcher, "maybe_run_planner"),
+            mock.patch.object(dispatcher.subprocess, "Popen") as popen,
+        ):
+            code = dispatcher.cmd_run(argparse.Namespace(dry_run=dry_run, timeout=90))
+        return code, review, popen
+
+    def test_one_repair_spawned_per_sweep_then_review_continues(self):
+        code, review, popen = self._run(
+            [numbered_ai_pr(82), numbered_ai_pr(83)], [numbered_ai_pr(84)]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(popen.call_count, 1)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index("--pr") + 1], "82")
+        self.assertIn("--execute", argv)
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[0].pr, 84)
+
+    def test_locked_review_does_not_starve_next_pr(self):
+        code, review, _ = self._run(
+            [],
+            [numbered_ai_pr(84), numbered_ai_pr(86)],
+            review_codes=[dispatcher.EXIT_LOCK_BUSY, 0],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0].pr for call in review.call_args_list], [84, 86])
+
+    def test_dry_run_does_not_spawn_repair(self):
+        code, review, popen = self._run(
+            [numbered_ai_pr(82)], [numbered_ai_pr(84)], dry_run=True
+        )
+        self.assertEqual(code, 0)
+        popen.assert_not_called()
+        review.assert_called_once()
+        self.assertFalse(review.call_args.args[0].execute)
+
+    def test_repair_log_is_appended_not_truncated(self):
+        run_root = Path(self._state_tmp.name) / "runs"
+        run_root.mkdir(parents=True)
+        log_path = run_root / "repair-82.out"
+        log_path.write_text("previous sweep\n", encoding="utf-8")
+        code, _, popen = self._run([numbered_ai_pr(82)], [])
+        self.assertEqual(code, 0)
+        popen.assert_called_once()
+        text = log_path.read_text(encoding="utf-8")
+        self.assertIn("previous sweep", text)
+        self.assertIn("dispatcher repair sweep", text)
+
+
+class ReviewLabelTransitionTests(IsolatedStateTestCase):
     """The review exits must leave exactly one status label behind."""
 
     def _review(self, labels: set[str], verdict: str | None):
@@ -293,6 +451,9 @@ class ReviewLabelTransitionTests(unittest.TestCase):
                 code = dispatcher.cmd_review(argparse.Namespace(pr=38, execute=True, timeout=30))
         finally:
             os.chdir(old_cwd)
+        lock = dispatcher.acquire_named_lock("review-38")
+        self.assertIsNotNone(lock)
+        dispatcher.release_named_lock(lock)
         return code, status_after(labels, calls)
 
     def test_approve_from_in_progress_leaves_only_awaiting_human(self):
@@ -428,7 +589,7 @@ class PostmergeStatusTests(unittest.TestCase):
         self.assertEqual(status_after(labels, calls), {"status:done"})
 
 
-class RepairStatusTests(unittest.TestCase):
+class RepairStatusTests(IsolatedStateTestCase):
     def test_repair_round_limit_leaves_only_blocked(self):
         labels = {"status:in-progress", "status:claimed"}
         pr = {
@@ -454,6 +615,9 @@ class RepairStatusTests(unittest.TestCase):
             code = dispatcher.cmd_repair(argparse.Namespace(pr=38, execute=True, timeout=30))
         self.assertEqual(code, 1)
         self.assertEqual(status_after(labels, calls), {"status:blocked"})
+        lock = dispatcher.acquire_named_lock("repair-38")
+        self.assertIsNotNone(lock)
+        dispatcher.release_named_lock(lock)
 
     def test_repair_success_pushes_and_returns_to_review(self):
         labels = {"status:in-progress", "status:claimed"}
@@ -506,6 +670,9 @@ class RepairStatusTests(unittest.TestCase):
             ["git", "-C", str(worktree), "push", "origin", "HEAD:ai/40-test"],
         )
         self.assertIn("自动修复已提交 `head111`", comment_pr.call_args.args[1])
+        lock = dispatcher.acquire_named_lock("repair-38")
+        self.assertIsNotNone(lock)
+        dispatcher.release_named_lock(lock)
 
 
 class MergeGuardTests(unittest.TestCase):
@@ -1392,7 +1559,7 @@ class PrepareRepairWorktreeTests(unittest.TestCase):
         self.assertFalse(any(call.args[0][:3] == ["git", "branch", "-D"] for call in run.call_args_list))
 
 
-class RepairWiringTests(unittest.TestCase):
+class RepairWiringTests(IsolatedStateTestCase):
     def test_prepare_error_marks_blocked_and_comments(self):
         pr = {"number": 80, "title": "test", "headRefName": "ai/79-test", "state": "OPEN", "comments": []}
         args = argparse.Namespace(pr=80, execute=True, timeout=90)
