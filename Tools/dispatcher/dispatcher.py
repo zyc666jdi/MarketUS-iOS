@@ -719,6 +719,13 @@ def _scan_final_event(path: Path, offset: int, pending: str) -> tuple[int, str, 
             continue
         if isinstance(event, dict) and event.get("type") == "final":
             return offset, pending, True
+    if pending.strip():
+        try:
+            event = json.loads(pending)
+        except json.JSONDecodeError:
+            event = None
+        if isinstance(event, dict) and event.get("type") == "final":
+            return offset, "", True
     return offset, pending, False
 
 

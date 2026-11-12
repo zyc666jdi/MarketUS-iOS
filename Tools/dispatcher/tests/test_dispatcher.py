@@ -1933,3 +1933,12 @@ class ReviewRoundTests(unittest.TestCase):
             ]
         }
         self.assertEqual(dispatcher.request_changes_rounds(pr), 2)
+
+
+class FinalEventScanTests(unittest.TestCase):
+    def test_final_event_without_trailing_newline_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.log"
+            path.write_text('{"type":"final","text":"OK"}', encoding="utf-8")
+            _, _, found = dispatcher._scan_final_event(path, 0, "")
+            self.assertTrue(found)
