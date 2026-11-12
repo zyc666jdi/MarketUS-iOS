@@ -453,3 +453,34 @@ python3 Tools/dispatcher/dispatcher.py planner --execute
 Planner 以 `DSH_PERMISSION_MODE=read-only` 运行，不修改文件、不 push、不 merge；
 选题结果仍由 Dispatcher 校验受保护路径与注入模式。不新增依赖、不读取密钥，
 日志写入 `.agent/runs/planner/`（不提交）。
+
+## 22. E2E 验收检查清单
+
+> 在首次常驻运行（或 Dispatcher 升级后）用**一张真实 ticket** 跑通全链路；每项都要在
+> issue、PR 与本地留下可复现证据。任一未勾选即视为 E2E 未通过：回到 `--dry-run`，
+> 按 §11 升级，不要跳步。本节验收跨阶段结果，§19 的首次领取前置检查仍需先全部通过。
+
+- [ ] **dispatch**：`status:ready` 的 ticket 通过 DoR 后被领取：领取时置
+      `status:claimed` 并回读成功，随后进入 `status:in-progress`；领取评论含
+      `run` / `at` / `branch`，worktree 为 `.worktrees/<N>-<slug>`、分支为
+      `ai/<N>-<slug>`；`dispatcher.py status` 与 `dispatcher.py plan` 的计数和 GitHub 上的
+      实际标签一致。
+- [ ] **PR**：实现 Agent 退出后存在对应 PR；用
+      `gh pr view <PR> --json baseRefName,headRefName,labels,body,files` 确认
+      base=`main`、head=`ai/<N>-<slug>`，body 使用模板且含 `Fixes #<N>`，标签含
+      `ai:generated` / `risk:*` / `size:*`，`files` 未命中受保护路径。
+- [ ] **review**：`dispatcher.py review --pr <PR> --execute` 产出带
+      `## Verdict: APPROVE|REQUEST_CHANGES` 与
+      `<!-- dispatcher-review pr=<PR> sha=<sha> ... -->` marker 的评论；P1 为 0 才进入
+      合并请求，P1 > 0 则退回修复或升级；Reviewer 为独立只读会话，未 approve 自己的
+      PR、未 push。
+- [ ] **merge gate**：评审通过后 PR 带 `merge:requested`、issue 进入
+      `status:awaiting-human`；`merge-gate / require-merge-requested` 检查为绿；确认过程
+      中没有 Agent 执行 merge、没有 push `main`，且人类审批数满足
+      `.agent/config.yml` 的 `merge.human_approvals`。
+- [ ] **postmerge**：人类 squash merge 后执行 `dispatcher.py postmerge`（先 `--dry-run`
+      预览）；issue 收敛到 `status:done`，对应 worktree 与 PR 上的 `status:*` 标签被清理，
+      合并评论带 `<!-- dispatcher-merged pr=<PR> -->`，重复执行不产生重复评论。
+- [ ] **失败路径**：抽查一次可恢复失败（如 Agent 超时或 Reviewer P1），确认按 §11
+      进入 `status:blocked` / 退回修复，租约释放、worktree 可清理，日志在
+      `.agent/runs/<N>/` 且不含密钥；全程未 force push、未合并、未绕过检查。
