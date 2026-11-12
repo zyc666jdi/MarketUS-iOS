@@ -440,6 +440,25 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 
+# Dispatcher 始终以 headless 方式运行 Implementer。该规则不能写进受保护的
+# .agent/prompts/implementer.md，因此在提示组装时注入。
+HEADLESS_VALIDATION_RULES = """
+
+---
+
+# Headless 验证规则（Dispatcher 注入，强制）
+
+- 本会话运行在 headless 环境：**不要运行 `make verify`**，也不要运行 UI 测试
+  （XCUITest / `-only-testing:*UITests` / 需要 Simulator.app 的测试）。
+- 只运行：`make build` + `make test-package`。
+- 若上述命令因沙箱/环境限制失败（无法启动 Simulator、`xcodebuild` 被拒、权限不足等）：
+  在最终输出和 PR 的 `## 测试证据` 中**原样记录完整命令与错误输出**，标注
+  「未跑 / 环境受限」，不得声称通过；但**仍然 commit / push / 创建 PR**，
+  不要仅因环境限制或未跑 `make verify` 标记 `BLOCKED`。
+- 只有代码本身的真实失败（编译错误、断言失败）才阻止提交 PR；修复后重跑。
+"""
+
+
 def build_prompt(issue: dict[str, Any], worktree: Path, branch: str) -> str:
     implementer = Path(".agent/prompts/implementer.md").read_text(encoding="utf-8")
     contract = Path("AGENTS.md").read_text(encoding="utf-8")
@@ -464,8 +483,26 @@ def build_prompt(issue: dict[str, Any], worktree: Path, branch: str) -> str:
 - 分支：`{branch}`
 - 超时：见 dispatcher；超过即会被终止
 - 禁止：合并 PR、push `main`、修改受保护路径、跳过测试
-- 完成后：按 PR 模板填写证据，并确保 `make verify` 通过
+- 完成后：按 PR 模板填写证据，并按下方 Headless 验证规则执行
+{HEADLESS_VALIDATION_RULES}
 """
+
+
+def build_repair_prompt(issue_number: int, issue_body: str, feedback: str, branch: str) -> str:
+    return (
+        Path(".agent/prompts/implementer.md").read_text(encoding="utf-8")
+        + "\n\n---\n\n"
+        + Path("AGENTS.md").read_text(encoding="utf-8")
+        + f"\n\n---\n\n# Ticket #{issue_number}\n\n{issue_body or ''}"
+        + f"\n\n---\n\n# Reviewer feedback（必须修复）\n\n{feedback[:20000]}"
+        + (
+            f"\n\n---\n\n# Run constraints\n\n"
+            "- 只修复 Reviewer 指出的问题，不扩大范围\n"
+            f"- 提交并 push 到 `{branch}`，**不要合并**\n"
+            "- 完成后立即退出"
+        )
+        + HEADLESS_VALIDATION_RULES
+    )
 
 
 def worktree_dirty(worktree: Path) -> bool:
@@ -1319,15 +1356,20 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         except SystemExit:
             continue
         labels = labels_of(issue)
-        # Only issues that still have work to converge are touched. A done
-        # issue is terminal: no comments, no label edits, no worktree cleanup.
-        if "status:done" in labels:
-            print(f"merged PR #{pr['number']} → issue #{issue_number}（已 status:done，跳过）")
-            continue
-        print(f"merged PR #{pr['number']} → issue #{issue_number}")
+        done = "status:done" in labels
+        if done:
+            print(
+                f"merged PR #{pr['number']} → issue #{issue_number}"
+                "（已 status:done：跳过 issue 评论/状态，仅清理 worktree 与 PR 标签）"
+            )
+        else:
+            print(f"merged PR #{pr['number']} → issue #{issue_number}")
         if args.dry_run:
             continue
 
+        # Cleanup is unconditional, including for status:done issues: a previous
+        # run may have set done before the worktree/PR labels were cleaned, and
+        # retries must still converge.
         branch = pr.get("headRefName", "")
         updated = False
         if "/" in branch:
@@ -1340,15 +1382,16 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         if clear_status(pr["number"], pr_labels, kind="pr"):
             updated = True
 
-        residual = labels & (set(STATUS_LABELS) - {"status:done"})
-        if residual:
-            set_status(issue_number, "status:done")
-            updated = True
+        if not done:
+            residual = labels & (set(STATUS_LABELS) - {"status:done"})
+            if residual:
+                set_status(issue_number, "status:done")
+                updated = True
 
-        marker = f"<!-- dispatcher-merged pr={pr['number']} -->"
-        if not any(marker in body for body in issue_comment_bodies(issue_number)):
-            gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}\n\n{marker}"])
-            updated = True
+            marker = f"<!-- dispatcher-merged pr={pr['number']} -->"
+            if not any(marker in body for body in issue_comment_bodies(issue_number)):
+                gh(["issue", "comment", str(issue_number), "--body", f"✅ 已合并：{pr['url']}\n\n{marker}"])
+                updated = True
         if updated:
             changed += 1
     print(f"postmerge: {changed} issue(s) updated")
@@ -1546,14 +1589,7 @@ def _cmd_repair_locked(args: argparse.Namespace) -> int:
         return 1
     base = run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).stdout.strip()
 
-    prompt = (
-        Path(".agent/prompts/implementer.md").read_text(encoding="utf-8")
-        + "\n\n---\n\n"
-        + Path("AGENTS.md").read_text(encoding="utf-8")
-        + f"\n\n---\n\n# Ticket #{issue_number}\n\n{issue.get('body') or ''}"
-        + f"\n\n---\n\n# Reviewer feedback（必须修复）\n\n{feedback[:20000]}"
-        + f"\n\n---\n\n# Run constraints\n\n- 只修复 Reviewer 指出的问题，不扩大范围\n- 只跑 `make build` + `make test-package`；UI 测试跳过\n- 提交并 push 到 `{branch}`，**不要合并**\n- 完成后立即退出\n"
-    )
+    prompt = build_repair_prompt(issue_number, issue.get("body") or "", feedback, branch)
     run_dir = RUN_ROOT / f"repair-{args.pr}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")

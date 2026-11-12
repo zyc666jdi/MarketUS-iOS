@@ -1278,7 +1278,14 @@ class PlannerCommandTests(unittest.TestCase):
 
 
 class PostmergeIdempotencyTests(unittest.TestCase):
-    def _postmerge(self, issue_labels: set[str], pr_labels: set[str], comments: tuple[str, ...] = ()):
+    def _postmerge(
+        self,
+        issue_labels: set[str],
+        pr_labels: set[str],
+        comments: tuple[str, ...] = (),
+        *,
+        worktree_exists: bool = True,
+    ):
         prs = [
             {
                 "number": 42,
@@ -1298,7 +1305,8 @@ class PostmergeIdempotencyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp) / "40-test"
-            worktree.mkdir()
+            if worktree_exists:
+                worktree.mkdir()
             with (
                 mock.patch.object(dispatcher, "gh_json", side_effect=fake_json),
                 mock.patch.object(dispatcher, "issue_detail", return_value=issue),
@@ -1319,30 +1327,54 @@ class PostmergeIdempotencyTests(unittest.TestCase):
         self.assertEqual(args[:4], ["pr", "list", "--state", "merged"])
         self.assertEqual(args[args.index("--limit") + 1], "10")
 
-    def test_done_issue_with_residual_labels_is_skipped(self):
-        code, calls, gh, run = self._postmerge(
+    def test_done_issue_with_residual_labels_still_cleans_worktree_and_pr_labels(self):
+        code, calls, _, run = self._postmerge(
             {"status:done", "status:in-progress", "status:claimed"},
             {"status:in-review", "status:awaiting-human", "merge:requested"},
         )
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [])
-        gh.assert_not_called()
-        run.assert_not_called()
+        worktree_remove = run.call_args.args[0]
+        self.assertEqual(worktree_remove[:3], ["git", "worktree", "remove"])
+        self.assertEqual(worktree_remove[-1], "--force")
+        pr_edits = [args for args in calls if args[:2] == ["pr", "edit"]]
+        self.assertEqual(len(pr_edits), 1)
+        self.assertIn("--remove-label", pr_edits[0])
+        self.assertIn("status:in-review", pr_edits[0])
+        self.assertIn("status:awaiting-human", pr_edits[0])
+        self.assertNotIn("--add-label", pr_edits[0])
+        # status:done is terminal: no issue status edits and no issue comments.
+        self.assertFalse(any(args[:2] == ["issue", "edit"] for args in calls))
+        self.assertFalse(any(args[:2] == ["issue", "comment"] for args in calls))
 
-    def test_done_issue_with_marker_is_skipped_without_gh_calls(self):
-        code, calls, gh, run = self._postmerge(
+    def test_done_issue_with_marker_still_cleans_worktree_and_pr_labels(self):
+        code, calls, _, run = self._postmerge(
             {"status:done"},
             {"status:in-review"},
             comments=("✅ 已合并\n\n<!-- dispatcher-merged pr=42 -->",),
         )
         self.assertEqual(code, 0)
-        gh.assert_not_called()
-        run.assert_not_called()
+        run.assert_called_once()
+        self.assertFalse(any(args[:2] == ["issue", "edit"] for args in calls))
+        self.assertFalse(any(args[:2] == ["issue", "comment"] for args in calls))
+        self.assertTrue(any(args[:2] == ["pr", "edit"] for args in calls))
 
-    def test_done_issue_without_comment_is_not_repaired(self):
-        code, calls, gh, _ = self._postmerge({"status:done"}, {"status:in-review"})
+    def test_done_issue_without_comment_is_not_commented_but_is_converged(self):
+        code, calls, _, run = self._postmerge({"status:done"}, {"status:in-review"})
         self.assertEqual(code, 0)
-        gh.assert_not_called()
+        run.assert_called_once()
+        self.assertFalse(any(args[:2] == ["issue", "comment"] for args in calls))
+        self.assertTrue(any(args[:2] == ["pr", "edit"] for args in calls))
+
+    def test_done_issue_without_worktree_only_clears_pr_labels(self):
+        code, calls, _, run = self._postmerge(
+            {"status:done"},
+            {"status:in-review", "status:awaiting-human"},
+            worktree_exists=False,
+        )
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+        self.assertTrue(any(args[:2] == ["pr", "edit"] for args in calls))
+        self.assertFalse(any(args[:2] == ["issue", "edit"] for args in calls))
         self.assertFalse(any(args[:2] == ["issue", "comment"] for args in calls))
 
     def test_comment_before_status_change_does_not_duplicate_on_retry(self):
@@ -1365,6 +1397,31 @@ class PostmergeIdempotencyTests(unittest.TestCase):
         self.assertEqual(status_after({"status:in-progress", "status:claimed"}, calls), {"status:done"})
         self.assertTrue(any(args[:2] == ["issue", "comment"] for args in calls))
         self.assertTrue(any(args[:2] == ["pr", "edit"] for args in calls))
+
+
+class ImplementerPromptTests(unittest.TestCase):
+    def _build_prompt(self) -> str:
+        issue = {"number": 40, "title": "test", "body": "body"}
+        with mock.patch.object(Path, "read_text", return_value="BASE PROMPT"):
+            return dispatcher.build_prompt(issue, Path("/tmp/worktree"), "ai/40-test")
+
+    def test_dispatch_prompt_appends_headless_validation_rules(self):
+        prompt = self._build_prompt()
+        self.assertEqual(prompt.count("# Headless 验证规则"), 1)
+        self.assertIn("不要运行 `make verify`", prompt)
+        self.assertIn("`make build` + `make test-package`", prompt)
+        self.assertIn("原样记录完整命令与错误输出", prompt)
+        self.assertIn("仍然 commit / push / 创建 PR", prompt)
+        self.assertIn("只有代码本身的真实失败", prompt)
+        self.assertNotIn("确保 `make verify` 通过", prompt)
+
+    def test_repair_prompt_appends_headless_validation_rules(self):
+        with mock.patch.object(Path, "read_text", return_value="BASE PROMPT"):
+            prompt = dispatcher.build_repair_prompt(7, "body", "P1 feedback", "ai/7-test")
+        self.assertEqual(prompt.count("# Headless 验证规则"), 1)
+        self.assertIn("不要运行 `make verify`", prompt)
+        self.assertIn("`make build` + `make test-package`", prompt)
+        self.assertIn("仍然 commit / push / 创建 PR", prompt)
 
 
 class AutoSalvageTests(unittest.TestCase):
