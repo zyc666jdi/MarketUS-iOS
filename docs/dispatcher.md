@@ -484,3 +484,36 @@ Planner 以 `DSH_PERMISSION_MODE=read-only` 运行，不修改文件、不 push�
 - [ ] **失败路径**：抽查一次可恢复失败（如 Agent 超时或 Reviewer P1），确认按 §11
       进入 `status:blocked` / 退回修复，租约释放、worktree 可清理，日志在
       `.agent/runs/<N>/` 且不含密钥；全程未 force push、未合并、未绕过检查。
+
+## 23. 本地观测
+
+`observe` 是本机的只读观测入口：不写 GitHub、不启动 Agent，用于在 `run` 前后或收到
+`status:blocked` 时快速确认 Dispatcher 是否在跑、Agent 是否卡住、PR 停在哪个状态。
+在仓库根目录执行：
+
+```bash
+# 单次快照：launchd 状态 → 进程 → open PR → 最近 run 日志
+python3 Tools/dispatcher/dispatcher.py observe
+
+# 持续刷新（默认 2 秒），Ctrl-C 退出；适合盯住一轮 run 的实时变化
+python3 Tools/dispatcher/dispatcher.py observe --watch
+
+# 自定义刷新间隔（秒）
+python3 Tools/dispatcher/dispatcher.py observe --watch --interval 5
+```
+
+每次输出包含：
+
+- launchd job `com.marketus.dispatcher` 的 `state` / `runs` / `last exit code`；
+- 运行中的 `dsh --profile headless`（Agent）与 `dispatcher.py`（Dispatcher）
+  进程，含 PID 与已运行时长；
+- 最多 5 个 open PR 的编号、标题与标签；
+- `.agent/runs/*/agent.log` 中最近修改的那个文件的最后 5 行。
+
+**单次与持续刷新的区别**：`observe` 打印一次后退出，适合事后取证或脚本调用；
+`observe --watch` 按 `--interval`（默认 2 秒）循环刷新，直到 `Ctrl-C` 退出，
+适合在 launchd 触发前后观察 Agent 进程与 PR 标签的变化。两种模式都不会修改
+Dispatcher 状态，也不会领取 ticket。
+
+> 依赖 macOS 的 `launchctl`、`pgrep`、`ps` 和已登录且对仓库有读权限的 `gh`。
+> 未安装 launchd job 时 launchd 段为空；`gh` 读取失败时命令会以非零状态退出。
