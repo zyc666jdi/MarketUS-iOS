@@ -23,10 +23,18 @@
 
 按 `/AGENTS.md` 的《提交前自检》逐项执行并在运行日志中记录真实输出。
 
-- 有 Simulator.app 的本地环境：`make verify` 必须全绿。
-- Headless / CI：运行 `make build` + `make test-package`；UI 测试仅在 Simulator.app
-  已启动时运行，否则在 PR 中标注「UI 未跑」，**不要等待或伪造通过**。
-- 构建/测试任一项真实失败，不得提交 PR。
+**Headless 环境（无 Simulator.app：CI、容器、远程会话）硬性规则：**
+
+- **不要运行 `make verify`**：它包含 UI 测试，headless 下必然失败。
+- **不要运行 UI 测试**（`make test` 中的 xcodebuild UI 测试 / XCUITest /
+  `-only-testing:*UITests`）。
+- 只运行：`make build` + `make test-package`。
+- 若 `make build` 或 `make test-package` 因沙箱/环境限制失败（无法启动 Simulator、
+  xcodebuild 被拒、权限不足等）：在最终输出和 PR 的 `## 测试证据` 中**原样记录完整
+  命令与错误输出**，并标注「未跑 / 环境受限」，不得声称通过；然后**仍然 commit /
+  push / 创建 PR**，不要仅因 `make verify` 未跑或环境限制就标记 `BLOCKED`。
+- 只有代码本身的真实失败（编译错误、断言失败）才阻止提交 PR；修复后重跑。
+- 有 Simulator.app 的本地环境：`make verify` 必须全绿（仅本地执行）。
 
 ## 提交后
 
@@ -50,7 +58,8 @@ DONE | BLOCKED | NEEDS_DECISION
 - path/to/File.swift — 一句话说明
 
 ## 验证
-- `make verify` → 通过（unit 128/128, snapshot 24/24, coverage 变更行 91%）
+- 本地：`make verify` → 通过（unit 128/128, snapshot 24/24, coverage 变更行 91%）
+- Headless：`make build` + `make test-package` → 通过；`make verify` / UI 测试未运行
 - 手工：iPhone 15 Pro 模拟器，拖拽 3 次后重启顺序保持
 
 ## 未决

@@ -76,6 +76,11 @@ STATE_ROOT = Path(".agent/state")
 # candidate instead of starving the ones outside the window.
 OPEN_PR_LIMIT = 200
 
+# Post-merge convergence only needs to look at the PRs merged since the last
+# run: a wider window re-reads issues that are already done and costs GitHub
+# API calls for no state change.
+POSTMERGE_PR_LIMIT = 10
+
 # Autopilot Planner：只在没有 ready / 进行中工作时选题，永远只读运行。
 AUTOPILOT_STATE = Path(".agent/state/autopilot.json")
 AUTOPILOT_PROMPT = Path("Tools/dispatcher/prompts/planner.md")
@@ -597,8 +602,8 @@ def build_auto_pr_body(issue: dict[str, Any]) -> str:
         f"## 关联 Ticket\n\nFixes #{number}\n\n"
         f"## 变更类型\n\n- [x] {change_type}（Dispatcher 自动收尾）\n\n"
         "## 摘要\n\n- Agent 退出时未创建 PR，但分支存在改动。\n"
-        "- Dispatcher 已自动 add/commit/push 并创建 PR；"
-        "需人工补齐验收证据并标记 ready 后再进入评审。\n\n"
+        "- Dispatcher 已自动 add/commit/push 并创建 PR，并转入 `status:in-review` 交由 Reviewer 评审。\n"
+        "- 验收证据需在合并前由人类复核补齐。\n\n"
         "## 验收标准对照\n\n| 验收标准 | 状态 | 证据 |\n| --- | --- | --- |\n"
         f"{rows}\n\n"
         "## 测试证据\n\n- 自动收尾未运行测试；合并前必须由人类复跑 `make verify` 并补齐输出。\n\n"
@@ -916,16 +921,15 @@ def cmd_once(args: argparse.Namespace) -> int:
 
     if prs:
         pr = prs[0]
+        set_status(number, "status:in-review")
         if auto_pr is not None:
-            set_status(number, "status:awaiting-human")
             comment(
                 number,
-                f"✅ 已创建 draft PR（Dispatcher 自动收尾）：{pr['url']}\n\n"
-                "需人工补齐 PR 模板、验收证据并标记 ready 后再进入评审。"
+                f"✅ 已创建 PR（Dispatcher 自动收尾）：{pr['url']}\n\n"
+                "已转入评审，Reviewer 会继续跟进；验收证据需在合并前由人类复核。"
                 f"\n\n日志：`.agent/runs/{number}/`",
             )
         else:
-            set_status(number, "status:in-review")
             comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")
         notify("MarketUS PR 已创建", f"#{number} {pr['url']}")
         print(f"PR: {pr['url']}")
@@ -1300,7 +1304,7 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
             "--state",
             "merged",
             "--limit",
-            "50",
+            str(POSTMERGE_PR_LIMIT),
             "--json",
             "number,title,body,headRefName,url,labels",
         ]
@@ -1315,12 +1319,15 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         except SystemExit:
             continue
         labels = labels_of(issue)
+        # Only issues that still have work to converge are touched. A done
+        # issue is terminal: no comments, no label edits, no worktree cleanup.
+        if "status:done" in labels:
+            print(f"merged PR #{pr['number']} → issue #{issue_number}（已 status:done，跳过）")
+            continue
         print(f"merged PR #{pr['number']} → issue #{issue_number}")
         if args.dry_run:
             continue
 
-        # Cleanup is unconditional: a previous run may have set done before the
-        # worktree/PR labels were cleaned, and retries must still converge.
         branch = pr.get("headRefName", "")
         updated = False
         if "/" in branch:

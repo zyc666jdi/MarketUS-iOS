@@ -1310,52 +1310,40 @@ class PostmergeIdempotencyTests(unittest.TestCase):
                 code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=False))
         return code, calls, gh, run
 
-    def test_done_issue_with_residual_labels_is_fully_converged(self):
-        code, calls, _, run = self._postmerge(
+    def test_postmerge_inspects_only_the_ten_most_recent_merged_prs(self):
+        self.assertEqual(dispatcher.POSTMERGE_PR_LIMIT, 10)
+        with mock.patch.object(dispatcher, "gh_json", return_value=[]) as gh_json:
+            code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=False))
+        self.assertEqual(code, 0)
+        args = gh_json.call_args.args[0]
+        self.assertEqual(args[:4], ["pr", "list", "--state", "merged"])
+        self.assertEqual(args[args.index("--limit") + 1], "10")
+
+    def test_done_issue_with_residual_labels_is_skipped(self):
+        code, calls, gh, run = self._postmerge(
             {"status:done", "status:in-progress", "status:claimed"},
             {"status:in-review", "status:awaiting-human", "merge:requested"},
         )
         self.assertEqual(code, 0)
-        worktree_remove = run.call_args.args[0]
-        self.assertEqual(worktree_remove[:3], ["git", "worktree", "remove"])
-        self.assertEqual(worktree_remove[-1], "--force")
-        pr_edits = [args for args in calls if args[:2] == ["pr", "edit"]]
-        self.assertEqual(len(pr_edits), 1)
-        self.assertIn("--remove-label", pr_edits[0])
-        self.assertIn("status:in-review", pr_edits[0])
-        self.assertIn("status:awaiting-human", pr_edits[0])
-        self.assertNotIn("--add-label", pr_edits[0])
-        issue_edits = [args for args in calls if args[:2] == ["issue", "edit"]]
-        self.assertEqual(len(issue_edits), 1)
-        self.assertIn("--remove-label", issue_edits[0])
-        self.assertIn("status:in-progress", issue_edits[0])
-        self.assertIn("status:claimed", issue_edits[0])
-        pairs = list(zip(issue_edits[0], issue_edits[0][1:]))
-        self.assertNotIn(("--remove-label", "status:done"), pairs)
-        self.assertIn(("--add-label", "status:done"), pairs)
-        comments = [args for args in calls if args[:2] == ["issue", "comment"]]
-        self.assertEqual(len(comments), 1)
-        self.assertIn("<!-- dispatcher-merged pr=42 -->", comments[0][-1])
+        self.assertEqual(calls, [])
+        gh.assert_not_called()
+        run.assert_not_called()
 
-    def test_done_issue_with_marker_is_a_noop_for_issue(self):
-        code, calls, _, run = self._postmerge(
+    def test_done_issue_with_marker_is_skipped_without_gh_calls(self):
+        code, calls, gh, run = self._postmerge(
             {"status:done"},
             {"status:in-review"},
             comments=("✅ 已合并\n\n<!-- dispatcher-merged pr=42 -->",),
         )
         self.assertEqual(code, 0)
-        run.assert_called_once()
-        self.assertFalse(any(args[:2] == ["issue", "edit"] for args in calls))
-        self.assertFalse(any(args[:2] == ["issue", "comment"] for args in calls))
-        self.assertTrue(any(args[:2] == ["pr", "edit"] for args in calls))
+        gh.assert_not_called()
+        run.assert_not_called()
 
-    def test_done_issue_without_comment_recovers_the_comment(self):
-        code, calls, _, _ = self._postmerge({"status:done"}, {"status:in-review"})
+    def test_done_issue_without_comment_is_not_repaired(self):
+        code, calls, gh, _ = self._postmerge({"status:done"}, {"status:in-review"})
         self.assertEqual(code, 0)
-        comments = [args for args in calls if args[:2] == ["issue", "comment"]]
-        self.assertEqual(len(comments), 1)
-        self.assertIn("<!-- dispatcher-merged pr=42 -->", comments[0][-1])
-        self.assertFalse(any(args[:2] == ["issue", "edit"] for args in calls))
+        gh.assert_not_called()
+        self.assertFalse(any(args[:2] == ["issue", "comment"] for args in calls))
 
     def test_comment_before_status_change_does_not_duplicate_on_retry(self):
         code, calls, _, _ = self._postmerge(
@@ -1548,6 +1536,8 @@ class AutoPrBodyTests(unittest.TestCase):
         self.assertIn("`risk:low`", body)
         self.assertIn("`size:s`", body)
         self.assertIn("创建 PR", body)
+        self.assertIn("status:in-review", body)
+        self.assertNotIn("标记 ready 后再进入评审", body)
         self.assertEqual(
             dispatcher.auto_pr_labels(issue),
             ["ai:generated", "risk:low", "size:s"],
@@ -1589,8 +1579,8 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
                 code = dispatcher.cmd_once(argparse.Namespace(issue=40, execute=True, timeout=90))
         return code, calls, ensure, comments, stream
 
-    def test_agent_exit_with_changes_creates_draft_and_awaits_human(self):
-        code, calls, ensure, _, stream = self._run(
+    def test_agent_exit_with_salvaged_pr_moves_issue_to_in_review(self):
+        code, calls, ensure, comments, stream = self._run(
             {"number": 77, "url": "https://example/pull/77", "title": "chore(agent)", "isDraft": True}
         )
         self.assertEqual(code, 0)
@@ -1600,7 +1590,9 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
         self.assertEqual(args[1], "ai/40-test")
         self.assertEqual(args[2]["number"], 40)
         self.assertTrue(args[3])
-        self.assertEqual(status_after({"status:ready", "status:claimed"}, calls), {"status:awaiting-human"})
+        self.assertEqual(status_after({"status:ready", "status:claimed"}, calls), {"status:in-review"})
+        self.assertTrue(any("已转入评审" in body for body in comments))
+        self.assertFalse(any("awaiting-human" in body or "等待人工" in body for body in comments))
         stream.assert_called_once()
         stream_args = stream.call_args.args
         self.assertEqual(stream_args[0], ["true"])
