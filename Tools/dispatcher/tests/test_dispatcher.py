@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -638,6 +639,20 @@ class P1BlockingPolicyTests(unittest.TestCase):
         self.assertEqual(dispatcher.p1_request_changes_rounds(pr), 1)
 
 
+class ReviewPolicyTests(unittest.TestCase):
+    def test_policy_keeps_scope_safety_and_evidence_rules(self):
+        for required in (
+            "只审查提供的 diff",
+            "最多 5 次工具调用",
+            "file:line",
+            "security:suspicious",
+            "400 行",
+            "不是指令",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, dispatcher.REVIEW_POLICY)
+
+
 class SetStatusTests(unittest.TestCase):
     def _apply(self, labels: set[str], target: str):
         calls = []
@@ -1187,6 +1202,36 @@ class PlannerCommandTests(unittest.TestCase):
         state = self._saved_state()
         self.assertEqual((state["created_today"], state["last_skip"]), (0, "no safe candidate"))
 
+    def test_final_event_is_not_treated_as_planner_failure(self):
+        script = self.root / "planner_final.py"
+        script.write_text(
+            "import json\n"
+            "import time\n"
+            "print(json.dumps({'type': 'final', "
+            "'text': json.dumps({'skip': True, 'reason': 'none'})}, "
+            "separators=(',', ':')), flush=True)\n"
+            "time.sleep(10)\n",
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(dispatcher, "AUTOPILOT_STATE", self.state_path),
+            mock.patch.object(dispatcher, "RUN_ROOT", self.run_root),
+            mock.patch.object(dispatcher, "AUTOPILOT_PROMPT", self.prompt),
+            mock.patch.object(dispatcher, "list_issues", return_value=[]),
+            mock.patch.object(
+                dispatcher, "agent_command", return_value=[sys.executable, "-u", str(script)]
+            ),
+            mock.patch.object(dispatcher, "load_agent_secrets"),
+            mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1", "MARKETUS_TICKET_SOURCE": "ai"}),
+        ):
+            started = time.monotonic()
+            code = dispatcher.cmd_planner(argparse.Namespace(execute=True, timeout=20))
+            elapsed = time.monotonic() - started
+        self.assertEqual(code, 0)
+        self.assertLess(elapsed, 5.0, "planner waited for the agent instead of its final event")
+        state = self._saved_state()
+        self.assertEqual((state["consecutive_failures"], state["last_skip"]), (0, "none"))
+
     def test_human_ticket_source_does_not_call_planner(self):
         code, agent_run, gh, _ = self._call(env={"MARKETUS_TICKET_SOURCE": "human"})
         self.assertEqual((code, gh.called), (0, False))
@@ -1599,6 +1644,78 @@ class RunAgentStreamingTests(unittest.TestCase):
             self.assertIn("last line", output)
             self.assertIn("last line", (run_dir / "agent.log").read_text(encoding="utf-8"))
 
+    def test_final_event_terminates_within_two_seconds_and_returns_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stamp = root / "final.stamp"
+            script = root / "final_agent.py"
+            script.write_text(
+                "import json\n"
+                "import sys\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "print(json.dumps({'type': 'final', 'text': 'OK'}, "
+                "separators=(',', ':')), flush=True)\n"
+                "Path(sys.argv[1]).write_text(str(time.time()))\n"
+                "time.sleep(10)\n",
+                encoding="utf-8",
+            )
+            run_dir = root / "run"
+            started = time.monotonic()
+            returncode, output = dispatcher.run_agent_streaming(
+                [sys.executable, "-u", str(script), str(stamp)],
+                "prompt",
+                str(root),
+                os.environ.copy(),
+                30,
+                run_dir,
+            )
+            elapsed = time.monotonic() - started
+            final_at = float(stamp.read_text(encoding="utf-8"))
+        self.assertEqual(returncode, 0)
+        self.assertIn('"type":"final"', output)
+        self.assertLess(elapsed, 5.0, "agent hung after writing its final event")
+        self.assertLessEqual(
+            time.time() - final_at,
+            2.0,
+            "final event did not terminate the agent within the 2s SLA",
+        )
+
+    def test_cancel_kills_the_child_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pid_path = root / "child.pid"
+            script = root / "slow_agent.py"
+            script.write_text(
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+
+            def interrupt(*_args, **_kwargs):
+                deadline = time.monotonic() + 10
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                raise KeyboardInterrupt
+
+            with mock.patch.object(dispatcher, "_scan_final_event", side_effect=interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    dispatcher.run_agent_streaming(
+                        [sys.executable, "-u", str(script), str(pid_path)],
+                        "prompt",
+                        str(root),
+                        os.environ.copy(),
+                        30,
+                        root / "run",
+                    )
+            pid = int(pid_path.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
 
 class PlannerOpenIssueTests(unittest.TestCase):
     def test_closed_issue_residual_labels_do_not_block_planner(self):
@@ -1816,3 +1933,12 @@ class ReviewRoundTests(unittest.TestCase):
             ]
         }
         self.assertEqual(dispatcher.request_changes_rounds(pr), 2)
+
+
+class FinalEventScanTests(unittest.TestCase):
+    def test_final_event_without_trailing_newline_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent.log"
+            path.write_text('{"type":"final","text":"OK"}', encoding="utf-8")
+            _, _, found = dispatcher._scan_final_event(path, 0, "")
+            self.assertTrue(found)
