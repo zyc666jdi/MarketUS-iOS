@@ -115,7 +115,9 @@ Implementer 在 PR 分支的临时 worktree 修复、push，issue 回到 `status
 
 review 与 repair 使用各自独立的 per-PR 锁（`.agent/state/review-N.lock` /
 `.agent/state/repair-N.lock`），两者可同时运行；同一 PR 重复触发会直接跳过。
-某个 PR 的 review 已在运行时，`run` 会继续尝试本轮下一张 PR，而不是空转。
+某个 PR 的 review 已在运行时，`run` 会继续尝试本轮下一张 PR，而不是空转；
+review 失败或超时时本轮不再扫描其他 PR（避免长时间占用全局 dispatcher 锁），
+review cursor 仍会前移，下一轮从其后继续。
 
 
 ## 漏审兜底
@@ -146,6 +148,9 @@ implementer/reviewer/repair 子进程额外记录 `agent_start` / `agent_end`
 （role、pid、exit_code、duration_ms）。后台 repair 的 `step_end` 与
 `loop_end` 由子进程在结束时写入，父循环不会提前把 loop 标成 `ok`。
 单条事件失败不会中断调度，但会把该 loop 标记为 `failed`。
+`loop-state.json` 的读写同样是 best-effort：路径不可写时只标记 loop failed，
+不阻断 repair 后台进程启动；repair 子进程因锁占用而跳过时记为 `skipped`，
+不会让 loop 变成 failed。
 
 ```bash
 # 最近 loop：id、开始时间、耗时、状态、步骤

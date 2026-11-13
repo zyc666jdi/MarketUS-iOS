@@ -221,6 +221,9 @@ class LoopTrace:
         self.error = ""
         self.deferred = False
         self.deferred_step = ""
+        # Shared loop-state persistence is observability only; remember when it
+        # failed so a deferred loop can still close its local timeline.
+        self.state_failed = False
 
     def emit(
         self,
@@ -254,6 +257,14 @@ class LoopTrace:
             print(f"loop trace 写入失败：{error}", file=sys.stderr)
         return record
 
+    def record_state_error(self, error: BaseException) -> None:
+        """Remember a shared-state failure; persistence never blocks the sweep."""
+        self.state_failed = True
+        self.failed = True
+        if not self.error:
+            self.error = f"loop state 写入失败：{error}"[:300]
+        print(f"loop state 写入失败：{error}", file=sys.stderr)
+
     def elapsed_ms(self) -> int:
         return duration_ms_since(self.started_at)
 
@@ -270,7 +281,12 @@ class LoopTrace:
     def finish_or_defer(self, status: str | None = None) -> None:
         """Close the loop, or hand ``loop_end`` to the detached repair child."""
         if self.deferred:
-            finish_deferred_loop(self, status)
+            if finish_deferred_loop(self, status):
+                return
+            if self.state_failed:
+                # Shared state is unusable; close locally instead of leaving the
+                # loop stuck in "running" with no way for the child to finish it.
+                self.finish(status)
         else:
             self.finish(status)
 
@@ -332,11 +348,17 @@ def loop_state_path(trace: LoopTrace) -> Path:
 
 @contextmanager
 def _locked_loop_state(trace: LoopTrace):
-    """Read-modify-write the shared parent/child state under an exclusive lock."""
+    """Read-modify-write the shared parent/child state under an exclusive lock.
+
+    This state only feeds observability, so persistence is best-effort: an
+    unwritable directory or a file blocking the path is recorded on the trace
+    and must never abort the repair sweep.
+    """
     path = loop_state_path(trace)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.with_name(path.name + ".lock").open("a", encoding="utf-8")
+    handle = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.with_name(path.name + ".lock").open("a", encoding="utf-8")
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -344,13 +366,33 @@ def _locked_loop_state(trace: LoopTrace):
             data = {}
         if not isinstance(data, dict):
             data = {}
+    except (OSError, TypeError, ValueError) as error:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        trace.record_state_error(error)
+        yield {}
+        return
+
+    try:
         yield data
-        _write_state_file(path, data)
+        try:
+            _write_state_file(path, data)
+        except (OSError, TypeError, ValueError) as error:
+            trace.record_state_error(error)
+        else:
+            trace.state_failed = False
     finally:
         try:
             fcntl.flock(handle, fcntl.LOCK_UN)
-        finally:
+        except OSError:
+            pass
+        try:
             handle.close()
+        except OSError:
+            pass
 
 
 def defer_loop(trace: LoopTrace, step: str, started_at: float) -> None:
@@ -379,7 +421,10 @@ def cancel_deferred_loop(trace: LoopTrace) -> None:
     """Undo :func:`defer_loop` when the background process could not be started."""
     trace.deferred = False
     trace.deferred_step = ""
-    loop_state_path(trace).unlink(missing_ok=True)
+    try:
+        loop_state_path(trace).unlink(missing_ok=True)
+    except OSError as error:
+        trace.record_state_error(error)
 
 
 def _combined_loop_status(state: dict[str, Any]) -> str:
@@ -409,13 +454,18 @@ def _emit_shared_loop_end(trace: LoopTrace, state: dict[str, Any]) -> None:
     )
 
 
-def finish_deferred_loop(trace: LoopTrace, status: str | None = None) -> None:
-    """Mark the parent side done; the last finisher writes ``loop_end``."""
+def finish_deferred_loop(trace: LoopTrace, status: str | None = None) -> bool:
+    """Mark the parent side done; the last finisher writes ``loop_end``.
+
+    Returns True when this call closed the loop (or it was already closed), so
+    the caller can fall back to a local ``loop_end`` if shared state is broken.
+    """
     if status is None:
         status = "failed" if trace.failed else ("skipped" if trace.skipped else "ok")
+    closed = False
     with _locked_loop_state(trace) as state:
         if state.get("closed"):
-            return
+            return True
         state["parent_done"] = True
         state["parent_status"] = status
         state["parent_error"] = trace.error
@@ -423,6 +473,8 @@ def finish_deferred_loop(trace: LoopTrace, status: str | None = None) -> None:
         if state.get("child_done"):
             _emit_shared_loop_end(trace, state)
             state["closed"] = True
+            closed = True
+    return closed
 
 
 def finish_deferred_child(trace: LoopTrace, code: int, error: str = "") -> None:
@@ -441,8 +493,17 @@ def finish_deferred_child(trace: LoopTrace, code: int, error: str = "") -> None:
             duration = max(0, int((time.time() - float(started)) * 1000))
         else:
             duration = trace.elapsed_ms()
-        status = "ok" if code == 0 else "failed"
-        reason = (error or ("" if code == 0 else f"{step} exit={code}"))[:300]
+        if code == 0:
+            status = "ok"
+        elif code == EXIT_LOCK_BUSY:
+            # Another repair already holds this PR's lock: the child skipped
+            # normally, so it must not turn the loop into a failure.
+            status = "skipped"
+        else:
+            status = "failed"
+        reason = ""
+        if status == "failed":
+            reason = (error or f"{step} exit={code}")[:300]
         detail_payload = {"error": reason} if reason else {}
         trace.emit(
             "step_end",
@@ -3060,9 +3121,12 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
                     continue
                 if code != 0:
                     phase.fail(f"review PR #{pr['number']} exit={code}")
-                    # A failed review is not a completed one: leave the cursor
-                    # untouched and try the next candidate in this sweep.
-                    continue
+                    # One review per round: a failed or timed-out review must
+                    # not hold the global dispatcher lock while scanning more
+                    # PRs. Advance the cursor so the next sweep rotates past it.
+                    if not args.dry_run:
+                        _write_review_cursor(pr["number"])
+                    break
                 if not args.dry_run:
                     _write_review_cursor(pr["number"])
                 break

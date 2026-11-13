@@ -384,7 +384,7 @@ class RunParallelLockTests(IsolatedStateTestCase):
             mock.patch.object(dispatcher, "pr_detail", return_value=request_changes),
             mock.patch.object(dispatcher, "gh_json", side_effect=[repair_prs, review_prs]) as gh_json,
             mock.patch.object(dispatcher, "cmd_review", **review_kwargs) as review,
-            mock.patch.object(dispatcher, "maybe_run_planner"),
+            mock.patch.object(dispatcher, "maybe_run_planner", return_value=0),
             mock.patch.object(dispatcher.subprocess, "Popen") as popen,
         ):
             popen.return_value.pid = 4242
@@ -442,6 +442,58 @@ class RunParallelLockTests(IsolatedStateTestCase):
         self.assertEqual(summary["status"], "failed")
         self.assertEqual(summary["steps"]["repair"], "failed")
 
+    def test_lock_busy_child_marks_repair_skipped_instead_of_failed(self):
+        code, _, _ = self._run([numbered_ai_pr(82)], [])
+        self.assertEqual(code, 0)
+        state_path = self._timeline_path().parent / "loop-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        child = dispatcher.LoopTrace(
+            loop_id=state["loop_id"], path=self._timeline_path()
+        )
+        child.deferred = True
+        child.deferred_step = "repair"
+        dispatcher.finish_deferred_child(child, dispatcher.EXIT_LOCK_BUSY)
+
+        events = self._events()
+        repair_end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "repair"
+        )
+        self.assertEqual(repair_end["status"], "skipped")
+        self.assertNotIn("error", repair_end["details"])
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "skipped")
+        self.assertNotIn("error", events[-1]["details"])
+        summary = dispatcher.summarize_loop(self._timeline_path())
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["steps"]["repair"], "skipped")
+
+    def test_loop_state_failure_still_spawns_repair(self):
+        loop_id = "20260101T000000-feedface"
+        blocker = Path(self._state_tmp.name) / "loops" / loop_id / "loop-state.json"
+        blocker.mkdir(parents=True)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "make_loop_id", return_value=loop_id),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code, _, popen = self._run([numbered_ai_pr(82)], [])
+        self.assertEqual(code, 0)
+        popen.assert_called_once()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index("--pr") + 1], "82")
+        self.assertIn("loop state 写入失败", stderr.getvalue())
+
+        timeline = blocker.parent / "timeline.jsonl"
+        events = [
+            json.loads(line)
+            for line in timeline.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(events[0]["event"], "loop_start")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+        self.assertIn("loop state 写入失败", events[-1]["details"]["error"])
+
     def test_one_repair_spawned_per_sweep_then_review_continues(self):
         code, review, popen = self._run(
             [numbered_ai_pr(82), numbered_ai_pr(83)], [numbered_ai_pr(84)]
@@ -462,6 +514,25 @@ class RunParallelLockTests(IsolatedStateTestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual([call.args[0].pr for call in review.call_args_list], [84, 86])
+
+    def test_failed_review_stops_after_one_pr_and_advances_cursor(self):
+        code, review, _ = self._run(
+            [],
+            [numbered_ai_pr(84), numbered_ai_pr(86)],
+            review_codes=[1, 0],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0].pr for call in review.call_args_list], [84])
+        self.assertEqual(dispatcher._read_review_cursor(), 84)
+        events = self._events()
+        review_end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "review"
+        )
+        self.assertEqual(review_end["status"], "failed")
+        self.assertIn("review PR #84 exit=1", review_end["details"]["error"])
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
 
     def test_dry_run_does_not_spawn_repair(self):
         code, review, popen = self._run(
@@ -2540,6 +2611,27 @@ class LoopTraceTests(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "loop_end")
         self.assertEqual(events[-1]["status"], "ok")
 
+    def test_unwritable_loop_state_is_best_effort_and_marks_loop_failed(self):
+        trace = self._trace()
+        trace.path.parent.mkdir(parents=True)
+        (trace.path.parent / dispatcher.LOOP_STATE_NAME).mkdir()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            dispatcher.defer_loop(trace, "repair", time.time())
+            dispatcher.finish_deferred_child(trace, 1, "repair exit=1")
+            trace.finish_or_defer()
+        self.assertTrue(trace.deferred)
+        self.assertTrue(trace.failed)
+        self.assertTrue(trace.state_failed)
+        self.assertIn("loop state 写入失败", trace.error)
+        self.assertIn("loop state 写入失败", stderr.getvalue())
+        events = self._events(trace)
+        self.assertEqual(events[-2]["event"], "step_end")
+        self.assertEqual(events[-2]["status"], "failed")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+        self.assertIn("loop state 写入失败", events[-1]["details"]["error"])
+
 
 class LoopRunTests(unittest.TestCase):
     def setUp(self):
@@ -2633,7 +2725,7 @@ class LoopRunTests(unittest.TestCase):
                 self.assertIn(f"{step} exit=7", end["details"]["error"])
                 self.assertEqual(events[-1]["status"], "failed")
 
-    def test_cmd_run_marks_nonzero_review_return_failed_without_cursor(self):
+    def test_cmd_run_marks_nonzero_review_return_failed_and_advances_cursor(self):
         pr = {
             "number": 84,
             "headRefName": "ai/84-test",
@@ -2649,7 +2741,7 @@ class LoopRunTests(unittest.TestCase):
         )
         self.assertEqual(end["status"], "failed")
         self.assertIn("review PR #84 exit=1", end["details"]["error"])
-        self.assertEqual(dispatcher._read_review_cursor(), 0)
+        self.assertEqual(dispatcher._read_review_cursor(), 84)
         self.assertEqual(events[-1]["status"], "failed")
 
 
