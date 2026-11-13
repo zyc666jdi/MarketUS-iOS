@@ -1,5 +1,7 @@
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import select
@@ -9,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -95,7 +98,7 @@ class ReviewRepairTests(unittest.TestCase):
 
 
 class IsolatedStateTestCase(unittest.TestCase):
-    """Keep per-PR lock files out of the real .agent/state during tests."""
+    """Keep per-PR lock files and loop traces out of the real .agent dirs."""
 
     def setUp(self):
         super().setUp()
@@ -104,6 +107,11 @@ class IsolatedStateTestCase(unittest.TestCase):
         state_patch = mock.patch.object(dispatcher, "STATE_ROOT", Path(self._state_tmp.name))
         state_patch.start()
         self.addCleanup(state_patch.stop)
+        loop_patch = mock.patch.object(
+            dispatcher, "LOOP_ROOT", Path(self._state_tmp.name) / "loops"
+        )
+        loop_patch.start()
+        self.addCleanup(loop_patch.stop)
 
 
 class NamedLockTests(IsolatedStateTestCase):
@@ -242,14 +250,14 @@ class RunFallbackTests(unittest.TestCase):
             else mock.patch.object(dispatcher, "pr_detail", side_effect=details if details is not None else [{}])
         )
         with (
-            mock.patch.object(dispatcher, "cmd_postmerge"),
-            mock.patch.object(dispatcher, "cmd_watch"),
+            mock.patch.object(dispatcher, "cmd_postmerge", return_value=0),
+            mock.patch.object(dispatcher, "cmd_watch", return_value=0),
             mock.patch.object(dispatcher, "list_issues", return_value=[]),
             mock.patch.object(dispatcher, "issue_detail", return_value=issue),
             detail_patch as detail,
             mock.patch.object(dispatcher, "age_minutes", return_value=age),
             mock.patch.object(dispatcher, "gh_json", side_effect=[[], prs]),
-            mock.patch.object(dispatcher, "cmd_review") as review,
+            mock.patch.object(dispatcher, "cmd_review", return_value=0) as review,
             mock.patch.object(dispatcher, "maybe_run_planner") as planner,
         ):
             dispatcher.cmd_run(argparse.Namespace(dry_run=False, timeout=90))
@@ -363,17 +371,20 @@ class RunParallelLockTests(IsolatedStateTestCase):
                 }
             ],
         }
+        review_kwargs = (
+            {"side_effect": review_codes} if review_codes is not None else {"return_value": 0}
+        )
         with (
-            mock.patch.object(dispatcher, "cmd_postmerge"),
+            mock.patch.object(dispatcher, "cmd_postmerge", return_value=0),
             mock.patch.object(dispatcher, "reap_worktrees"),
-            mock.patch.object(dispatcher, "cmd_watch") as watch,
+            mock.patch.object(dispatcher, "cmd_watch", return_value=0) as watch,
             mock.patch.object(dispatcher, "RUN_ROOT", Path(self._state_tmp.name) / "runs"),
             mock.patch.object(dispatcher, "list_issues", return_value=[]),
             mock.patch.object(dispatcher, "issue_detail", side_effect=issue_for),
             mock.patch.object(dispatcher, "pr_detail", return_value=request_changes),
             mock.patch.object(dispatcher, "gh_json", side_effect=[repair_prs, review_prs]) as gh_json,
-            mock.patch.object(dispatcher, "cmd_review", side_effect=review_codes) as review,
-            mock.patch.object(dispatcher, "maybe_run_planner"),
+            mock.patch.object(dispatcher, "cmd_review", **review_kwargs) as review,
+            mock.patch.object(dispatcher, "maybe_run_planner", return_value=0),
             mock.patch.object(dispatcher.subprocess, "Popen") as popen,
         ):
             popen.return_value.pid = 4242
@@ -381,6 +392,107 @@ class RunParallelLockTests(IsolatedStateTestCase):
         self.watch = watch
         self.gh_json = gh_json
         return code, review, popen
+
+    def _timeline_path(self) -> Path:
+        paths = list((Path(self._state_tmp.name) / "loops").glob("*/timeline.jsonl"))
+        self.assertEqual(len(paths), 1)
+        return paths[0]
+
+    def _events(self) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in self._timeline_path().read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_background_repair_failure_closes_deferred_loop(self):
+        code, _, popen = self._run([numbered_ai_pr(82)], [])
+        self.assertEqual(code, 0)
+        events = self._events()
+        self.assertFalse(any(event["event"] == "loop_end" for event in events))
+        self.assertFalse(
+            any(
+                event["event"] == "step_end" and event["step"] == "repair"
+                for event in events
+            )
+        )
+        state_path = self._timeline_path().parent / "loop-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["parent_done"])
+        self.assertFalse(state["child_done"])
+
+        child_env = popen.call_args.kwargs["env"]
+        self.assertEqual(child_env[dispatcher.LOOP_ENV_STEP], "repair")
+        child = dispatcher.LoopTrace(
+            loop_id=state["loop_id"], path=self._timeline_path()
+        )
+        child.deferred = True
+        child.deferred_step = "repair"
+        dispatcher.finish_deferred_child(child, 1, "repair exit=1")
+
+        events = self._events()
+        repair_end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "repair"
+        )
+        self.assertEqual(repair_end["status"], "failed")
+        self.assertEqual(repair_end["details"]["error"], "repair exit=1")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+        summary = dispatcher.summarize_loop(self._timeline_path())
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["steps"]["repair"], "failed")
+
+    def test_lock_busy_child_marks_repair_skipped_instead_of_failed(self):
+        code, _, _ = self._run([numbered_ai_pr(82)], [])
+        self.assertEqual(code, 0)
+        state_path = self._timeline_path().parent / "loop-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        child = dispatcher.LoopTrace(
+            loop_id=state["loop_id"], path=self._timeline_path()
+        )
+        child.deferred = True
+        child.deferred_step = "repair"
+        dispatcher.finish_deferred_child(child, dispatcher.EXIT_LOCK_BUSY)
+
+        events = self._events()
+        repair_end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "repair"
+        )
+        self.assertEqual(repair_end["status"], "skipped")
+        self.assertNotIn("error", repair_end["details"])
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "skipped")
+        self.assertNotIn("error", events[-1]["details"])
+        summary = dispatcher.summarize_loop(self._timeline_path())
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["steps"]["repair"], "skipped")
+
+    def test_loop_state_failure_still_spawns_repair(self):
+        loop_id = "20260101T000000-feedface"
+        blocker = Path(self._state_tmp.name) / "loops" / loop_id / "loop-state.json"
+        blocker.mkdir(parents=True)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "make_loop_id", return_value=loop_id),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code, _, popen = self._run([numbered_ai_pr(82)], [])
+        self.assertEqual(code, 0)
+        popen.assert_called_once()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index("--pr") + 1], "82")
+        self.assertIn("loop state 写入失败", stderr.getvalue())
+
+        timeline = blocker.parent / "timeline.jsonl"
+        events = [
+            json.loads(line)
+            for line in timeline.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(events[0]["event"], "loop_start")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+        self.assertIn("loop state 写入失败", events[-1]["details"]["error"])
 
     def test_one_repair_spawned_per_sweep_then_review_continues(self):
         code, review, popen = self._run(
@@ -402,6 +514,25 @@ class RunParallelLockTests(IsolatedStateTestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual([call.args[0].pr for call in review.call_args_list], [84, 86])
+
+    def test_failed_review_stops_after_one_pr_and_advances_cursor(self):
+        code, review, _ = self._run(
+            [],
+            [numbered_ai_pr(84), numbered_ai_pr(86)],
+            review_codes=[1, 0],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0].pr for call in review.call_args_list], [84])
+        self.assertEqual(dispatcher._read_review_cursor(), 84)
+        events = self._events()
+        review_end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "review"
+        )
+        self.assertEqual(review_end["status"], "failed")
+        self.assertIn("review PR #84 exit=1", review_end["details"]["error"])
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
 
     def test_dry_run_does_not_spawn_repair(self):
         code, review, popen = self._run(
@@ -534,7 +665,7 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
 
-        def fake_review_agent(_prompt, _run_dir, _timeout):
+        def fake_review_agent(_prompt, _run_dir, _timeout, **_kwargs):
             return (f"## Verdict: {verdict}\n{review_body}" if verdict else "no verdict", 0)
 
         old_cwd = os.getcwd()
@@ -864,6 +995,7 @@ class RepairStatusTests(IsolatedStateTestCase):
         self.assertEqual(stream_args[2], str(worktree))
         self.assertEqual(stream_args[4], 30 * 60)
         self.assertEqual(stream_args[5], Path(tmp) / "runs" / "repair-38")
+        self.assertEqual(stream.call_args.kwargs["role"], "repair")
         self.assertEqual(
             run.call_args_list[2].args[0],
             ["git", "-C", str(worktree), "push", "origin", "HEAD:ai/40-test"],
@@ -1656,6 +1788,7 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
         self.assertEqual(Path(stream_args[2]).name, "40-test")
         self.assertEqual(stream_args[4], 90 * 60)
         self.assertEqual(Path(stream_args[5]).name, "40")
+        self.assertEqual(stream.call_args.kwargs["role"], "implementer")
 
     def test_agent_exit_without_changes_is_blocked(self):
         code, calls, ensure, _, _ = self._run(None)
@@ -1928,6 +2061,34 @@ class RepairWiringTests(IsolatedStateTestCase):
         set_status.assert_called_once_with(79, "status:blocked")
         self.assertIn("无法删除旧分支", comment.call_args.args[1])
 
+    def test_cmd_repair_records_nonzero_child_step_from_env(self):
+        trace = dispatcher.LoopTrace(loop_id="20260101T000000-abcdef12")
+        args = argparse.Namespace(pr=80, execute=True, timeout=90)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    dispatcher.LOOP_ENV_ID: trace.loop_id,
+                    dispatcher.LOOP_ENV_TIMELINE: str(trace.path),
+                    dispatcher.LOOP_ENV_STEP: "repair",
+                    dispatcher.LOOP_ENV_STEP_STARTED: str(time.time()),
+                },
+            ),
+            mock.patch.object(dispatcher, "_cmd_repair_locked", return_value=1),
+        ):
+            code = dispatcher.cmd_repair(args)
+        self.assertEqual(code, 1)
+        events = [
+            json.loads(line)
+            for line in trace.path.read_text(encoding="utf-8").splitlines()
+        ]
+        end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "repair"
+        )
+        self.assertEqual(end["status"], "failed")
+        self.assertEqual(end["details"]["error"], "repair exit=1")
+
 
 class RepairStateTests(IsolatedStateTestCase):
     def test_write_and_heartbeat_preserve_started_at(self):
@@ -2187,3 +2348,513 @@ class FinalEventScanTests(unittest.TestCase):
             path.write_text('{"type":"final","text":"OK"}', encoding="utf-8")
             _, _, found = dispatcher._scan_final_event(path, 0, "")
             self.assertTrue(found)
+
+
+class LoopTraceTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        loop_patch = mock.patch.object(dispatcher, "LOOP_ROOT", self.root)
+        loop_patch.start()
+        self.addCleanup(loop_patch.stop)
+
+    def _trace(self, loop_id: str = "20260101T000000-abcdef12") -> dispatcher.LoopTrace:
+        return dispatcher.LoopTrace(loop_id=loop_id)
+
+    def _events(self, trace: dispatcher.LoopTrace) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in trace.path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def _write_timeline(self, loop_id: str, *, duration: int = 1234, status: str = "ok") -> Path:
+        path = self.root / loop_id / "timeline.jsonl"
+        path.parent.mkdir(parents=True)
+        start = "2026-01-01T00:00:00Z"
+        events = [
+            ("loop_start", "", "ok", 0, {}),
+            ("step_start", "dispatch", "ok", 0, {"issue": 102}),
+            ("step_end", "dispatch", "ok", duration, {"issue": 102}),
+            ("step_start", "planner", "ok", 0, {}),
+            ("step_end", "planner", "failed", 5, {"error": "RuntimeError: boom"}),
+            ("loop_end", "", status, duration, {}),
+        ]
+        lines = [
+            json.dumps(
+                {
+                    "ts": start,
+                    "loop_id": loop_id,
+                    "event": event,
+                    "step": step,
+                    "status": event_status,
+                    "duration_ms": event_duration,
+                    "details": details,
+                }
+            )
+            for event, step, event_status, event_duration, details in events
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_make_loop_id_is_sortable_and_unique(self):
+        with mock.patch.object(dispatcher, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            first = dispatcher.make_loop_id()
+            clock.now.return_value = datetime(2026, 1, 2, tzinfo=timezone.utc)
+            second = dispatcher.make_loop_id()
+        self.assertRegex(first, r"^\d{8}T\d{6}-[0-9a-f]{8}$")
+        self.assertNotEqual(first, second)
+        self.assertLess(first, second)
+
+    def test_timeline_is_append_only_jsonl_under_loop_root(self):
+        trace = self._trace()
+        trace.emit("loop_start", details={"dry_run": False})
+        with trace.step("postmerge"):
+            pass
+        trace.finish()
+        self.assertEqual(
+            trace.path.relative_to(self.root),
+            Path(trace.loop_id) / "timeline.jsonl",
+        )
+        events = self._events(trace)
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["loop_start", "step_start", "step_end", "loop_end"],
+        )
+        for event in events:
+            self.assertEqual(
+                set(event),
+                {"ts", "loop_id", "event", "step", "status", "duration_ms", "details"},
+            )
+            self.assertEqual(event["loop_id"], trace.loop_id)
+            self.assertRegex(event["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            self.assertIsInstance(event["duration_ms"], int)
+        self.assertEqual(events[1]["step"], "postmerge")
+        self.assertEqual(events[2]["details"], {})
+        size_before = trace.path.stat().st_size
+        trace.emit("agent_start", step="dispatch", details={"role": "implementer"})
+        self.assertGreater(trace.path.stat().st_size, size_before)
+        self.assertEqual(self._events(trace)[-1]["event"], "agent_start")
+
+    def test_step_duration_comes_from_monotonic_clock(self):
+        trace = self._trace()
+        with mock.patch.object(dispatcher.time, "monotonic", side_effect=[100.0, 100.25]):
+            with trace.step("watch"):
+                pass
+        end = self._events(trace)[-1]
+        self.assertEqual((end["event"], end["step"]), ("step_end", "watch"))
+        self.assertEqual(end["duration_ms"], 250)
+
+    def test_failed_step_emits_error_summary_and_fails_loop(self):
+        trace = self._trace()
+        with self.assertRaises(RuntimeError):
+            with trace.step("dispatch"):
+                raise RuntimeError("boom")
+        trace.finish()
+        events = self._events(trace)
+        self.assertEqual(events[1]["event"], "step_end")
+        self.assertEqual(events[1]["status"], "failed")
+        self.assertIn("RuntimeError: boom", events[1]["details"]["error"])
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+
+    def test_trace_write_failure_does_not_raise(self):
+        trace = self._trace()
+        trace.path.parent.mkdir(parents=True)
+        trace.path.mkdir()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            record = trace.emit("loop_start")
+        self.assertEqual(record["event"], "loop_start")
+        self.assertIn("loop trace 写入失败", stderr.getvalue())
+        self.assertTrue(trace.failed)
+        self.assertIn("loop trace 写入失败", trace.error)
+
+    def test_naive_timeline_timestamp_is_treated_as_utc(self):
+        path = self.root / "20260101T000000-aaaaaaaa" / "timeline.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({"ts": "2026-01-01T00:00:00", "event": "loop_start"}) + "\n",
+            encoding="utf-8",
+        )
+        parsed = dispatcher._parse_timestamp("2026-01-01T00:00:00")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.tzinfo, timezone.utc)
+        summary = dispatcher.summarize_loop(path)
+        self.assertEqual(summary["status"], "running")
+        self.assertGreaterEqual(summary["duration_ms"], 0)
+
+    def test_partial_utf8_timeline_is_ignored_instead_of_crashing(self):
+        path = self.root / "20260101T000000-bbbbbbbb" / "timeline.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'{"event":"loop_start"}\n\xff\xfe')
+        self.assertEqual(dispatcher.read_timeline(path), [])
+        self.assertEqual(dispatcher.summarize_loop(path)["status"], "running")
+
+    def test_failed_step_overrides_an_ok_loop_end_in_summary(self):
+        path = self._write_timeline("20260101T000000-cccccccc", status="ok")
+        self.assertEqual(dispatcher.summarize_loop(path)["status"], "failed")
+
+    def test_trace_from_env_reuses_parent_timeline(self):
+        trace = self._trace()
+        with mock.patch.dict(
+            os.environ,
+            {
+                dispatcher.LOOP_ENV_ID: trace.loop_id,
+                dispatcher.LOOP_ENV_TIMELINE: str(trace.path),
+            },
+        ):
+            child = dispatcher.trace_from_env()
+        self.assertIsNotNone(child)
+        self.assertEqual(child.loop_id, trace.loop_id)
+        self.assertEqual(child.path, trace.path)
+        with mock.patch.dict(
+            os.environ,
+            {dispatcher.LOOP_ENV_ID: "", dispatcher.LOOP_ENV_TIMELINE: ""},
+        ):
+            self.assertIsNone(dispatcher.trace_from_env())
+
+    def test_loop_list_prints_columns_and_honors_limit(self):
+        self._write_timeline("20260101T000000-aaaaaaaa")
+        self._write_timeline("20260102T000000-bbbbbbbb")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = dispatcher.cmd_loop_list(argparse.Namespace(limit=1))
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("loop_id", text)
+        self.assertIn("20260102T000000-bbbbbbbb", text)
+        self.assertNotIn("20260101T000000-aaaaaaaa", text)
+        self.assertIn("1.2s", text)
+        self.assertIn("dispatch:ok", text)
+        self.assertIn("planner:failed", text)
+
+    def test_loop_show_prints_timeline_and_per_step_durations(self):
+        self._write_timeline("20260101T000000-aaaaaaaa")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = dispatcher.cmd_loop_show(
+                argparse.Namespace(loop_id="20260101T000000-aaaaaaaa")
+            )
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("loop     20260101T000000-aaaaaaaa", text)
+        self.assertIn("duration 1.2s", text)
+        self.assertIn("step_end", text)
+        self.assertIn("1234ms", text)
+        self.assertIn("RuntimeError: boom", text)
+        self.assertIn("  planner", text)
+        self.assertIn("failed", text)
+
+    def test_loop_show_missing_loop_returns_error(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = dispatcher.cmd_loop_show(argparse.Namespace(loop_id="missing"))
+        self.assertEqual(code, 1)
+        self.assertIn("未找到", output.getvalue())
+
+    def test_observe_prints_current_loop_and_recent_steps(self):
+        self._write_timeline("20260101T000000-aaaaaaaa")
+        fake = mock.Mock(stdout="", stderr="", returncode=0)
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "RUN_ROOT", self.root / "runs"),
+            mock.patch.object(dispatcher, "gh_json", return_value=[]),
+            mock.patch.object(dispatcher.subprocess, "run", return_value=fake),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.cmd_observe(argparse.Namespace(watch=False, interval=2))
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("loops", text)
+        self.assertIn("20260101T000000-aaaaaaaa", text)
+        self.assertIn("dispatch:ok", text)
+        self.assertIn("planner:failed", text)
+
+    def test_deferred_step_skips_parent_step_end(self):
+        trace = self._trace()
+        with trace.step("repair") as phase:
+            phase.deferred = True
+        events = self._events(trace)
+        self.assertEqual([event["event"] for event in events], ["step_start"])
+        self.assertTrue(trace.deferred)
+        self.assertEqual(trace.deferred_step, "repair")
+
+    def test_child_finishes_before_parent_waits_for_loop_end(self):
+        trace = self._trace()
+        trace.emit("loop_start")
+        dispatcher.defer_loop(trace, "repair", time.time())
+        dispatcher.finish_deferred_child(trace, 1, "repair exit=1")
+        events = self._events(trace)
+        self.assertFalse(any(event["event"] == "loop_end" for event in events))
+        dispatcher.finish_deferred_loop(trace)
+        events = self._events(trace)
+        self.assertEqual(events[-2]["event"], "step_end")
+        self.assertEqual(events[-2]["status"], "failed")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+        self.assertEqual(events[-1]["details"]["error"], "repair exit=1")
+
+    def test_parent_finishes_before_child_lets_child_close_loop(self):
+        trace = self._trace()
+        trace.emit("loop_start")
+        dispatcher.defer_loop(trace, "repair", time.time())
+        dispatcher.finish_deferred_loop(trace)
+        self.assertFalse(
+            any(event["event"] == "loop_end" for event in self._events(trace))
+        )
+        dispatcher.finish_deferred_child(trace, 0)
+        events = self._events(trace)
+        self.assertEqual(events[-2]["event"], "step_end")
+        self.assertEqual(events[-2]["status"], "ok")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "ok")
+
+    def test_unwritable_loop_state_is_best_effort_and_marks_loop_failed(self):
+        trace = self._trace()
+        trace.path.parent.mkdir(parents=True)
+        (trace.path.parent / dispatcher.LOOP_STATE_NAME).mkdir()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            dispatcher.defer_loop(trace, "repair", time.time())
+            dispatcher.finish_deferred_child(trace, 1, "repair exit=1")
+            trace.finish_or_defer()
+        self.assertTrue(trace.deferred)
+        self.assertTrue(trace.failed)
+        self.assertTrue(trace.state_failed)
+        self.assertIn("loop state 写入失败", trace.error)
+        self.assertIn("loop state 写入失败", stderr.getvalue())
+        events = self._events(trace)
+        self.assertEqual(events[-2]["event"], "step_end")
+        self.assertEqual(events[-2]["status"], "failed")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+        self.assertIn("loop state 写入失败", events[-1]["details"]["error"])
+
+
+class LoopRunTests(unittest.TestCase):
+    def setUp(self):
+        self._cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        self.addCleanup(self._cleanup)
+        self.loops = Path(self._tmp.name) / "loops"
+        loop_patch = mock.patch.object(dispatcher, "LOOP_ROOT", self.loops)
+        loop_patch.start()
+        self.addCleanup(loop_patch.stop)
+        self._loop_seq = 0
+
+        def next_loop_id() -> str:
+            self._loop_seq += 1
+            return f"20260101T000000-{self._loop_seq:08d}"
+
+        id_patch = mock.patch.object(dispatcher, "make_loop_id", side_effect=next_loop_id)
+        id_patch.start()
+        self.addCleanup(id_patch.stop)
+
+    def _cleanup(self):
+        os.chdir(self._cwd)
+        self._tmp.cleanup()
+
+    def _run(self, watch_error=None, *, postmerge_code=0, watch_code=0,
+             review_code=0, review_prs=None, dry_run=True):
+        watch = mock.Mock(return_value=watch_code, side_effect=watch_error)
+        issue = {"number": 84, "labels": [{"name": "status:in-review"}]}
+        with (
+            mock.patch.object(dispatcher, "cmd_postmerge", return_value=postmerge_code),
+            mock.patch.object(dispatcher, "cmd_watch", watch),
+            mock.patch.object(dispatcher, "reap_worktrees"),
+            mock.patch.object(dispatcher, "list_issues", return_value=[]),
+            mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+            mock.patch.object(dispatcher, "gh_json", side_effect=[[], review_prs or []]),
+            mock.patch.object(dispatcher, "cmd_review", return_value=review_code),
+            mock.patch.object(dispatcher, "maybe_run_planner", return_value=0),
+        ):
+            code = dispatcher.cmd_run(
+                argparse.Namespace(dry_run=dry_run, timeout=90)
+            )
+        return code, watch
+
+    def _events(self) -> list[dict]:
+        timelines = sorted(self.loops.glob("*/timeline.jsonl"))
+        self.assertGreaterEqual(len(timelines), 1)
+        return [
+            json.loads(line)
+            for line in timelines[-1].read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_cmd_run_writes_all_phase_events(self):
+        code, _ = self._run()
+        self.assertEqual(code, 0)
+        self.assertIsNone(dispatcher.active_trace())
+        events = self._events()
+        self.assertEqual(events[0]["event"], "loop_start")
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "ok")
+        steps = [event["step"] for event in events if event["event"] == "step_end"]
+        self.assertEqual(
+            steps,
+            ["postmerge", "watch", "repair", "dispatch", "review", "planner"],
+        )
+
+    def test_cmd_run_records_failed_phase_and_loop(self):
+        with self.assertRaises(RuntimeError):
+            self._run(RuntimeError("watch exploded"))
+        events = self._events()
+        watch_end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "watch"
+        )
+        self.assertEqual(watch_end["status"], "failed")
+        self.assertIn("watch exploded", watch_end["details"]["error"])
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "failed")
+
+    def test_cmd_run_marks_nonzero_postmerge_and_watch_returns_failed(self):
+        for keyword in ("postmerge_code", "watch_code"):
+            with self.subTest(command=keyword):
+                self._run(**{keyword: 7})
+                events = self._events()
+                step = "postmerge" if keyword == "postmerge_code" else "watch"
+                end = next(
+                    event for event in events
+                    if event["event"] == "step_end" and event["step"] == step
+                )
+                self.assertEqual(end["status"], "failed")
+                self.assertIn(f"{step} exit=7", end["details"]["error"])
+                self.assertEqual(events[-1]["status"], "failed")
+
+    def test_cmd_run_marks_nonzero_review_return_failed_and_advances_cursor(self):
+        pr = {
+            "number": 84,
+            "headRefName": "ai/84-test",
+            "body": "Refs #84",
+            "isDraft": False,
+            "createdAt": "2026-01-01T00:00:00Z",
+        }
+        self._run(review_code=1, review_prs=[pr], dry_run=False)
+        events = self._events()
+        end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "review"
+        )
+        self.assertEqual(end["status"], "failed")
+        self.assertIn("review PR #84 exit=1", end["details"]["error"])
+        self.assertEqual(dispatcher._read_review_cursor(), 84)
+        self.assertEqual(events[-1]["status"], "failed")
+
+
+class LoopAgentTraceTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        loop_patch = mock.patch.object(dispatcher, "LOOP_ROOT", self.root)
+        loop_patch.start()
+        self.addCleanup(loop_patch.stop)
+
+    def _events(self, trace: dispatcher.LoopTrace) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in trace.path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_run_agent_streaming_emits_role_pid_and_exit_code(self):
+        trace = dispatcher.LoopTrace(loop_id="20260101T000000-abcdef12")
+        code, _ = dispatcher.run_agent_streaming(
+            [sys.executable, "-c", "print('done')"],
+            "prompt",
+            str(self.root),
+            os.environ.copy(),
+            30,
+            self.root / "run",
+            role="implementer",
+            details={"issue": 102},
+            trace=trace,
+        )
+        self.assertEqual(code, 0)
+        events = self._events(trace)
+        start = next(event for event in events if event["event"] == "agent_start")
+        end = next(event for event in events if event["event"] == "agent_end")
+        self.assertEqual(start["step"], "dispatch")
+        self.assertEqual(start["details"]["role"], "implementer")
+        self.assertEqual(start["details"]["issue"], 102)
+        self.assertGreater(start["details"]["pid"], 0)
+        self.assertEqual(end["loop_id"], trace.loop_id)
+        self.assertEqual(end["status"], "ok")
+        self.assertEqual(end["details"]["role"], "implementer")
+        self.assertEqual(end["details"]["exit_code"], 0)
+        self.assertGreaterEqual(end["duration_ms"], 0)
+
+    def test_agent_end_records_failure_exit_code(self):
+        trace = dispatcher.LoopTrace(loop_id="20260101T000000-abcdef12")
+        code, _ = dispatcher.run_agent_streaming(
+            [sys.executable, "-c", "import sys; sys.exit(3)"],
+            "prompt",
+            str(self.root),
+            os.environ.copy(),
+            30,
+            self.root / "run",
+            role="implementer",
+            details={"issue": 102},
+            trace=trace,
+        )
+        self.assertEqual(code, 3)
+        end = next(
+            event for event in self._events(trace) if event["event"] == "agent_end"
+        )
+        self.assertEqual(end["status"], "failed")
+        self.assertEqual(end["details"]["exit_code"], 3)
+
+    def test_run_review_agent_emits_reviewer_events(self):
+        trace = dispatcher.LoopTrace(loop_id="20260101T000000-abcdef12")
+        with (
+            mock.patch.object(dispatcher, "active_trace", return_value=trace),
+            mock.patch.object(
+                dispatcher,
+                "agent_command",
+                return_value=[sys.executable, "-c", "print('verdict')"],
+            ),
+            mock.patch.object(dispatcher, "load_agent_secrets"),
+        ):
+            text, code = dispatcher.run_review_agent(
+                "prompt", self.root / "review-9", 1, details={"pr": 9}
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("verdict", text)
+        events = self._events(trace)
+        start = next(event for event in events if event["event"] == "agent_start")
+        end = next(event for event in events if event["event"] == "agent_end")
+        self.assertEqual((start["step"], start["details"]["role"]), ("review", "reviewer"))
+        self.assertEqual((end["step"], end["details"]["pr"]), ("review", 9))
+
+    def test_repair_child_events_reuse_parent_loop(self):
+        parent = dispatcher.LoopTrace(loop_id="20260101T000000-abcdef12")
+        with mock.patch.dict(
+            os.environ,
+            {
+                dispatcher.LOOP_ENV_ID: parent.loop_id,
+                dispatcher.LOOP_ENV_TIMELINE: str(parent.path),
+            },
+        ):
+            child = dispatcher.trace_from_env()
+        self.assertIsNotNone(child)
+        code, _ = dispatcher.run_agent_streaming(
+            [sys.executable, "-c", "print('repair')"],
+            "prompt",
+            str(self.root),
+            os.environ.copy(),
+            30,
+            self.root / "repair",
+            role="repair",
+            details={"pr": 80},
+            trace=child,
+        )
+        self.assertEqual(code, 0)
+        events = self._events(parent)
+        start = next(event for event in events if event["event"] == "agent_start")
+        end = next(event for event in events if event["event"] == "agent_end")
+        self.assertEqual((start["loop_id"], start["step"]), (parent.loop_id, "repair"))
+        self.assertEqual((start["details"]["role"], start["details"]["pr"]), ("repair", 80))
+        self.assertEqual(end["status"], "ok")
