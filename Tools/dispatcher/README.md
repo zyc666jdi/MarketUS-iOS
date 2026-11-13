@@ -143,7 +143,9 @@ python3 Tools/dispatcher/dispatcher.py observe --watch
 `ts / loop_id / event / step / status / duration_ms / details`，
 覆盖 `postmerge/watch/repair/dispatch/review/planner` 六个阶段；
 implementer/reviewer/repair 子进程额外记录 `agent_start` / `agent_end`
-（role、pid、exit_code、duration_ms）。单条事件失败不会中断调度。
+（role、pid、exit_code、duration_ms）。后台 repair 的 `step_end` 与
+`loop_end` 由子进程在结束时写入，父循环不会提前把 loop 标成 `ok`。
+单条事件失败不会中断调度，但会把该 loop 标记为 `failed`。
 
 ```bash
 # 最近 loop：id、开始时间、耗时、状态、步骤

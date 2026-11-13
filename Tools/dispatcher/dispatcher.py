@@ -76,6 +76,9 @@ STATE_ROOT = Path(".agent/state")
 LOOP_ROOT = Path(".agent/loops")
 LOOP_ENV_ID = "DISPATCHER_LOOP_ID"
 LOOP_ENV_TIMELINE = "DISPATCHER_LOOP_TIMELINE"
+LOOP_ENV_STEP = "DISPATCHER_LOOP_STEP"
+LOOP_ENV_STEP_STARTED = "DISPATCHER_LOOP_STEP_STARTED"
+LOOP_STATE_NAME = "loop-state.json"
 AGENT_ROLE_STEPS = {
     "implementer": "dispatch",
     "reviewer": "review",
@@ -190,6 +193,8 @@ class StepScope:
     def __init__(self) -> None:
         self.status = "ok"
         self.error = ""
+        # A detached child owns this step's step_end; the parent must not emit it.
+        self.deferred = False
 
     def fail(self, reason: str = "") -> None:
         self.status = "failed"
@@ -214,6 +219,8 @@ class LoopTrace:
         self.failed = False
         self.skipped = False
         self.error = ""
+        self.deferred = False
+        self.deferred_step = ""
 
     def emit(
         self,
@@ -240,6 +247,10 @@ class LoopTrace:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 handle.flush()
         except (OSError, TypeError, ValueError) as error:
+            # A silently incomplete timeline must never be reported as a healthy loop.
+            self.failed = True
+            if not self.error:
+                self.error = f"loop trace 写入失败：{error}"[:300]
             print(f"loop trace 写入失败：{error}", file=sys.stderr)
         return record
 
@@ -255,6 +266,13 @@ class LoopTrace:
             status = "failed" if self.failed else ("skipped" if self.skipped else "ok")
         details = {"error": self.error} if self.error else {}
         self.emit("loop_end", status=status, duration_ms=self.elapsed_ms(), details=details)
+
+    def finish_or_defer(self, status: str | None = None) -> None:
+        """Close the loop, or hand ``loop_end`` to the detached repair child."""
+        if self.deferred:
+            finish_deferred_loop(self, status)
+        else:
+            self.finish(status)
 
     @contextmanager
     def step(self, step: str, **details: Any):
@@ -274,13 +292,17 @@ class LoopTrace:
                 payload["error"] = scope.error
             if scope.status == "failed":
                 self.failed = True
-            self.emit(
-                "step_end",
-                step=step,
-                status=scope.status,
-                duration_ms=duration_ms_since(started),
-                details=payload,
-            )
+            if scope.deferred:
+                self.deferred = True
+                self.deferred_step = step
+            else:
+                self.emit(
+                    "step_end",
+                    step=step,
+                    status=scope.status,
+                    duration_ms=duration_ms_since(started),
+                    details=payload,
+                )
 
 
 _ACTIVE_TRACE: LoopTrace | None = None
@@ -296,7 +318,145 @@ def trace_from_env() -> LoopTrace | None:
     timeline = os.environ.get(LOOP_ENV_TIMELINE, "")
     if not loop_id or not timeline:
         return None
-    return LoopTrace(loop_id=loop_id, path=Path(timeline))
+    trace = LoopTrace(loop_id=loop_id, path=Path(timeline))
+    step = os.environ.get(LOOP_ENV_STEP, "")
+    if step:
+        trace.deferred = True
+        trace.deferred_step = step
+    return trace
+
+
+def loop_state_path(trace: LoopTrace) -> Path:
+    return trace.path.parent / LOOP_STATE_NAME
+
+
+@contextmanager
+def _locked_loop_state(trace: LoopTrace):
+    """Read-modify-write the shared parent/child state under an exclusive lock."""
+    path = loop_state_path(trace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.with_name(path.name + ".lock").open("a", encoding="utf-8")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        yield data
+        _write_state_file(path, data)
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def defer_loop(trace: LoopTrace, step: str, started_at: float) -> None:
+    """Record that a detached child will append ``step_end`` and ``loop_end``."""
+    with _locked_loop_state(trace) as state:
+        state.update(
+            {
+                "loop_id": trace.loop_id,
+                "step": step,
+                "step_started_at": started_at,
+                "loop_started_at": time.time() - trace.elapsed_ms() / 1000.0,
+                "parent_done": False,
+                "parent_status": "ok",
+                "parent_error": "",
+                "child_done": False,
+                "child_status": "",
+                "child_error": "",
+                "closed": False,
+            }
+        )
+    trace.deferred = True
+    trace.deferred_step = step
+
+
+def cancel_deferred_loop(trace: LoopTrace) -> None:
+    """Undo :func:`defer_loop` when the background process could not be started."""
+    trace.deferred = False
+    trace.deferred_step = ""
+    loop_state_path(trace).unlink(missing_ok=True)
+
+
+def _combined_loop_status(state: dict[str, Any]) -> str:
+    statuses = (state.get("parent_status"), state.get("child_status"))
+    if "failed" in statuses:
+        return "failed"
+    if "skipped" in statuses:
+        return "skipped"
+    return "ok"
+
+
+def _emit_shared_loop_end(trace: LoopTrace, state: dict[str, Any]) -> None:
+    started = state.get("loop_started_at")
+    if isinstance(started, (int, float)) and not isinstance(started, bool):
+        duration = max(0, int((time.time() - float(started)) * 1000))
+    else:
+        duration = trace.elapsed_ms()
+    errors = [
+        str(state.get(key)) for key in ("parent_error", "child_error") if state.get(key)
+    ]
+    details = {"error": "; ".join(errors)[:300]} if errors else {}
+    trace.emit(
+        "loop_end",
+        status=_combined_loop_status(state),
+        duration_ms=duration,
+        details=details,
+    )
+
+
+def finish_deferred_loop(trace: LoopTrace, status: str | None = None) -> None:
+    """Mark the parent side done; the last finisher writes ``loop_end``."""
+    if status is None:
+        status = "failed" if trace.failed else ("skipped" if trace.skipped else "ok")
+    with _locked_loop_state(trace) as state:
+        if state.get("closed"):
+            return
+        state["parent_done"] = True
+        state["parent_status"] = status
+        state["parent_error"] = trace.error
+        state.setdefault("loop_started_at", time.time() - trace.elapsed_ms() / 1000.0)
+        if state.get("child_done"):
+            _emit_shared_loop_end(trace, state)
+            state["closed"] = True
+
+
+def finish_deferred_child(trace: LoopTrace, code: int, error: str = "") -> None:
+    """Record the detached child's result and close the loop once the parent is done."""
+    with _locked_loop_state(trace) as state:
+        if state.get("child_done"):
+            return
+        step = str(state.get("step") or trace.deferred_step or "repair")
+        started = state.get("step_started_at")
+        if not isinstance(started, (int, float)) or isinstance(started, bool):
+            try:
+                started = float(os.environ.get(LOOP_ENV_STEP_STARTED, ""))
+            except ValueError:
+                started = None
+        if isinstance(started, (int, float)) and not isinstance(started, bool):
+            duration = max(0, int((time.time() - float(started)) * 1000))
+        else:
+            duration = trace.elapsed_ms()
+        status = "ok" if code == 0 else "failed"
+        reason = (error or ("" if code == 0 else f"{step} exit={code}"))[:300]
+        detail_payload = {"error": reason} if reason else {}
+        trace.emit(
+            "step_end",
+            step=step,
+            status=status,
+            duration_ms=duration,
+            details=detail_payload,
+        )
+        state["child_done"] = True
+        state["child_status"] = status
+        state["child_error"] = reason
+        if state.get("parent_done") and not state.get("closed"):
+            _emit_shared_loop_end(trace, state)
+            state["closed"] = True
 
 
 def slugify(title: str, limit: int = 40) -> str:
@@ -1734,14 +1894,27 @@ def prepare_repair_worktree(pr: int, branch: str, worktree: Path) -> str:
 
 
 def cmd_repair(args: argparse.Namespace) -> int:
-    repair_lock = acquire_named_lock(f"repair-{args.pr}")
-    if repair_lock is None:
-        print(f"PR #{args.pr} 已有 repair 在运行，跳过")
-        return EXIT_LOCK_BUSY
+    trace = trace_from_env()
+    code = 0
+    error = ""
     try:
-        return _cmd_repair_locked(args)
+        repair_lock = acquire_named_lock(f"repair-{args.pr}")
+        if repair_lock is None:
+            print(f"PR #{args.pr} 已有 repair 在运行，跳过")
+            code = EXIT_LOCK_BUSY
+            return code
+        try:
+            code = _cmd_repair_locked(args)
+            return code
+        finally:
+            release_named_lock(repair_lock)
+    except BaseException as failure:
+        error = error_summary(failure)
+        code = 1
+        raise
     finally:
-        release_named_lock(repair_lock)
+        if trace is not None:
+            finish_deferred_child(trace, code, error)
 
 
 def _cmd_repair_locked(args: argparse.Namespace) -> int:
@@ -2462,7 +2635,7 @@ def read_timeline(path: Path) -> list[dict[str, Any]]:
     """Read a JSONL timeline, ignoring partial or corrupt lines."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     events: list[dict[str, Any]] = []
     for line in lines:
@@ -2479,9 +2652,14 @@ def _parse_timestamp(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # Hand-written or older timelines may omit the offset; treat them as UTC so
+    # they can be compared with datetime.now(timezone.utc).
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def format_duration(duration_ms: int) -> str:
@@ -2528,6 +2706,8 @@ def summarize_loop(path: Path) -> dict[str, Any]:
             steps[step] = "running"
         elif event.get("event") == "step_end":
             steps[step] = str(event.get("status") or "ok")
+    if status != "running" and "failed" in steps.values():
+        status = "failed"
     return {
         "loop_id": path.parent.name,
         "start": start_ts,
@@ -2696,7 +2876,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise
     finally:
         _ACTIVE_TRACE = previous_trace
-        trace.finish()
+        trace.finish_or_defer()
 
 
 def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
@@ -2714,12 +2894,16 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
     try:
         if not args.dry_run:
             cleanup_stale_repair_state()
-        with trace.step("postmerge"):
-            cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
+        with trace.step("postmerge") as phase:
+            code = cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
+            if code != 0:
+                phase.fail(f"postmerge exit={code}")
             if not args.dry_run:
                 reap_worktrees()
-        with trace.step("watch"):
-            cmd_watch(argparse.Namespace(dry_run=args.dry_run))
+        with trace.step("watch") as phase:
+            code = cmd_watch(argparse.Namespace(dry_run=args.dry_run))
+            if code != 0:
+                phase.fail(f"watch exit={code}")
 
         with trace.step("repair") as phase:
             prs = gh_json(
@@ -2758,6 +2942,10 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
                     child_env = os.environ.copy()
                     child_env[LOOP_ENV_ID] = trace.loop_id
                     child_env[LOOP_ENV_TIMELINE] = str(trace.path.resolve())
+                    started_wall = time.time()
+                    defer_loop(trace, "repair", started_wall)
+                    child_env[LOOP_ENV_STEP] = "repair"
+                    child_env[LOOP_ENV_STEP_STARTED] = str(started_wall)
                     try:
                         with log_path.open("a", encoding="utf-8") as log:
                             log.write(
@@ -2770,9 +2958,11 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
                                 stdout=log, stderr=log, start_new_session=True, env=child_env,
                             )
                     except OSError as error:
+                        cancel_deferred_loop(trace)
                         print(f"⛔ 启动 repair 失败：{error}")
                         phase.fail(f"repair PR #{number} 启动失败：{error}")
                         continue
+                    phase.deferred = True
                     try:
                         repair_state = write_repair_state(number, proc.pid, str(log_path))
                     except (OSError, TypeError, ValueError) as error:
@@ -2811,7 +3001,7 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
                     phase.fail(f"dispatch #{issue['number']} exit={code}")
                 break
 
-        with trace.step("review"):
+        with trace.step("review") as phase:
             prs = gh_json(
                 [
                     "pr",
@@ -2867,6 +3057,11 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
                 if code == EXIT_LOCK_BUSY:
                     # This PR already has a review running; try the next one.
                     # Do not advance the cursor: the PR was never reviewed.
+                    continue
+                if code != 0:
+                    phase.fail(f"review PR #{pr['number']} exit={code}")
+                    # A failed review is not a completed one: leave the cursor
+                    # untouched and try the next candidate in this sweep.
                     continue
                 if not args.dry_run:
                     _write_review_cursor(pr["number"])
