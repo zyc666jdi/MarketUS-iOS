@@ -27,6 +27,7 @@ MarketUS.xcodeproj/
 # ---- AI Agent 运行时（不提交） ----
 .worktrees/
 .agent/runs/
+.agent/loops/
 .agent/locks/
 .agent/state/
 .agent/cache/
