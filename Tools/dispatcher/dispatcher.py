@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
@@ -35,6 +35,7 @@ if str(DISPATCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(DISPATCHER_ROOT))
 
 from runners.base import ResolvedRole, RunnerResult, build_job_input  # noqa: E402
+from runners.codex import FINAL_MESSAGE_FILE  # noqa: E402
 from runners.registry import Registry, RegistryError, load_registry  # noqa: E402
 
 STATUS_LABELS = [
@@ -142,17 +143,18 @@ def resolve_agent_role(role: str, env: dict[str, str] | None = None) -> Resolved
     return agent_registry().resolve(role, os.environ if env is None else env)
 
 
-def role_command(role: str) -> list[str]:
+def role_command(role: str, output_path: str | Path | None = None) -> list[str]:
     """Return the argv for a role; dsh keeps the legacy AGENT_CMD hook.
 
     Non-dsh runners get the role's effective sandbox, so a codex reviewer is
-    always invoked with ``--sandbox read-only``.
+    always invoked with ``--sandbox read-only``.  ``output_path`` is forwarded
+    to runners that support a final-message file (codex ``-o``).
     """
 
     resolved = resolve_agent_role(role)
     if resolved.runner_name == "dsh":
         return agent_command()
-    return resolved.command()
+    return resolved.command(None if output_path is None else str(output_path))
 
 
 def secret_env_file() -> Path:
@@ -1178,6 +1180,7 @@ def run_agent_streaming(
     role: str = "",
     details: dict[str, Any] | None = None,
     trace: LoopTrace | None = None,
+    stdout_path: Path | None = None,
 ) -> tuple[int, str]:
     """Run an agent, streaming logs, and stop shortly after a final event.
 
@@ -1185,6 +1188,11 @@ def run_agent_streaming(
     hung dsh process, so its SIGKILL return code is not propagated. When a loop
     trace is active (or passed explicitly) and ``role`` is set, agent_start /
     agent_end events record the child pid, duration and exit code.
+
+    When ``stdout_path`` is set, stdout is captured separately from
+    ``agent.log`` (which keeps stderr); the caller can then parse a runner's
+    clean final message without tool output.  Final-event polling is skipped
+    in that mode because it is only used by the dsh NDJSON path.
     """
     import threading
     import time
@@ -1193,13 +1201,20 @@ def run_agent_streaming(
     agent_details = dict(details or {})
     agent_step = AGENT_ROLE_STEPS.get(role, "")
     run_dir.mkdir(parents=True, exist_ok=True)
-    out_path = run_dir / "agent.log"
+    log_path = run_dir / "agent.log"
     proc: subprocess.Popen[str] | None = None
     started = time.monotonic()
     try:
-        with out_path.open("w", encoding="utf-8") as out:
+        with ExitStack() as stack:
+            log = stack.enter_context(log_path.open("w", encoding="utf-8"))
+            child_stdout = log
+            if stdout_path is not None and stdout_path != log_path:
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                child_stdout = stack.enter_context(
+                    stdout_path.open("w", encoding="utf-8")
+                )
             proc = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=out, stderr=out,
+                command, stdin=subprocess.PIPE, stdout=child_stdout, stderr=log,
                 text=True, cwd=cwd, env=env,
             )
             started = time.monotonic()
@@ -1230,7 +1245,11 @@ def run_agent_streaming(
             pending = ""
             try:
                 while True:
-                    offset, pending, found = _scan_final_event(out_path, offset, pending)
+                    found = False
+                    if stdout_path is None:
+                        offset, pending, found = _scan_final_event(
+                            log_path, offset, pending
+                        )
                     if found and final_seen_at is None:
                         # Backdate one poll and reserve a scheduler/kill margin so
                         # the child still exits inside the ticket's 2s SLA.
@@ -1257,7 +1276,7 @@ def run_agent_streaming(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-        content = out_path.read_text(encoding="utf-8")
+        content = log_path.read_text(encoding="utf-8")
         if final_seen_at is not None:
             returncode = 0
         else:
@@ -1548,11 +1567,11 @@ def run_review_agent(
     The return value is iterable as ``(text, returncode)`` for existing callers.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 
     try:
         resolved = resolve_agent_role(role)
     except RegistryError as error:
+        (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
         result = RunnerResult(
             status="failed",
             text=f"runner config error: {error}",
@@ -1561,6 +1580,11 @@ def run_review_agent(
         )
         _write_runner_result(run_dir, result)
         return result
+
+    codex_review = role == "reviewer" and resolved.runner_name == "codex"
+    if codex_review:
+        prompt = prompt.rstrip() + CODEX_REVIEW_CONTRACT
+    (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 
     job_input = build_job_input(
         job_id=job_id or run_dir.name,
@@ -1578,7 +1602,16 @@ def run_review_agent(
     )
 
     load_agent_secrets()
-    command = agent_command() if resolved.runner_name == "dsh" else resolved.command()
+    last_message_path: Path | None = None
+    stdout_path: Path | None = None
+    if resolved.runner_name == "codex":
+        last_message_path = (run_dir / FINAL_MESSAGE_FILE).resolve()
+        stdout_path = (run_dir / "agent.stdout").resolve()
+        command = resolved.command(str(last_message_path))
+    elif resolved.runner_name == "dsh":
+        command = agent_command()
+    else:
+        command = resolved.command()
     env = os.environ.copy()
     env["AGENT_RUN_ID"] = run_dir.name
     if command and command[0] == "dsh" and resolved.sandbox == "read-only":
@@ -1588,7 +1621,7 @@ def run_review_agent(
     try:
         returncode, stdout = run_agent_streaming(
             command, prompt, os.getcwd(), env, timeout_minutes * 60, run_dir,
-            role=role, details=details,
+            role=role, details=details, stdout_path=stdout_path,
         )
     except subprocess.TimeoutExpired:
         result = RunnerResult(
@@ -1610,10 +1643,24 @@ def run_review_agent(
         _write_runner_result(run_dir, result)
         return result
 
+    final_message: str | None = None
+    if last_message_path is not None:
+        try:
+            final_message = last_message_path.read_text(encoding="utf-8")
+        except OSError:
+            final_message = None
+        if final_message is None and stdout_path is not None:
+            # -o unavailable: codex stdout is its final assistant message only.
+            try:
+                final_message = stdout_path.read_text(encoding="utf-8")
+            except OSError:
+                final_message = None
+
     result = resolved.runner.parse(
         stdout,
         returncode=returncode,
         duration_ms=int((time.monotonic() - started) * 1000),
+        final_message=final_message,
     )
     _write_runner_result(run_dir, result)
     return result
@@ -1698,6 +1745,23 @@ P2/P3（不得单独 REQUEST_CHANGES）：测试覆盖、PR 描述、文档、�
 """
 
 
+CODEX_REVIEW_CONTRACT = """
+
+## Codex 结构化 verdict（必须）
+
+在完整 markdown 评审正文之后，追加且仅追加一个 ```json 代码块作为最终内容：
+
+```json
+{"marketus_review": true, "verdict": "APPROVE", "summary": "一句话结论", "findings": []}
+```
+
+- `verdict` 只能是 `APPROVE` 或 `REQUEST_CHANGES`。
+- `findings` 只列 P1 blocker（每条带 `file:line`）；没有则 `[]`。
+- 该 JSON 块必须是最后内容；除它之外不要再输出任何 JSON。
+- 上面的 markdown `## Verdict` 仍保留；Dispatcher 以 JSON sentinel 为准。
+"""
+
+
 
 # cmd_run treats this exit code as "another run holds this PR's lock", so it
 # can skip the PR and try the next one instead of ending the sweep.
@@ -1766,8 +1830,11 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     print(f"ticket   #{issue_number}")
     print(f"sha      {sha[:8]}")
     print(f"diff     {len(diff)} chars")
+    review_dir = RUN_ROOT / f"review-{args.pr}"
     try:
-        review_command = role_command("reviewer")
+        review_command = role_command(
+            "reviewer", (review_dir / FINAL_MESSAGE_FILE).resolve()
+        )
     except RegistryError as error:
         print(f"⛔ Runner 配置错误：{error}")
         return 1
@@ -1793,7 +1860,7 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     test_evidence = format_review_tests(test_passed, test_command, test_output)
     prompt += f"\n\n---\n\n# Dispatcher 独立测试（read-only worktree）\n\n{test_evidence}\n"
 
-    run_dir = RUN_ROOT / f"review-{args.pr}"
+    run_dir = review_dir
     run_result = run_review_agent(
         prompt,
         run_dir,
@@ -1807,14 +1874,25 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     )
     text, code = run_result
     unified = run_result if isinstance(run_result, RunnerResult) else None
-    if unified is not None:
-        if unified.verdict and parse_verdict(text) is None:
+    if unified is not None and unified.verdict:
+        parsed = parse_verdict(text)
+        if parsed is None:
             text = f"## Verdict: {unified.verdict}\n\n{text}"
-        if unified.findings and not parse_p1_blockers(text):
-            text = text.rstrip() + "\n\n## Blockers (P1)\n\n" + "\n".join(
-                f"- {finding}" for finding in unified.findings
-            ) + "\n"
-    verdict = parse_verdict(text)
+        elif parsed != unified.verdict:
+            # Structured verdict (codex sentinel) is authoritative; never let
+            # a quoted markdown heading flip the gate.
+            text = VERDICT_PATTERN.sub(
+                f"## Verdict: {unified.verdict}", text
+            )
+    if unified is not None and unified.findings and not parse_p1_blockers(text):
+        text = text.rstrip() + "\n\n## Blockers (P1)\n\n" + "\n".join(
+            f"- {finding}" for finding in unified.findings
+        ) + "\n"
+    verdict = (
+        unified.verdict
+        if unified is not None and unified.verdict
+        else parse_verdict(text)
+    )
     print(f"verdict  {verdict or 'MISSING'} (exit={code})")
     print(f"tests    {test_passed if test_passed is not None else 'not-run'}")
 

@@ -97,10 +97,19 @@ class Runner(Protocol):
 
     spec: RunnerSpec
 
-    def command(self, sandbox: str | None = None) -> list[str]:
+    def command(
+        self, sandbox: str | None = None, output_path: str | None = None
+    ) -> list[str]:
         ...
 
-    def parse(self, stdout: str, *, returncode: int = 0, duration_ms: int = 0) -> RunnerResult:
+    def parse(
+        self,
+        stdout: str,
+        *,
+        returncode: int = 0,
+        duration_ms: int = 0,
+        final_message: str | None = None,
+    ) -> RunnerResult:
         ...
 
 
@@ -119,8 +128,8 @@ class ResolvedRole:
     runner_name: str
     sandbox: str
 
-    def command(self) -> list[str]:
-        return self.runner.command(self.sandbox)
+    def command(self, output_path: str | None = None) -> list[str]:
+        return self.runner.command(self.sandbox, output_path)
 
 
 def build_job_input(
@@ -193,17 +202,24 @@ def build_result(
     result: dict[str, Any] | None = None,
     error_code: str | None = None,
     retryable: bool = False,
+    markdown_fallback: bool = True,
 ) -> RunnerResult:
-    """Merge a runner payload with markdown fallbacks into one result."""
+    """Merge a runner payload with markdown fallbacks into one result.
+
+    ``markdown_fallback`` is disabled for codex, where verdict/findings must
+    come from the explicit review sentinel rather than from arbitrary text.
+    """
 
     structured = result if isinstance(result, dict) else {}
-    verdict = str(structured.get("verdict") or "").strip().upper() or extract_verdict(text)
+    verdict = str(structured.get("verdict") or "").strip().upper()
+    if not verdict and markdown_fallback:
+        verdict = extract_verdict(text) or ""
     verdict = verdict if verdict in VERDICTS else None
     raw_findings = structured.get("findings")
     findings = (
         [str(item).strip() for item in raw_findings if item is not None and str(item).strip()]
         if isinstance(raw_findings, list)
-        else extract_findings(text)
+        else (extract_findings(text) if markdown_fallback else [])
     )
     summary = str(structured.get("summary") or "").strip() or summarize(text)
     if returncode != 0 and error_code is None:

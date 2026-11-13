@@ -13,12 +13,21 @@ class DshRunner:
     def __init__(self, spec: RunnerSpec) -> None:
         self.spec = spec
 
-    def command(self, sandbox: str | None = None) -> list[str]:
+    def command(
+        self, sandbox: str | None = None, output_path: str | None = None
+    ) -> list[str]:
         """dsh enforces the sandbox through ``DSH_PERMISSION_MODE``, not argv."""
 
         return list(self.spec.command)
 
-    def parse(self, stdout: str, *, returncode: int = 0, duration_ms: int = 0) -> RunnerResult:
+    def parse(
+        self,
+        stdout: str,
+        *,
+        returncode: int = 0,
+        duration_ms: int = 0,
+        final_message: str | None = None,
+    ) -> RunnerResult:
         final_events = {self.spec.final_event, "final", "dsh_final"}
         texts: list[str] = []
         structured: dict | None = None
