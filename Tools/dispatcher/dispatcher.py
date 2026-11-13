@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -22,9 +23,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
+
+DISPATCHER_ROOT = Path(__file__).resolve().parent
+if str(DISPATCHER_ROOT) not in sys.path:
+    sys.path.insert(0, str(DISPATCHER_ROOT))
+
+from runners.base import ResolvedRole, RunnerResult, build_job_input  # noqa: E402
+from runners.registry import Registry, RegistryError, load_registry  # noqa: E402
 
 STATUS_LABELS = [
     "status:ready",
@@ -106,6 +115,25 @@ DEFAULT_PROTECTED_PATHS = [
 def agent_command() -> list[str]:
     """Agent 入口；可用 AGENT_CMD 覆盖（例如 codex exec / claude -p）。"""
     return shlex.split(os.environ.get("AGENT_CMD", "dsh --profile headless --json"))
+
+
+@functools.lru_cache(maxsize=1)
+def agent_registry() -> Registry:
+    """Load the Phase 1a runner registry from the checked-in config."""
+    return load_registry(DISPATCHER_ROOT / "config/agents.yaml")
+
+
+def resolve_agent_role(role: str, env: dict[str, str] | None = None) -> ResolvedRole:
+    """Resolve a role to its runner, honouring per-role env overrides."""
+    return agent_registry().resolve(role, os.environ if env is None else env)
+
+
+def role_command(role: str) -> list[str]:
+    """Return the executable for a role; dsh keeps the legacy AGENT_CMD hook."""
+    resolved = resolve_agent_role(role)
+    if resolved.runner_name == "dsh":
+        return agent_command()
+    return resolved.runner.command()
 
 
 def secret_env_file() -> Path:
@@ -879,7 +907,7 @@ def cmd_once(args: argparse.Namespace) -> int:
     print(f"branch   {branch}")
     print(f"worktree {worktree}")
     print(f"prompt   {len(prompt)} chars")
-    command = agent_command()
+    command = role_command("implementer")
     load_agent_secrets()
     credential = "DEEPSEEK_API_KEY" if os.environ.get("DEEPSEEK_API_KEY") else "missing"
     print(f"agent    {' '.join(command)}")
@@ -932,7 +960,7 @@ def cmd_once(args: argparse.Namespace) -> int:
     env["TICKET_NUMBER"] = str(number)
 
     timeout_seconds = args.timeout * 60
-    command = agent_command()
+    command = role_command("implementer")
     try:
         returncode, _stdout = run_agent_streaming(
             command, prompt, str(worktree), env, timeout_seconds, run_dir
@@ -1078,27 +1106,101 @@ def agent_text(output: str) -> str:
     return "\n".join(final) if final else output
 
 
-def run_review_agent(prompt: str, run_dir: Path, timeout_minutes: int) -> tuple[str, int]:
+def _write_runner_result(run_dir: Path, result: RunnerResult) -> None:
+    (run_dir / "result.json").write_text(
+        json.dumps(result.to_payload(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_review_agent(
+    prompt: str,
+    run_dir: Path,
+    timeout_minutes: int,
+    *,
+    role: str = "reviewer",
+    job_id: str | None = None,
+    ticket: int | None = None,
+    pr: int | None = None,
+    worktree: str | None = None,
+) -> RunnerResult:
+    """Run one role through its configured runner.
+
+    The return value is iterable as ``(text, returncode)`` for existing callers.
+    DSH keeps the historical ``AGENT_CMD`` / permission behaviour; other roles
+    only change when ``config/agents.yaml`` (or ``REVIEWER_RUNNER``) selects a
+    different runner.  The unified input/result documents are written to the
+    run directory for observability.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-    load_agent_secrets()
 
-    command = agent_command()
+    try:
+        resolved = resolve_agent_role(role)
+    except RegistryError as error:
+        result = RunnerResult(
+            status="failed",
+            text=f"runner config error: {error}",
+            returncode=1,
+            error_code="runner_config",
+        )
+        _write_runner_result(run_dir, result)
+        return result
+
+    job_input = build_job_input(
+        job_id=job_id or run_dir.name,
+        role=role,
+        prompt=prompt,
+        ticket=ticket,
+        pr=pr,
+        worktree=worktree,
+        timeout_seconds=timeout_minutes * 60,
+        capabilities=resolved.role.capabilities,
+    )
+    (run_dir / "input.json").write_text(
+        json.dumps(job_input, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    load_agent_secrets()
+    command = agent_command() if resolved.runner_name == "dsh" else resolved.runner.command()
     env = os.environ.copy()
     env["AGENT_RUN_ID"] = run_dir.name
     if command and command[0] == "dsh":
         env["DSH_PERMISSION_MODE"] = "read-only"
 
+    started = time.monotonic()
     try:
         returncode, stdout = run_agent_streaming(
             command, prompt, os.getcwd(), env, timeout_minutes * 60, run_dir
         )
     except subprocess.TimeoutExpired:
-        return "reviewer timeout", 1
+        result = RunnerResult(
+            status="timeout",
+            text="reviewer timeout",
+            returncode=1,
+            error_code="timeout",
+            retryable=True,
+        )
+        _write_runner_result(run_dir, result)
+        return result
     except FileNotFoundError:
-        return f"agent not found: {command[0] if command else '<empty>'}", 1
+        result = RunnerResult(
+            status="failed",
+            text=f"agent not found: {command[0] if command else '<empty>'}",
+            returncode=1,
+            error_code="agent_not_found",
+        )
+        _write_runner_result(run_dir, result)
+        return result
 
-    return agent_text(stdout), returncode
+    result = resolved.runner.parse(
+        stdout,
+        returncode=returncode,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+    _write_runner_result(run_dir, result)
+    return result
 
 
 def comment_pr(number: int, body: str) -> None:
@@ -1248,7 +1350,12 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     print(f"ticket   #{issue_number}")
     print(f"sha      {sha[:8]}")
     print(f"diff     {len(diff)} chars")
-    print(f"agent    {' '.join(agent_command())}")
+    try:
+        review_command = role_command("reviewer")
+    except RegistryError as error:
+        print(f"⛔ Runner 配置错误：{error}")
+        return 1
+    print(f"agent    {' '.join(review_command)}")
 
     if not args.execute:
         print("\n(dry-run) 未调用 Reviewer；加 --execute 执行。")
@@ -1271,7 +1378,25 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     prompt += f"\n\n---\n\n# Dispatcher 独立测试（read-only worktree）\n\n{test_evidence}\n"
 
     run_dir = RUN_ROOT / f"review-{args.pr}"
-    text, code = run_review_agent(prompt, run_dir, args.timeout)
+    run_result = run_review_agent(
+        prompt,
+        run_dir,
+        args.timeout,
+        role="reviewer",
+        job_id=f"review-{args.pr}",
+        ticket=issue_number,
+        pr=args.pr,
+        worktree=os.getcwd(),
+    )
+    text, code = run_result
+    unified = run_result if isinstance(run_result, RunnerResult) else None
+    if unified is not None:
+        if unified.verdict and parse_verdict(text) is None:
+            text = f"## Verdict: {unified.verdict}\n\n{text}"
+        if unified.findings and not parse_p1_blockers(text):
+            text = text.rstrip() + "\n\n## Blockers (P1)\n\n" + "\n".join(
+                f"- {finding}" for finding in unified.findings
+            ) + "\n"
     verdict = parse_verdict(text)
     print(f"verdict  {verdict or 'MISSING'} (exit={code})")
     print(f"tests    {test_passed if test_passed is not None else 'not-run'}")
@@ -1595,7 +1720,7 @@ def _cmd_repair_locked(args: argparse.Namespace) -> int:
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
 
     load_agent_secrets()
-    command = agent_command()
+    command = role_command("repair")
     if not command or shutil.which(command[0]) is None:
         print(f"⛔ 找不到 Agent 命令：{command[0] if command else '<empty>'}")
         return 1
@@ -2161,7 +2286,7 @@ def cmd_planner(args: argparse.Namespace) -> int:
         print("\n(dry-run) 未调用 Planner Agent、未写入 GitHub；加 --execute 执行。")
         return 0
     try:
-        text, code = run_review_agent(prompt, run_dir, args.timeout)
+        text, code = run_review_agent(prompt, run_dir, args.timeout, role="planner")
     except OSError as error:
         return _planner_failed(state, f"Planner 运行失败：{error}", run_dir)
     if code != 0:

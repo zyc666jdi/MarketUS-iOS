@@ -534,7 +534,7 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
 
-        def fake_review_agent(_prompt, _run_dir, _timeout):
+        def fake_review_agent(_prompt, _run_dir, _timeout, **_kwargs):
             return (f"## Verdict: {verdict}\n{review_body}" if verdict else "no verdict", 0)
 
         old_cwd = os.getcwd()
