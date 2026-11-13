@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
-from .base import RunnerResult, RunnerSpec, build_result
+from .base import RunnerResult, RunnerSpec, build_result, render_job_prompt
 
 
 class DshRunner:
@@ -19,6 +20,9 @@ class DshRunner:
         """dsh enforces the sandbox through ``DSH_PERMISSION_MODE``, not argv."""
 
         return list(self.spec.command)
+
+    def render_prompt(self, job_input: dict[str, Any]) -> str:
+        return render_job_prompt(job_input)
 
     def parse(
         self,
@@ -44,6 +48,12 @@ class DshRunner:
             text = event.get("text") or event.get("message")
             if not text and isinstance(payload, str):
                 text = payload
+            if not text and isinstance(payload, dict):
+                for key in ("text", "message", "summary"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        text = value
+                        break
             if text:
                 texts.append(str(text))
         text = "\n".join(texts) if texts else stdout

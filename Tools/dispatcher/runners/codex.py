@@ -15,7 +15,14 @@ import json
 import re
 from typing import Any
 
-from .base import SANDBOXES, VERDICTS, RunnerResult, RunnerSpec, build_result
+from .base import (
+    SANDBOXES,
+    VERDICTS,
+    RunnerResult,
+    RunnerSpec,
+    build_result,
+    render_job_prompt,
+)
 
 SENTINEL_KEY = "marketus_review"
 FINAL_MESSAGE_FILE = "last-message.txt"
@@ -163,6 +170,9 @@ class CodexRunner:
                 args, "-o", str(output_path), ("--output-last-message",)
             )
         return args
+
+    def render_prompt(self, job_input: dict[str, Any]) -> str:
+        return render_job_prompt(job_input)
 
     def parse(
         self,

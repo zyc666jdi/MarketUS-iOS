@@ -47,6 +47,15 @@ def schema_errors(value, schema: dict, path: str = "$") -> list[str]:
         errors.append(f"{path}: expected const {schema['const']!r}")
     if "enum" in schema and value not in schema["enum"]:
         errors.append(f"{path}: value not in enum")
+    if isinstance(value, str) and "minLength" in schema and len(value) < schema["minLength"]:
+        errors.append(f"{path}: shorter than minLength {schema['minLength']}")
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and "minimum" in schema
+        and value < schema["minimum"]
+    ):
+        errors.append(f"{path}: below minimum {schema['minimum']}")
     if isinstance(value, dict):
         for key in schema.get("required", []):
             if key not in value:
@@ -277,6 +286,19 @@ class DshParserTests(unittest.TestCase):
         result = self.runner.parse(stdout)
         self.assertEqual(result.verdict, "APPROVE")
         self.assertEqual(result.summary, "LGTM")
+        self.assertEqual(result.text, "LGTM")
+
+    def test_structured_final_payload_with_text(self):
+        body = "## Verdict: APPROVE\n\n## Blockers (P1)\n\n- 无\n"
+        stdout = json.dumps(
+            {
+                "type": "dsh_final",
+                "result": {"text": body, "verdict": "APPROVE", "findings": []},
+            }
+        )
+        result = self.runner.parse(stdout)
+        self.assertEqual(result.text, body)
+        self.assertEqual(result.verdict, "APPROVE")
 
 
 class CodexCommandTests(unittest.TestCase):
@@ -404,6 +426,15 @@ class CodexParserTests(unittest.TestCase):
         result = self.runner.parse("", final_message=final)
         self.assertEqual(result.verdict, "REQUEST_CHANGES")
         self.assertNotIn("## Verdict: APPROVE", result.text)
+
+    def test_structured_findings_drop_p2_and_p3(self):
+        final = codex_review_message(
+            "Review.\n",
+            "REQUEST_CHANGES",
+            ["P1: race", "P2: naming", "P3: nit"],
+        )
+        result = self.runner.parse("", final_message=final)
+        self.assertEqual(result.findings, ["P1: race"])
 
     def test_quoted_inline_verdict_is_removed(self):
         final = codex_review_message(
@@ -535,6 +566,33 @@ class SchemaContractTests(unittest.TestCase):
         self.assertTrue(schema_errors({"schema_version": 1}, self.input_schema))
         self.assertTrue(schema_errors({"schema_version": 1}, self.output_schema))
 
+    def test_validator_rejects_empty_prompt_and_non_positive_ids(self):
+        payload = base.build_job_input(
+            job_id="",
+            role="reviewer",
+            prompt="",
+            ticket=0,
+            pr=0,
+            timeout_seconds=60,
+        )
+        errors = schema_errors(payload, self.input_schema)
+        self.assertTrue(any("job_id" in error for error in errors))
+        self.assertTrue(any("prompt" in error for error in errors))
+        self.assertTrue(any("ticket" in error for error in errors))
+        self.assertTrue(any("pr" in error for error in errors))
+
+    def test_adapters_render_prompt_from_job_input(self):
+        job_input = base.build_job_input(
+            job_id="review-104",
+            role="reviewer",
+            prompt="review this",
+            ticket=104,
+            pr=105,
+        )
+        for runner in registry.load_registry().runners.values():
+            with self.subTest(runner=runner.spec.name):
+                self.assertEqual(runner.render_prompt(job_input), "review this")
+
 
 class DispatcherIntegrationTests(unittest.TestCase):
     def test_codex_reviewer_uses_final_message_file_not_stdout(self):
@@ -562,7 +620,13 @@ class DispatcherIntegrationTests(unittest.TestCase):
                 return 0, malicious_stdout
 
             with (
-                mock.patch.dict(os.environ, {"REVIEWER_RUNNER": "codex"}),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "REVIEWER_RUNNER": "codex",
+                        "UNLISTED_SECRET": "must-not-leak",
+                    },
+                ),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
                 mock.patch.object(
                     dispatcher, "run_agent_streaming", side_effect=fake_stream
@@ -591,8 +655,12 @@ class DispatcherIntegrationTests(unittest.TestCase):
                 stream.call_args.kwargs["stdout_path"],
                 (run_dir / "agent.stdout").resolve(),
             )
-            self.assertNotIn("DSH_PERMISSION_MODE", stream.call_args.args[3])
+            runner_env = stream.call_args.args[3]
+            self.assertNotIn("DSH_PERMISSION_MODE", runner_env)
+            self.assertNotIn("UNLISTED_SECRET", runner_env)
+            self.assertIn("PATH", runner_env)
             input_payload = json.loads((run_dir / "input.json").read_text())
+            self.assertEqual(stream.call_args.args[1], input_payload["prompt"])
             output_payload = json.loads((run_dir / "result.json").read_text())
             self.assertIn("marketus_review", input_payload["prompt"])
             self.assertIn("marketus_review", (run_dir / "prompt.md").read_text())

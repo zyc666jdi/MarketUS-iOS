@@ -15,6 +15,7 @@ SCHEMA_VERSION = 1
 STATUSES = ("succeeded", "failed", "timeout")
 VERDICTS = ("APPROVE", "REQUEST_CHANGES")
 SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+EXECUTION_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
 
 VERDICT_RE = re.compile(r"##\s*Verdict:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
 HEADING_RE = re.compile(r"^#{2,4}\s+(.+)$")
@@ -102,6 +103,9 @@ class Runner(Protocol):
     ) -> list[str]:
         ...
 
+    def render_prompt(self, job_input: dict[str, Any]) -> str:
+        ...
+
     def parse(
         self,
         stdout: str,
@@ -132,6 +136,21 @@ class ResolvedRole:
         return self.runner.command(self.sandbox, output_path)
 
 
+def build_runner_env(
+    allowlist: tuple[str, ...] | list[str],
+    source: dict[str, str],
+    *,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a runner environment from the allowlist plus execution basics."""
+
+    allowed = set(allowlist) | set(EXECUTION_ENV_KEYS)
+    env = {key: value for key, value in source.items() if key in allowed}
+    if overrides:
+        env.update(overrides)
+    return env
+
+
 def build_job_input(
     *,
     job_id: str,
@@ -156,6 +175,15 @@ def build_job_input(
         "limits": {"timeout_seconds": max(1, int(timeout_seconds))},
         "capabilities": [str(item) for item in capabilities],
     }
+
+
+def render_job_prompt(job_input: dict[str, Any]) -> str:
+    """Return the prompt carried by a validated runner input document."""
+
+    prompt = job_input.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("job input prompt must be a non-empty string")
+    return prompt
 
 
 def extract_verdict(text: str) -> str | None:
@@ -190,6 +218,17 @@ def extract_findings(text: str) -> list[str]:
     return findings
 
 
+def filter_blocking_findings(findings: list[str]) -> list[str]:
+    """Drop explicitly advisory P2/P3 entries from a structured findings list."""
+
+    blocking: list[str] = []
+    for item in findings:
+        if P2_P3_RE.search(item) and not re.search(r"\bP1\b", item, re.IGNORECASE):
+            continue
+        blocking.append(item)
+    return blocking
+
+
 def summarize(text: str, limit: int = SUMMARY_LIMIT) -> str:
     return " ".join(text.split())[:limit]
 
@@ -217,7 +256,13 @@ def build_result(
     verdict = verdict if verdict in VERDICTS else None
     raw_findings = structured.get("findings")
     findings = (
-        [str(item).strip() for item in raw_findings if item is not None and str(item).strip()]
+        filter_blocking_findings(
+            [
+                str(item).strip()
+                for item in raw_findings
+                if item is not None and str(item).strip()
+            ]
+        )
         if isinstance(raw_findings, list)
         else (extract_findings(text) if markdown_fallback else [])
     )

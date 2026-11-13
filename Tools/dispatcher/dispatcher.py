@@ -34,7 +34,13 @@ DISPATCHER_ROOT = Path(__file__).resolve().parent
 if str(DISPATCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(DISPATCHER_ROOT))
 
-from runners.base import ResolvedRole, RunnerResult, build_job_input  # noqa: E402
+from runners.base import (  # noqa: E402
+    ResolvedRole,
+    RunnerResult,
+    build_job_input,
+    build_runner_env,
+    filter_blocking_findings,
+)
 from runners.codex import FINAL_MESSAGE_FILE  # noqa: E402
 from runners.registry import Registry, RegistryError, load_registry  # noqa: E402
 
@@ -1612,15 +1618,19 @@ def run_review_agent(
         command = agent_command()
     else:
         command = resolved.command()
-    env = os.environ.copy()
-    env["AGENT_RUN_ID"] = run_dir.name
+    env = build_runner_env(
+        agent_registry().defaults["env_allowlist"],
+        os.environ,
+        overrides={"AGENT_RUN_ID": run_dir.name},
+    )
     if command and command[0] == "dsh" and resolved.sandbox == "read-only":
         env["DSH_PERMISSION_MODE"] = "read-only"
+    runner_prompt = resolved.runner.render_prompt(job_input)
 
     started = time.monotonic()
     try:
         returncode, stdout = run_agent_streaming(
-            command, prompt, os.getcwd(), env, timeout_minutes * 60, run_dir,
+            command, runner_prompt, os.getcwd(), env, timeout_minutes * 60, run_dir,
             role=role, details=details, stdout_path=stdout_path,
         )
     except subprocess.TimeoutExpired:
@@ -1884,9 +1894,12 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
             text = VERDICT_PATTERN.sub(
                 f"## Verdict: {unified.verdict}", text
             )
-    if unified is not None and unified.findings and not parse_p1_blockers(text):
+    blocking_findings = (
+        filter_blocking_findings(unified.findings) if unified is not None else []
+    )
+    if blocking_findings and not parse_p1_blockers(text):
         text = text.rstrip() + "\n\n## Blockers (P1)\n\n" + "\n".join(
-            f"- {finding}" for finding in unified.findings
+            f"- {finding}" for finding in blocking_findings
         ) + "\n"
     verdict = (
         unified.verdict

@@ -4,8 +4,8 @@ version: 1
 
 defaults:
   timeout_seconds: 1800
-  # Phase 1a metadata: registry.py validates this allowlist, but the dispatcher
-  # does not filter the child environment yet (deferred to a later phase).
+  # run_review_agent builds the runner env from this allowlist; build_runner_env
+  # always keeps PATH/HOME/LANG/TMPDIR so the CLI can start.
   env_allowlist:
     - DEEPSEEK_API_KEY
     - AGENT_RUN_ID
