@@ -100,6 +100,15 @@ class ConfigLoadTests(unittest.TestCase):
         text = registry.DEFAULT_CONFIG.read_text(encoding="utf-8")
         with mock.patch.object(registry, "_yaml", None):
             self.assertEqual(registry.load_config(), registry.parse_simple_yaml(text))
+            fallback = registry.load_registry()
+        self.assertEqual(
+            fallback.runners["dsh"].spec.command,
+            ("dsh", "--profile", "headless", "--json"),
+        )
+        self.assertEqual(
+            fallback.resolve("reviewer", {"REVIEWER_RUNNER": "codex"}).runner_name,
+            "codex",
+        )
 
     def test_malformed_registry_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
