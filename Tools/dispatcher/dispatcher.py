@@ -22,6 +22,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
@@ -70,6 +73,15 @@ TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
 STATE_ROOT = Path(".agent/state")
+LOOP_ROOT = Path(".agent/loops")
+LOOP_ENV_ID = "DISPATCHER_LOOP_ID"
+LOOP_ENV_TIMELINE = "DISPATCHER_LOOP_TIMELINE"
+AGENT_ROLE_STEPS = {
+    "implementer": "dispatch",
+    "reviewer": "review",
+    "repair": "repair",
+    "planner": "planner",
+}
 
 # gh pr list window for the review rotation. It must stay comfortably above
 # the number of concurrently open ai/* PRs so the cursor can reach every
@@ -155,6 +167,136 @@ def now_iso() -> str:
 
 def make_run_id(issue: int) -> str:
     return f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{issue}"
+
+
+def make_loop_id() -> str:
+    """UTC sortable timestamp plus a short random suffix, unique per run."""
+    return f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def duration_ms_since(started: float) -> int:
+    return max(0, int(round((time.monotonic() - started) * 1000)))
+
+
+def error_summary(error: BaseException) -> str:
+    message = str(error).strip()
+    name = type(error).__name__
+    return f"{name}: {message}"[:300] if message else name
+
+
+class StepScope:
+    """Mutable outcome of a traced step; failures can be recorded without raising."""
+
+    def __init__(self) -> None:
+        self.status = "ok"
+        self.error = ""
+
+    def fail(self, reason: str = "") -> None:
+        self.status = "failed"
+        if reason and not self.error:
+            self.error = reason[:300]
+
+
+class LoopTrace:
+    """Append-only JSONL timeline for one dispatcher loop."""
+
+    def __init__(
+        self,
+        loop_id: str | None = None,
+        *,
+        root: Path | None = None,
+        path: Path | None = None,
+    ) -> None:
+        self.loop_id = loop_id or make_loop_id()
+        self.root = Path(root) if root is not None else LOOP_ROOT
+        self.path = Path(path) if path is not None else self.root / self.loop_id / "timeline.jsonl"
+        self.started_at = time.monotonic()
+        self.failed = False
+        self.skipped = False
+        self.error = ""
+
+    def emit(
+        self,
+        event: str,
+        *,
+        step: str = "",
+        status: str = "ok",
+        duration_ms: int = 0,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append one event and flush immediately; a trace failure never breaks the run."""
+        record = {
+            "ts": now_iso(),
+            "loop_id": self.loop_id,
+            "event": event,
+            "step": step,
+            "status": status,
+            "duration_ms": int(duration_ms),
+            "details": details or {},
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                handle.flush()
+        except (OSError, TypeError, ValueError) as error:
+            print(f"loop trace 写入失败：{error}", file=sys.stderr)
+        return record
+
+    def elapsed_ms(self) -> int:
+        return duration_ms_since(self.started_at)
+
+    def fail(self, error: BaseException) -> None:
+        self.failed = True
+        self.error = error_summary(error)
+
+    def finish(self, status: str | None = None) -> None:
+        if status is None:
+            status = "failed" if self.failed else ("skipped" if self.skipped else "ok")
+        details = {"error": self.error} if self.error else {}
+        self.emit("loop_end", status=status, duration_ms=self.elapsed_ms(), details=details)
+
+    @contextmanager
+    def step(self, step: str, **details: Any):
+        """Trace one phase; exceptions are recorded, then re-raised unchanged."""
+        started = time.monotonic()
+        self.emit("step_start", step=step, details=details)
+        scope = StepScope()
+        try:
+            yield scope
+        except BaseException as error:
+            scope.status = "failed"
+            scope.error = error_summary(error)
+            raise
+        finally:
+            payload = dict(details)
+            if scope.error:
+                payload["error"] = scope.error
+            if scope.status == "failed":
+                self.failed = True
+            self.emit(
+                "step_end",
+                step=step,
+                status=scope.status,
+                duration_ms=duration_ms_since(started),
+                details=payload,
+            )
+
+
+_ACTIVE_TRACE: LoopTrace | None = None
+
+
+def active_trace() -> LoopTrace | None:
+    return _ACTIVE_TRACE
+
+
+def trace_from_env() -> LoopTrace | None:
+    """Reattach to the parent cmd_run timeline when running as a child process."""
+    loop_id = os.environ.get(LOOP_ENV_ID, "")
+    timeline = os.environ.get(LOOP_ENV_TIMELINE, "")
+    if not loop_id or not timeline:
+        return None
+    return LoopTrace(loop_id=loop_id, path=Path(timeline))
 
 
 def slugify(title: str, limit: int = 40) -> str:
@@ -779,74 +921,124 @@ def _scan_final_event(path: Path, offset: int, pending: str) -> tuple[int, str, 
 def run_agent_streaming(
     command: list[str], prompt: str, cwd: str, env: dict[str, str],
     timeout_seconds: int, run_dir: Path,
+    *,
+    role: str = "",
+    details: dict[str, Any] | None = None,
+    trace: LoopTrace | None = None,
 ) -> tuple[int, str]:
     """Run an agent, streaming logs, and stop shortly after a final event.
 
     A final event is successful completion: the child is killed to release a
-    hung dsh process, so its SIGKILL return code is not propagated.
+    hung dsh process, so its SIGKILL return code is not propagated. When a loop
+    trace is active (or passed explicitly) and ``role`` is set, agent_start /
+    agent_end events record the child pid, duration and exit code.
     """
     import threading
     import time
 
+    tracer = trace if trace is not None else active_trace()
+    agent_details = dict(details or {})
+    agent_step = AGENT_ROLE_STEPS.get(role, "")
     run_dir.mkdir(parents=True, exist_ok=True)
     out_path = run_dir / "agent.log"
-    with out_path.open("w", encoding="utf-8") as out:
-        proc = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=out, stderr=out,
-            text=True, cwd=cwd, env=env,
-        )
+    proc: subprocess.Popen[str] | None = None
+    started = time.monotonic()
+    try:
+        with out_path.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=out, stderr=out,
+                text=True, cwd=cwd, env=env,
+            )
+            started = time.monotonic()
+            if tracer is not None and role:
+                tracer.emit(
+                    "agent_start",
+                    step=agent_step,
+                    details={**agent_details, "role": role, "pid": proc.pid},
+                )
 
-        def feed() -> None:
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.write(prompt)
-                    proc.stdin.close()
-            except Exception:
-                # A dead child or a non-UTF-8 locale must not leave stdin open.
+            def feed() -> None:
                 try:
                     if proc.stdin is not None:
+                        proc.stdin.write(prompt)
                         proc.stdin.close()
                 except Exception:
-                    pass
+                    # A dead child or a non-UTF-8 locale must not leave stdin open.
+                    try:
+                        if proc.stdin is not None:
+                            proc.stdin.close()
+                    except Exception:
+                        pass
 
-        threading.Thread(target=feed, daemon=True).start()
-        deadline = time.monotonic() + timeout_seconds
-        final_seen_at: float | None = None
-        offset = 0
-        pending = ""
-        try:
-            while True:
-                offset, pending, found = _scan_final_event(out_path, offset, pending)
-                if found and final_seen_at is None:
-                    # Backdate one poll and reserve a scheduler/kill margin so
-                    # the child still exits inside the ticket's 2s SLA.
-                    final_seen_at = time.monotonic() - AGENT_POLL_SECONDS
-                if final_seen_at is not None:
-                    kill_at = (
-                        final_seen_at
-                        + FINAL_EVENT_GRACE_SECONDS
-                        - FINAL_EVENT_KILL_MARGIN_SECONDS
-                    )
-                    if time.monotonic() >= kill_at:
-                        proc.kill()
-                        break
-                if proc.poll() is not None:
-                    break
-                if final_seen_at is None and time.monotonic() > deadline:
-                    raise subprocess.TimeoutExpired(command, timeout_seconds)
-                time.sleep(AGENT_POLL_SECONDS)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
+            threading.Thread(target=feed, daemon=True).start()
+            deadline = time.monotonic() + timeout_seconds
+            final_seen_at: float | None = None
+            offset = 0
+            pending = ""
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-    content = out_path.read_text(encoding="utf-8")
-    if final_seen_at is not None:
-        return 0, content
-    return proc.returncode if proc.returncode is not None else 1, content
+                while True:
+                    offset, pending, found = _scan_final_event(out_path, offset, pending)
+                    if found and final_seen_at is None:
+                        # Backdate one poll and reserve a scheduler/kill margin so
+                        # the child still exits inside the ticket's 2s SLA.
+                        final_seen_at = time.monotonic() - AGENT_POLL_SECONDS
+                    if final_seen_at is not None:
+                        kill_at = (
+                            final_seen_at
+                            + FINAL_EVENT_GRACE_SECONDS
+                            - FINAL_EVENT_KILL_MARGIN_SECONDS
+                        )
+                        if time.monotonic() >= kill_at:
+                            proc.kill()
+                            break
+                    if proc.poll() is not None:
+                        break
+                    if final_seen_at is None and time.monotonic() > deadline:
+                        raise subprocess.TimeoutExpired(command, timeout_seconds)
+                    time.sleep(AGENT_POLL_SECONDS)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        content = out_path.read_text(encoding="utf-8")
+        if final_seen_at is not None:
+            returncode = 0
+        else:
+            returncode = proc.returncode if proc.returncode is not None else 1
+        if tracer is not None and role:
+            tracer.emit(
+                "agent_end",
+                step=agent_step,
+                status="ok" if returncode == 0 else "failed",
+                duration_ms=duration_ms_since(started),
+                details={
+                    **agent_details,
+                    "role": role,
+                    "pid": proc.pid,
+                    "exit_code": returncode,
+                },
+            )
+        return returncode, content
+    except BaseException as error:
+        if proc is not None and tracer is not None and role:
+            tracer.emit(
+                "agent_end",
+                step=agent_step,
+                status="failed",
+                duration_ms=duration_ms_since(started),
+                details={
+                    **agent_details,
+                    "role": role,
+                    "pid": proc.pid,
+                    "exit_code": proc.returncode,
+                    "error": error_summary(error),
+                },
+            )
+        raise
 
 
 def cmd_once(args: argparse.Namespace) -> int:
@@ -935,7 +1127,8 @@ def cmd_once(args: argparse.Namespace) -> int:
     command = agent_command()
     try:
         returncode, _stdout = run_agent_streaming(
-            command, prompt, str(worktree), env, timeout_seconds, run_dir
+            command, prompt, str(worktree), env, timeout_seconds, run_dir,
+            role="implementer", details={"issue": number},
         )
         agent_failed = returncode != 0
     except subprocess.TimeoutExpired:
@@ -1078,7 +1271,10 @@ def agent_text(output: str) -> str:
     return "\n".join(final) if final else output
 
 
-def run_review_agent(prompt: str, run_dir: Path, timeout_minutes: int) -> tuple[str, int]:
+def run_review_agent(
+    prompt: str, run_dir: Path, timeout_minutes: int,
+    *, role: str = "reviewer", details: dict[str, Any] | None = None,
+) -> tuple[str, int]:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
     load_agent_secrets()
@@ -1091,7 +1287,8 @@ def run_review_agent(prompt: str, run_dir: Path, timeout_minutes: int) -> tuple[
 
     try:
         returncode, stdout = run_agent_streaming(
-            command, prompt, os.getcwd(), env, timeout_minutes * 60, run_dir
+            command, prompt, os.getcwd(), env, timeout_minutes * 60, run_dir,
+            role=role, details=details,
         )
     except subprocess.TimeoutExpired:
         return "reviewer timeout", 1
@@ -1271,7 +1468,9 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     prompt += f"\n\n---\n\n# Dispatcher 独立测试（read-only worktree）\n\n{test_evidence}\n"
 
     run_dir = RUN_ROOT / f"review-{args.pr}"
-    text, code = run_review_agent(prompt, run_dir, args.timeout)
+    text, code = run_review_agent(
+        prompt, run_dir, args.timeout, details={"pr": args.pr}
+    )
     verdict = parse_verdict(text)
     print(f"verdict  {verdict or 'MISSING'} (exit={code})")
     print(f"tests    {test_passed if test_passed is not None else 'not-run'}")
@@ -1606,7 +1805,10 @@ def _cmd_repair_locked(args: argparse.Namespace) -> int:
 
     try:
         update_repair_heartbeat(args.pr, status="agent-running")
-        run_agent_streaming(command, prompt, str(worktree), env, args.timeout * 60, run_dir)
+        run_agent_streaming(
+            command, prompt, str(worktree), env, args.timeout * 60, run_dir,
+            role="repair", details={"pr": args.pr}, trace=trace_from_env(),
+        )
     except subprocess.TimeoutExpired:
         set_status(issue_number, "status:blocked")
         update_repair_heartbeat(args.pr, status="timeout")
@@ -2161,7 +2363,7 @@ def cmd_planner(args: argparse.Namespace) -> int:
         print("\n(dry-run) 未调用 Planner Agent、未写入 GitHub；加 --execute 执行。")
         return 0
     try:
-        text, code = run_review_agent(prompt, run_dir, args.timeout)
+        text, code = run_review_agent(prompt, run_dir, args.timeout, role="planner")
     except OSError as error:
         return _planner_failed(state, f"Planner 运行失败：{error}", run_dir)
     if code != 0:
@@ -2256,6 +2458,156 @@ def reap_worktrees(_args: argparse.Namespace | None = None) -> None:
             run(["git", "worktree", "remove", str(path), "--force"])
 
 
+def read_timeline(path: Path) -> list[dict[str, Any]]:
+    """Read a JSONL timeline, ignoring partial or corrupt lines."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def format_duration(duration_ms: int) -> str:
+    if duration_ms < 1000:
+        return f"{duration_ms}ms"
+    seconds = duration_ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(int(round(seconds)), 60)
+    return f"{minutes}m{remainder}s"
+
+
+def summarize_loop(path: Path) -> dict[str, Any]:
+    """Summarize one timeline for ``loop list`` and ``observe``."""
+    events = read_timeline(path)
+    start_ts = next(
+        (str(event.get("ts")) for event in events
+         if event.get("event") == "loop_start" and event.get("ts")),
+        "",
+    )
+    end_event = next(
+        (event for event in reversed(events) if event.get("event") == "loop_end"),
+        None,
+    )
+    if end_event is not None:
+        status = str(end_event.get("status") or "ok")
+        raw_duration = end_event.get("duration_ms")
+        duration = raw_duration if isinstance(raw_duration, int) else 0
+    else:
+        status = "running"
+        started = _parse_timestamp(start_ts)
+        if started is None:
+            duration = 0
+        else:
+            duration = max(
+                0, int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            )
+    steps: dict[str, str] = {}
+    for event in events:
+        step = event.get("step")
+        if not isinstance(step, str) or not step:
+            continue
+        if event.get("event") == "step_start":
+            steps[step] = "running"
+        elif event.get("event") == "step_end":
+            steps[step] = str(event.get("status") or "ok")
+    return {
+        "loop_id": path.parent.name,
+        "start": start_ts,
+        "duration_ms": duration,
+        "status": status,
+        "steps": steps,
+    }
+
+
+def iter_loop_timelines() -> list[Path]:
+    """Newest loop first; loop ids start with a sortable UTC timestamp."""
+    paths = list(LOOP_ROOT.glob("*/timeline.jsonl"))
+    return sorted(paths, key=lambda path: path.parent.name, reverse=True)
+
+
+def format_loop_steps(steps: dict[str, str]) -> str:
+    return ",".join(f"{name}:{status}" for name, status in steps.items()) or "-"
+
+
+def cmd_loop_list(args: argparse.Namespace) -> int:
+    limit = max(1, int(getattr(args, "limit", 20)))
+    rows = [summarize_loop(path) for path in iter_loop_timelines()[:limit]]
+    if not rows:
+        print("loop list: 暂无记录")
+        return 0
+    print(f"{'loop_id':<26} {'start':<21} {'duration':>9} {'status':<8} steps")
+    for row in rows:
+        print(
+            f"{row['loop_id']:<26} {row['start'] or '-':<21} "
+            f"{format_duration(row['duration_ms']):>9} {row['status']:<8} "
+            f"{format_loop_steps(row['steps'])}"
+        )
+    return 0
+
+
+def cmd_loop_show(args: argparse.Namespace) -> int:
+    loop_id = str(getattr(args, "loop_id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", loop_id):
+        print(f"⛔ 未找到 loop：{loop_id}")
+        return 1
+    path = LOOP_ROOT / loop_id / "timeline.jsonl"
+    events = read_timeline(path) if path.is_file() else []
+    if not events:
+        print(f"⛔ 未找到 loop：{loop_id}")
+        return 1
+    row = summarize_loop(path)
+    print(f"loop     {row['loop_id']}")
+    print(f"start    {row['start'] or '-'}")
+    print(f"duration {format_duration(row['duration_ms'])}")
+    print(f"status   {row['status']}")
+    print("")
+    for event in events:
+        duration = event.get("duration_ms")
+        duration = duration if isinstance(duration, int) else 0
+        details = event.get("details") or {}
+        details_text = json.dumps(details, ensure_ascii=False, sort_keys=True) if details else ""
+        print(
+            f"{str(event.get('ts') or '-'):<21} {str(event.get('event') or '?'):<11} "
+            f"{str(event.get('step') or '-'):<10} {str(event.get('status') or '-'):<8} "
+            f"{duration:>7}ms  {details_text}"
+        )
+    print("")
+    print("steps:")
+    for step, status in row["steps"].items():
+        step_events = [
+            event for event in events
+            if event.get("event") == "step_end" and event.get("step") == step
+        ]
+        raw_duration = step_events[-1].get("duration_ms", 0) if step_events else 0
+        duration = raw_duration if isinstance(raw_duration, int) else 0
+        print(f"  {step:<10} {duration:>7}ms  {status}")
+    return 0
+
+
+def cmd_loop(args: argparse.Namespace) -> int:
+    if args.loop_command == "list":
+        return cmd_loop_list(args)
+    return cmd_loop_show(args)
+
+
 def cmd_observe(args: argparse.Namespace) -> int:
     """本地实时观测：launchd、agent、PR、最后日志。"""
     import time
@@ -2279,6 +2631,18 @@ def cmd_observe(args: argparse.Namespace) -> int:
         for pr in prs:
             labels = ",".join(item["name"] for item in pr.get("labels", []))
             print(f"PR #{pr['number']} {pr['title'][:50]} [{labels}]")
+        loops = [summarize_loop(path) for path in iter_loop_timelines()[:3]]
+        if loops:
+            print("loops")
+            for row in loops:
+                marker = "▶" if row["status"] == "running" else " "
+                print(
+                    f" {marker} {row['loop_id']} {row['status']:<8} "
+                    f"{format_duration(row['duration_ms']):>8} "
+                    f"{format_loop_steps(row['steps'])}"
+                )
+        else:
+            print("loops    none")
         runs = sorted(RUN_ROOT.glob("*/agent.log"), key=lambda p: p.stat().st_mtime, reverse=True)
         if runs:
             print(f"log {runs[0]}")
@@ -2319,6 +2683,23 @@ def rotate_from_cursor(prs: list[dict[str, Any]], cursor: int) -> list[dict[str,
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    """Run one sweep and persist its Loop Trace timeline."""
+    trace = LoopTrace()
+    trace.emit("loop_start", details={"dry_run": bool(args.dry_run)})
+    global _ACTIVE_TRACE
+    previous_trace = _ACTIVE_TRACE
+    _ACTIVE_TRACE = trace
+    try:
+        return _run_loop_phases(args, trace)
+    except BaseException as error:
+        trace.fail(error)
+        raise
+    finally:
+        _ACTIVE_TRACE = previous_trace
+        trace.finish()
+
+
+def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
     state_dir = STATE_ROOT
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "dispatcher.lock"
@@ -2327,164 +2708,182 @@ def cmd_run(args: argparse.Namespace) -> int:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print("另一个 Dispatcher 正在运行，跳过本轮")
+        trace.skipped = True
         return 0
 
     try:
         if not args.dry_run:
             cleanup_stale_repair_state()
-        cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
-        if not args.dry_run:
-            reap_worktrees()
-        cmd_watch(argparse.Namespace(dry_run=args.dry_run))
+        with trace.step("postmerge"):
+            cmd_postmerge(argparse.Namespace(dry_run=args.dry_run))
+            if not args.dry_run:
+                reap_worktrees()
+        with trace.step("watch"):
+            cmd_watch(argparse.Namespace(dry_run=args.dry_run))
 
-        prs = gh_json(
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--limit",
-                str(OPEN_PR_LIMIT),
-                "--json",
-                "number,body,headRefName,isDraft",
-            ]
-        )
-        for pr in prs:
-            if not pr.get("headRefName", "").startswith("ai/"):
-                continue
-            issue_number = extract_issue_number(pr)
-            if issue_number is None:
-                continue
-            try:
-                linked = issue_detail(issue_number)
-            except SystemExit:
-                continue
-            if "status:in-progress" not in labels_of(linked):
-                continue
-            detail = pr_detail(pr["number"])
-            _, verdict, feedback = last_review(detail)
-            if verdict == "REQUEST_CHANGES" and review_has_p1(feedback):
-                number = pr["number"]
-                print(f"repair PR #{number} (issue #{issue_number}) [background]")
-                if args.dry_run:
-                    continue
-                RUN_ROOT.mkdir(parents=True, exist_ok=True)
-                log_path = RUN_ROOT / f"repair-{number}.out"
-                try:
-                    with log_path.open("a", encoding="utf-8") as log:
-                        log.write(
-                            f"\n=== {datetime.now(timezone.utc).isoformat()} "
-                            f"dispatcher repair sweep ===\n"
-                        )
-                        proc = subprocess.Popen(
-                            [sys.executable, str(Path(__file__).resolve()), "repair",
-                             "--pr", str(number), "--execute", "--timeout", str(args.timeout)],
-                            stdout=log, stderr=log, start_new_session=True,
-                        )
-                except OSError as error:
-                    print(f"⛔ 启动 repair 失败：{error}")
-                    continue
-                try:
-                    repair_state = write_repair_state(number, proc.pid, str(log_path))
-                except (OSError, TypeError, ValueError) as error:
-                    repair_state = f"<写入失败：{error}>"
-                print(
-                    f"repair PR #{number} 已在后台启动 pid={proc.pid} "
-                    f"log={log_path} state={repair_state}"
-                )
-                # One background repair per sweep keeps the host from running
-                # many 90-minute full-access agents (and git operations) at once.
-                break
-
-        ready = sorted(list_issues("status:ready"), key=lambda issue: (priority_rank(issue), issue["number"]))
-        for issue in ready:
-            failures = validate(issue)
-            if failures:
-                print(f"DoR failed #{issue['number']}: {'; '.join(failures)}")
-                if not args.dry_run:
-                    flag_dor(issue, failures)
-                continue
-            if "ai:needs-human-decision" in labels_of(issue) and not args.dry_run:
-                gh(["issue", "edit", str(issue["number"]), "--remove-label", "ai:needs-human-decision"])
-            print(f"dispatch #{issue['number']} {issue['title']}")
-            cmd_once(
-                argparse.Namespace(
-                    issue=issue["number"],
-                    execute=not args.dry_run,
-                    timeout=args.timeout,
-                )
+        with trace.step("repair") as phase:
+            prs = gh_json(
+                [
+                    "pr",
+                    "list",
+                    "--state",
+                    "open",
+                    "--limit",
+                    str(OPEN_PR_LIMIT),
+                    "--json",
+                    "number,body,headRefName,isDraft",
+                ]
             )
-            break
-
-        prs = gh_json(
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--limit",
-                str(OPEN_PR_LIMIT),
-                "--json",
-                "number,body,headRefName,isDraft,createdAt",
-            ]
-        )
-        prs = rotate_from_cursor(prs, _read_review_cursor())
-
-        for pr in prs:
-            if pr.get("isDraft") or not pr.get("headRefName", "").startswith("ai/"):
-                continue
-            issue_number = extract_issue_number(pr)
-            if issue_number is None:
-                continue
-            try:
-                issue = issue_detail(issue_number)
-            except SystemExit:
-                continue
-            labels = labels_of(issue)
-            if "status:in-review" not in labels:
-                if "status:in-progress" not in labels:
+            for pr in prs:
+                if not pr.get("headRefName", "").startswith("ai/"):
                     continue
-                created_at = pr.get("createdAt")
-                if not isinstance(created_at, str) or not created_at:
+                issue_number = extract_issue_number(pr)
+                if issue_number is None:
                     continue
                 try:
-                    age = age_minutes(created_at)
-                except ValueError:
-                    continue
-                try:
-                    detail = pr_detail(pr["number"])
+                    linked = issue_detail(issue_number)
                 except SystemExit:
                     continue
-                sha, verdict, _ = last_review(detail)
-                has_review = verdict is not None and sha == detail.get("headRefOid")
-                if not should_auto_review(labels, has_review, age):
+                if "status:in-progress" not in labels_of(linked):
                     continue
-                print(f"fallback review PR #{pr['number']} (in-progress, no current-head review)")
-            print(f"review PR #{pr['number']} (issue #{issue_number})")
-            code = cmd_review(
-                argparse.Namespace(
-                    pr=pr["number"],
-                    execute=not args.dry_run,
-                    timeout=args.timeout,
-                )
+                detail = pr_detail(pr["number"])
+                _, verdict, feedback = last_review(detail)
+                if verdict == "REQUEST_CHANGES" and review_has_p1(feedback):
+                    number = pr["number"]
+                    print(f"repair PR #{number} (issue #{issue_number}) [background]")
+                    if args.dry_run:
+                        continue
+                    RUN_ROOT.mkdir(parents=True, exist_ok=True)
+                    log_path = RUN_ROOT / f"repair-{number}.out"
+                    child_env = os.environ.copy()
+                    child_env[LOOP_ENV_ID] = trace.loop_id
+                    child_env[LOOP_ENV_TIMELINE] = str(trace.path.resolve())
+                    try:
+                        with log_path.open("a", encoding="utf-8") as log:
+                            log.write(
+                                f"\n=== {datetime.now(timezone.utc).isoformat()} "
+                                f"dispatcher repair sweep ===\n"
+                            )
+                            proc = subprocess.Popen(
+                                [sys.executable, str(Path(__file__).resolve()), "repair",
+                                 "--pr", str(number), "--execute", "--timeout", str(args.timeout)],
+                                stdout=log, stderr=log, start_new_session=True, env=child_env,
+                            )
+                    except OSError as error:
+                        print(f"⛔ 启动 repair 失败：{error}")
+                        phase.fail(f"repair PR #{number} 启动失败：{error}")
+                        continue
+                    try:
+                        repair_state = write_repair_state(number, proc.pid, str(log_path))
+                    except (OSError, TypeError, ValueError) as error:
+                        repair_state = f"<写入失败：{error}>"
+                    print(
+                        f"repair PR #{number} 已在后台启动 pid={proc.pid} "
+                        f"log={log_path} state={repair_state}"
+                    )
+                    # One background repair per sweep keeps the host from running
+                    # many 90-minute full-access agents (and git operations) at once.
+                    break
+
+        with trace.step("dispatch") as phase:
+            ready = sorted(
+                list_issues("status:ready"),
+                key=lambda issue: (priority_rank(issue), issue["number"]),
             )
-            if code == EXIT_LOCK_BUSY:
-                # This PR already has a review running; try the next one.
-                # Do not advance the cursor: the PR was never reviewed.
-                continue
-            if not args.dry_run:
-                _write_review_cursor(pr["number"])
-            break
+            for issue in ready:
+                failures = validate(issue)
+                if failures:
+                    print(f"DoR failed #{issue['number']}: {'; '.join(failures)}")
+                    if not args.dry_run:
+                        flag_dor(issue, failures)
+                    continue
+                if "ai:needs-human-decision" in labels_of(issue) and not args.dry_run:
+                    gh(["issue", "edit", str(issue["number"]), "--remove-label", "ai:needs-human-decision"])
+                print(f"dispatch #{issue['number']} {issue['title']}")
+                code = cmd_once(
+                    argparse.Namespace(
+                        issue=issue["number"],
+                        execute=not args.dry_run,
+                        timeout=args.timeout,
+                    )
+                )
+                if code != 0:
+                    phase.fail(f"dispatch #{issue['number']} exit={code}")
+                break
+
+        with trace.step("review"):
+            prs = gh_json(
+                [
+                    "pr",
+                    "list",
+                    "--state",
+                    "open",
+                    "--limit",
+                    str(OPEN_PR_LIMIT),
+                    "--json",
+                    "number,body,headRefName,isDraft,createdAt",
+                ]
+            )
+            prs = rotate_from_cursor(prs, _read_review_cursor())
+
+            for pr in prs:
+                if pr.get("isDraft") or not pr.get("headRefName", "").startswith("ai/"):
+                    continue
+                issue_number = extract_issue_number(pr)
+                if issue_number is None:
+                    continue
+                try:
+                    issue = issue_detail(issue_number)
+                except SystemExit:
+                    continue
+                labels = labels_of(issue)
+                if "status:in-review" not in labels:
+                    if "status:in-progress" not in labels:
+                        continue
+                    created_at = pr.get("createdAt")
+                    if not isinstance(created_at, str) or not created_at:
+                        continue
+                    try:
+                        age = age_minutes(created_at)
+                    except ValueError:
+                        continue
+                    try:
+                        detail = pr_detail(pr["number"])
+                    except SystemExit:
+                        continue
+                    sha, verdict, _ = last_review(detail)
+                    has_review = verdict is not None and sha == detail.get("headRefOid")
+                    if not should_auto_review(labels, has_review, age):
+                        continue
+                    print(f"fallback review PR #{pr['number']} (in-progress, no current-head review)")
+                print(f"review PR #{pr['number']} (issue #{issue_number})")
+                code = cmd_review(
+                    argparse.Namespace(
+                        pr=pr["number"],
+                        execute=not args.dry_run,
+                        timeout=args.timeout,
+                    )
+                )
+                if code == EXIT_LOCK_BUSY:
+                    # This PR already has a review running; try the next one.
+                    # Do not advance the cursor: the PR was never reviewed.
+                    continue
+                if not args.dry_run:
+                    _write_review_cursor(pr["number"])
+                break
 
         # 只有完全空闲时才让 Planner 选题；每轮最多创建 1 张，下一轮才会被派发。
-        try:
-            open_ai_prs = [pr for pr in prs if pr.get("headRefName", "").startswith("ai/")]
-            active = [issue for issue in list_issues() if labels_of(issue) & ACTIVE_STATUS]
-            ready_now = list_issues("status:ready")
-        except SystemExit as error:
-            print(f"planner: 无法读取仓库状态，跳过本轮（{error}）")
-        else:
-            maybe_run_planner(args, ready_now, open_ai_prs, active)
+        with trace.step("planner") as phase:
+            try:
+                open_ai_prs = [pr for pr in prs if pr.get("headRefName", "").startswith("ai/")]
+                active = [issue for issue in list_issues() if labels_of(issue) & ACTIVE_STATUS]
+                ready_now = list_issues("status:ready")
+            except SystemExit as error:
+                print(f"planner: 无法读取仓库状态，跳过本轮（{error}）")
+            else:
+                code = maybe_run_planner(args, ready_now, open_ai_prs, active)
+                if code != 0:
+                    phase.fail(f"planner exit={code}")
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
@@ -2528,6 +2927,13 @@ def main() -> int:
     observe_parser.add_argument("--watch", action="store_true")
     observe_parser.add_argument("--interval", type=int, default=2)
 
+    loop_parser = subparsers.add_parser("loop", help="查看 Loop Trace 时间线")
+    loop_subparsers = loop_parser.add_subparsers(dest="loop_command", required=True)
+    loop_list_parser = loop_subparsers.add_parser("list", help="列出最近的 loop")
+    loop_list_parser.add_argument("--limit", type=int, default=20, help="最多显示条数")
+    loop_show_parser = loop_subparsers.add_parser("show", help="显示一个 loop 的时间线")
+    loop_show_parser.add_argument("loop_id")
+
     run_parser = subparsers.add_parser("run", help="单次巡检：postmerge → dispatch → review → planner")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--timeout", type=int, default=90)
@@ -2556,6 +2962,8 @@ def main() -> int:
         return cmd_postmerge(args)
     if args.command == "planner":
         return cmd_planner(args)
+    if args.command == "loop":
+        return cmd_loop(args)
     if args.command == "observe":
         return cmd_observe(args)
     if args.command == "observe":

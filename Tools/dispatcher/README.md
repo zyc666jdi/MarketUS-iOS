@@ -133,4 +133,23 @@ python3 Tools/dispatcher/dispatcher.py observe
 python3 Tools/dispatcher/dispatcher.py observe --watch
 ```
 
-显示 launchd 状态、当前 agent/dispatcher PID 与耗时、open PR、最近 run 日志。
+显示 launchd 状态、当前 agent/dispatcher PID 与耗时、open PR、最近 loop 与 run 日志。
+
+
+## Loop Trace
+
+每次 `run` 生成一个 `loop_id`（UTC 时间戳 + 短 uuid），追加写入
+`.agent/loops/<loop_id>/timeline.jsonl`。事件为 JSONL，包含
+`ts / loop_id / event / step / status / duration_ms / details`，
+覆盖 `postmerge/watch/repair/dispatch/review/planner` 六个阶段；
+implementer/reviewer/repair 子进程额外记录 `agent_start` / `agent_end`
+（role、pid、exit_code、duration_ms）。单条事件失败不会中断调度。
+
+```bash
+# 最近 loop：id、开始时间、耗时、状态、步骤
+python3 Tools/dispatcher/dispatcher.py loop list
+python3 Tools/dispatcher/dispatcher.py loop list --limit 5
+
+# 单个 loop 的完整时间线与每步耗时
+python3 Tools/dispatcher/dispatcher.py loop show <loop_id>
+```
