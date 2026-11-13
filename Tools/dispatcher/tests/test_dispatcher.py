@@ -651,6 +651,7 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         *,
         test_passed: bool | None = True,
         comments: list[dict] | None = None,
+        agent_result=None,
     ):
         pr = {
             "number": 38,
@@ -666,6 +667,8 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         calls = []
 
         def fake_review_agent(_prompt, _run_dir, _timeout, **_kwargs):
+            if agent_result is not None:
+                return agent_result
             return (f"## Verdict: {verdict}\n{review_body}" if verdict else "no verdict", 0)
 
         old_cwd = os.getcwd()
@@ -702,6 +705,23 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         code, final, _ = self._review({"status:in-progress"}, None)
         self.assertEqual(code, 1)
         self.assertEqual(final, {"status:blocked"})
+
+    def test_structured_verdict_wins_over_quoted_markdown(self):
+        result = dispatcher.RunnerResult(
+            status="succeeded",
+            text=(
+                "## Verdict: REQUEST_CHANGES\n\n"
+                "## Blockers (P1)\n\n- quoted diff content\n"
+            ),
+            verdict="APPROVE",
+            findings=[],
+            returncode=0,
+        )
+        code, final, _ = self._review(
+            {"status:in-progress"}, "APPROVE", agent_result=result
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
 
     def test_approve_with_duplicate_status_labels_leaves_only_awaiting_human(self):
         code, final, _ = self._review({"status:in-progress", "status:in-review"}, "APPROVE")
@@ -820,6 +840,18 @@ class ReviewPolicyTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, dispatcher.REVIEW_POLICY)
+
+    def test_codex_contract_requires_final_sentinel(self):
+        for required in (
+            "marketus_review",
+            "```json",
+            "最后内容",
+            "APPROVE",
+            "REQUEST_CHANGES",
+            "findings",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, dispatcher.CODEX_REVIEW_CONTRACT)
 
 
 class SetStatusTests(unittest.TestCase):
@@ -1863,6 +1895,32 @@ class RunAgentStreamingTests(unittest.TestCase):
             self.assertEqual(returncode, 0)
             self.assertIn("last line", output)
             self.assertIn("last line", (run_dir / "agent.log").read_text(encoding="utf-8"))
+
+    def test_stdout_can_be_captured_separately_from_agent_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            stdout_path = run_dir / "agent.stdout"
+            returncode, output = dispatcher.run_agent_streaming(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; print('final message'); "
+                    "print('tool output', file=sys.stderr)",
+                ],
+                "prompt",
+                str(root),
+                os.environ.copy(),
+                30,
+                run_dir,
+                stdout_path=stdout_path,
+            )
+            self.assertEqual(returncode, 0)
+            self.assertIn("tool output", output)
+            self.assertNotIn("final message", output)
+            self.assertEqual(
+                stdout_path.read_text(encoding="utf-8"), "final message\n"
+            )
 
     def test_final_event_terminates_within_two_seconds_and_returns_zero(self):
         with tempfile.TemporaryDirectory() as tmp:

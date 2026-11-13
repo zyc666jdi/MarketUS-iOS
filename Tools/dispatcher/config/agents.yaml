@@ -1,0 +1,50 @@
+# Phase 1a runner registry. Parsed with PyYAML when installed, otherwise with
+# runners/registry.py's stdlib-only YAML subset parser.
+version: 1
+
+defaults:
+  timeout_seconds: 1800
+  # run_review_agent builds the runner env from this allowlist; build_runner_env
+  # always keeps PATH/HOME/LANG/TMPDIR so the CLI can start.
+  env_allowlist:
+    - DEEPSEEK_API_KEY
+    - AGENT_RUN_ID
+    - DSH_PERMISSION_MODE
+  sandbox: workspace-write
+
+runners:
+  dsh:
+    command: ["dsh", "--profile", "headless", "--json"]
+    output_format: ndjson
+    final_event: dsh_final
+  codex:
+    # The role sandbox is injected as --sandbox by runners/codex.py; do not
+    # hardcode workspace-write here or the reviewer loses read-only isolation.
+    command: ["codex", "exec", "-"]
+    output_format: text
+    final_event: json_result
+
+roles:
+  implementer:
+    runner: dsh
+    sandbox: workspace-write
+    prompt: .agent/prompts/implementer.md
+    capabilities: [read, write, commit, push, create_pull_request]
+  reviewer:
+    runner: dsh
+    runner_env: REVIEWER_RUNNER
+    # Read-only is a hard requirement: reviewer never edits the worktree or
+    # runs tests. run_review_tests executes them in a throwaway checkout.
+    sandbox: read-only
+    prompt: .agent/prompts/reviewer.md
+    capabilities: [read, comment, verdict]
+  repair:
+    runner: dsh
+    sandbox: workspace-write
+    prompt: .agent/prompts/implementer.md
+    capabilities: [read, write, commit, push]
+  planner:
+    runner: dsh
+    sandbox: read-only
+    prompt: Tools/dispatcher/prompts/planner.md
+    capabilities: [read, create_issue]
