@@ -143,11 +143,16 @@ def resolve_agent_role(role: str, env: dict[str, str] | None = None) -> Resolved
 
 
 def role_command(role: str) -> list[str]:
-    """Return the executable for a role; dsh keeps the legacy AGENT_CMD hook."""
+    """Return the argv for a role; dsh keeps the legacy AGENT_CMD hook.
+
+    Non-dsh runners get the role's effective sandbox, so a codex reviewer is
+    always invoked with ``--sandbox read-only``.
+    """
+
     resolved = resolve_agent_role(role)
     if resolved.runner_name == "dsh":
         return agent_command()
-    return resolved.runner.command()
+    return resolved.command()
 
 
 def secret_env_file() -> Path:
@@ -1573,10 +1578,10 @@ def run_review_agent(
     )
 
     load_agent_secrets()
-    command = agent_command() if resolved.runner_name == "dsh" else resolved.runner.command()
+    command = agent_command() if resolved.runner_name == "dsh" else resolved.command()
     env = os.environ.copy()
     env["AGENT_RUN_ID"] = run_dir.name
-    if command and command[0] == "dsh":
+    if command and command[0] == "dsh" and resolved.sandbox == "read-only":
         env["DSH_PERMISSION_MODE"] = "read-only"
 
     started = time.monotonic()

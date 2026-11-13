@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 SCHEMA_VERSION = 1
 STATUSES = ("succeeded", "failed", "timeout")
 VERDICTS = ("APPROVE", "REQUEST_CHANGES")
+SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 
 VERDICT_RE = re.compile(r"##\s*Verdict:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
 HEADING_RE = re.compile(r"^#{2,4}\s+(.+)$")
@@ -96,7 +97,7 @@ class Runner(Protocol):
 
     spec: RunnerSpec
 
-    def command(self) -> list[str]:
+    def command(self, sandbox: str | None = None) -> list[str]:
         ...
 
     def parse(self, stdout: str, *, returncode: int = 0, duration_ms: int = 0) -> RunnerResult:
@@ -105,11 +106,21 @@ class Runner(Protocol):
 
 @dataclass(frozen=True)
 class ResolvedRole:
-    """The concrete runner selected for a role after env overrides."""
+    """The concrete runner and effective sandbox selected for a role.
+
+    ``sandbox`` is the role's own declaration or ``defaults.sandbox`` when the
+    role does not declare one.  Build argv through :meth:`command` so adapters
+    that accept a sandbox flag (codex) cannot silently fall back to their
+    configured default.
+    """
 
     role: RoleSpec
     runner: Runner
     runner_name: str
+    sandbox: str
+
+    def command(self) -> list[str]:
+        return self.runner.command(self.sandbox)
 
 
 def build_job_input(

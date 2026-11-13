@@ -79,7 +79,8 @@ python3 Tools/dispatcher/dispatcher.py review --pr 18 --execute
 python3 Tools/dispatcher/dispatcher.py postmerge --dry-run
 ```
 
-Reviewer 以 `DSH_PERMISSION_MODE=read-only` 运行；因为是同一个 GitHub 账号，
+Reviewer 以只读沙箱运行：dsh 使用 `DSH_PERMISSION_MODE=read-only`，codex 使用
+`--sandbox read-only`；因为是同一个 GitHub 账号，
 GitHub 不允许 approve 自己的 PR，所以 Dispatcher 用 **评论 verdict + `merge:requested` 标签**
 表示通过，最终仍由人类合并。
 

@@ -1,5 +1,6 @@
 """Phase 1a tests: runner registry, parser adapters, and JSON contracts."""
 
+import dataclasses
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ if str(DISPATCHER_ROOT) not in sys.path:
 
 import dispatcher  # noqa: E402
 from runners import base, registry  # noqa: E402
+from runners.codex import CodexRunner  # noqa: E402
 
 INPUT_SCHEMA = DISPATCHER_ROOT / "schemas/input.schema.json"
 OUTPUT_SCHEMA = DISPATCHER_ROOT / "schemas/output.schema.json"
@@ -67,7 +69,10 @@ class ConfigLoadTests(unittest.TestCase):
         reg = registry.load_registry()
         self.assertEqual(reg.version, 1)
         self.assertEqual(reg.defaults["timeout_seconds"], 1800)
-        self.assertIn("DEEPSEEK_API_KEY", reg.defaults["env_allowlist"])
+        self.assertEqual(
+            reg.defaults["env_allowlist"],
+            ["DEEPSEEK_API_KEY", "AGENT_RUN_ID", "DSH_PERMISSION_MODE"],
+        )
         self.assertEqual(reg.defaults["sandbox"], "workspace-write")
         self.assertEqual(
             reg.runners["dsh"].spec.command,
@@ -75,10 +80,12 @@ class ConfigLoadTests(unittest.TestCase):
         )
         self.assertEqual(reg.runners["dsh"].spec.output_format, "ndjson")
         self.assertEqual(reg.runners["dsh"].spec.final_event, "dsh_final")
+        # Sandbox is a per-role decision; the codex command must not pin it.
         self.assertEqual(
             reg.runners["codex"].spec.command,
-            ("codex", "exec", "--sandbox", "workspace-write", "-"),
+            ("codex", "exec", "-"),
         )
+        self.assertNotIn("--sandbox", reg.runners["codex"].spec.command)
         self.assertEqual(reg.runners["codex"].spec.output_format, "text")
         self.assertEqual(reg.runners["codex"].spec.final_event, "json_result")
         self.assertEqual(
@@ -91,10 +98,16 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertEqual(reg.roles["reviewer"].prompt, ".agent/prompts/reviewer.md")
         self.assertEqual(reg.roles["reviewer"].runner_env, "REVIEWER_RUNNER")
         self.assertEqual(reg.roles["reviewer"].sandbox, "read-only")
+        self.assertEqual(reg.roles["implementer"].sandbox, "workspace-write")
+        self.assertEqual(reg.roles["repair"].sandbox, "workspace-write")
+        self.assertEqual(reg.roles["planner"].sandbox, "read-only")
         self.assertIn("create_pull_request", reg.roles["implementer"].capabilities)
         self.assertIn("verdict", reg.roles["reviewer"].capabilities)
         self.assertIn("commit", reg.roles["repair"].capabilities)
         self.assertIn("create_issue", reg.roles["planner"].capabilities)
+        # Tests run in dispatcher.run_review_tests, never inside the reviewer.
+        self.assertNotIn("run_tests", reg.roles["reviewer"].capabilities)
+        self.assertNotIn("write", reg.roles["reviewer"].capabilities)
 
     def test_stdlib_fallback_parses_same_config(self):
         text = registry.DEFAULT_CONFIG.read_text(encoding="utf-8")
@@ -117,6 +130,32 @@ class ConfigLoadTests(unittest.TestCase):
             with self.assertRaises(registry.RegistryError):
                 registry.load_registry(path)
 
+    def test_env_allowlist_and_sandbox_are_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agents.yaml"
+            path.write_text(
+                "version: 1\n"
+                "defaults:\n"
+                "  timeout_seconds: 60\n"
+                "  env_allowlist: DEEPSEEK_API_KEY\n"
+                "  sandbox: workspace-write\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(registry.RegistryError, "env_allowlist"):
+                registry.load_registry(path)
+
+            path.write_text(
+                "version: 1\n"
+                "defaults:\n"
+                "  timeout_seconds: 60\n"
+                "  env_allowlist:\n"
+                "    - DEEPSEEK_API_KEY\n"
+                "  sandbox: read-everything\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(registry.RegistryError, "defaults.sandbox"):
+                registry.load_registry(path)
+
 
 class RoleResolutionTests(unittest.TestCase):
     def setUp(self):
@@ -130,10 +169,27 @@ class RoleResolutionTests(unittest.TestCase):
     def test_reviewer_runner_override_selects_codex(self):
         resolved = self.reg.resolve("reviewer", {"REVIEWER_RUNNER": "codex"})
         self.assertEqual(resolved.runner_name, "codex")
-        self.assertEqual(
-            resolved.runner.command(),
-            ["codex", "exec", "--sandbox", "workspace-write", "-"],
-        )
+        self.assertEqual(resolved.sandbox, "read-only")
+        argv = resolved.command()
+        self.assertEqual(argv, ["codex", "exec", "--sandbox", "read-only", "-"])
+        self.assertIn("--sandbox", argv)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        self.assertNotIn("workspace-write", argv)
+
+    def test_codex_implementer_and_repair_resolve_workspace_write(self):
+        for role in ("implementer", "repair"):
+            with self.subTest(role=role):
+                registry_with_codex = registry.load_registry()
+                registry_with_codex.roles[role] = dataclasses.replace(
+                    registry_with_codex.roles[role], runner="codex"
+                )
+                resolved = registry_with_codex.resolve(role, {})
+                self.assertEqual(resolved.runner_name, "codex")
+                self.assertEqual(resolved.sandbox, "workspace-write")
+                self.assertEqual(
+                    resolved.command(),
+                    ["codex", "exec", "--sandbox", "workspace-write", "-"],
+                )
 
     def test_reviewer_runner_override_back_to_dsh(self):
         self.assertEqual(
@@ -145,13 +201,16 @@ class RoleResolutionTests(unittest.TestCase):
             self.reg.resolve("reviewer", {"REVIEWER_RUNNER": "claude"})
 
     def test_dispatcher_resolves_every_role_and_honours_override(self):
-        for role in ("implementer", "reviewer", "repair", "planner"):
-            with self.subTest(role=role):
-                self.assertEqual(dispatcher.resolve_agent_role(role).runner_name, "dsh")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for role in ("implementer", "reviewer", "repair", "planner"):
+                with self.subTest(role=role):
+                    self.assertEqual(
+                        dispatcher.resolve_agent_role(role).runner_name, "dsh"
+                    )
         with mock.patch.dict(os.environ, {"REVIEWER_RUNNER": "codex"}):
             self.assertEqual(
                 dispatcher.role_command("reviewer"),
-                ["codex", "exec", "--sandbox", "workspace-write", "-"],
+                ["codex", "exec", "--sandbox", "read-only", "-"],
             )
         with mock.patch.dict(os.environ, {"REVIEWER_RUNNER": ""}):
             with mock.patch.object(dispatcher, "agent_command", return_value=["dsh-x"]):
@@ -201,6 +260,55 @@ class DshParserTests(unittest.TestCase):
         result = self.runner.parse(stdout)
         self.assertEqual(result.verdict, "APPROVE")
         self.assertEqual(result.summary, "LGTM")
+
+
+class CodexCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = registry.load_registry().runners["codex"]
+
+    def test_sandbox_is_injected_before_prompt_marker(self):
+        self.assertEqual(
+            self.runner.command("read-only"),
+            ["codex", "exec", "--sandbox", "read-only", "-"],
+        )
+        self.assertEqual(
+            self.runner.command("workspace-write"),
+            ["codex", "exec", "--sandbox", "workspace-write", "-"],
+        )
+
+    def test_explicit_sandbox_flag_is_replaced_not_duplicated(self):
+        runner = CodexRunner(
+            base.RunnerSpec(
+                name="codex",
+                command=("codex", "exec", "--sandbox", "workspace-write", "-"),
+                output_format="text",
+                final_event="json_result",
+            )
+        )
+        argv = runner.command("read-only")
+        self.assertEqual(argv.count("--sandbox"), 1)
+        self.assertEqual(argv, ["codex", "exec", "--sandbox", "read-only", "-"])
+
+    def test_equals_form_is_replaced(self):
+        runner = CodexRunner(
+            base.RunnerSpec(
+                name="codex",
+                command=("codex", "exec", "--sandbox=workspace-write", "-"),
+                output_format="text",
+                final_event="json_result",
+            )
+        )
+        self.assertEqual(
+            runner.command("read-only"),
+            ["codex", "exec", "--sandbox=read-only", "-"],
+        )
+
+    def test_unknown_sandbox_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.runner.command("read-everything")
+
+    def test_no_sandbox_leaves_command_untouched(self):
+        self.assertEqual(self.runner.command(), ["codex", "exec", "-"])
 
 
 class CodexParserTests(unittest.TestCase):
@@ -326,8 +434,9 @@ class DispatcherIntegrationTests(unittest.TestCase):
             self.assertEqual((text, code), (stdout, 0))
             self.assertEqual(result.verdict, "REQUEST_CHANGES")
             self.assertEqual(stream.call_args.args[0], [
-                "codex", "exec", "--sandbox", "workspace-write", "-",
+                "codex", "exec", "--sandbox", "read-only", "-",
             ])
+            self.assertNotIn("workspace-write", stream.call_args.args[0])
             self.assertNotIn("DSH_PERMISSION_MODE", stream.call_args.args[3])
             input_payload = json.loads((run_dir / "input.json").read_text())
             output_payload = json.loads((run_dir / "result.json").read_text())

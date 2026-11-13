@@ -17,7 +17,7 @@ try:  # pragma: no cover - depends on the host environment
 except ImportError:  # pragma: no cover
     _yaml = None
 
-from .base import ResolvedRole, RoleSpec, Runner, RunnerSpec
+from .base import ResolvedRole, RoleSpec, Runner, RunnerSpec, SANDBOXES
 from .codex import CodexRunner
 from .dsh import DshRunner
 
@@ -227,8 +227,13 @@ class Registry:
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
             raise RegistryError(f"{path}: defaults.timeout_seconds must be a positive integer")
         _string_list(defaults.get("env_allowlist"), f"{path}: defaults.env_allowlist")
-        if not isinstance(defaults.get("sandbox"), str) or not defaults["sandbox"]:
+        default_sandbox = defaults.get("sandbox")
+        if not isinstance(default_sandbox, str) or not default_sandbox:
             raise RegistryError(f"{path}: defaults.sandbox must be a string")
+        if default_sandbox not in SANDBOXES:
+            raise RegistryError(
+                f"{path}: defaults.sandbox must be one of {list(SANDBOXES)}"
+            )
 
         runner_map = _mapping(data.get("runners"), f"{path}: runners")
         runners: dict[str, Runner] = {}
@@ -271,8 +276,13 @@ class Registry:
             if runner_env is not None and (not isinstance(runner_env, str) or not runner_env):
                 raise RegistryError(f"{where}.runner_env must be a non-empty string")
             sandbox = entry.get("sandbox")
-            if sandbox is not None and (not isinstance(sandbox, str) or not sandbox):
-                raise RegistryError(f"{where}.sandbox must be a non-empty string")
+            if sandbox is not None:
+                if not isinstance(sandbox, str) or not sandbox:
+                    raise RegistryError(f"{where}.sandbox must be a non-empty string")
+                if sandbox not in SANDBOXES:
+                    raise RegistryError(
+                        f"{where}.sandbox must be one of {list(SANDBOXES)}"
+                    )
             roles[name] = RoleSpec(
                 name=name,
                 runner=runner_name,
@@ -300,7 +310,13 @@ class Registry:
                         f"allowed: {sorted(self.runners)}"
                     )
                 runner_name = override
-        return ResolvedRole(role=spec, runner=self.runners[runner_name], runner_name=runner_name)
+        sandbox = spec.sandbox or self.defaults["sandbox"]
+        return ResolvedRole(
+            role=spec,
+            runner=self.runners[runner_name],
+            runner_name=runner_name,
+            sandbox=sandbox,
+        )
 
 
 def load_registry(path: Path | str | None = None) -> Registry:

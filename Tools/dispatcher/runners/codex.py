@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from .base import RunnerResult, RunnerSpec, build_result
+from .base import SANDBOXES, RunnerResult, RunnerSpec, build_result
 
 FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 TAG_RE = re.compile(r"<json_result>\s*(\{.*?\})\s*</json_result>", re.DOTALL)
@@ -59,8 +59,36 @@ class CodexRunner:
     def __init__(self, spec: RunnerSpec) -> None:
         self.spec = spec
 
-    def command(self) -> list[str]:
-        return list(self.spec.command)
+    def command(self, sandbox: str | None = None) -> list[str]:
+        """Render argv for the resolved role sandbox.
+
+        The checked-in command omits ``--sandbox`` so the role declaration is
+        the only source of truth: reviewer -> ``read-only``, implementer /
+        repair -> ``workspace-write`` (the defaults).  An explicit flag in a
+        custom command is replaced rather than duplicated.
+        """
+
+        args = list(self.spec.command)
+        if sandbox is None:
+            return args
+        if sandbox not in SANDBOXES:
+            raise ValueError(f"unknown codex sandbox: {sandbox!r}")
+        for index, arg in enumerate(args):
+            if arg == "--sandbox":
+                if index + 1 < len(args):
+                    args[index + 1] = sandbox
+                else:
+                    args.append(sandbox)
+                return args
+            if arg.startswith("--sandbox="):
+                args[index] = f"--sandbox={sandbox}"
+                return args
+        if "exec" in args:
+            position = args.index("exec") + 1
+        else:
+            position = len(args) - 1 if args and args[-1] == "-" else len(args)
+        args[position:position] = ["--sandbox", sandbox]
+        return args
 
     def parse(self, stdout: str, *, returncode: int = 0, duration_ms: int = 0) -> RunnerResult:
         payload = _find_payload(stdout)
