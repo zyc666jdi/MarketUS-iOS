@@ -34,6 +34,7 @@ DISPATCHER_ROOT = Path(__file__).resolve().parent
 if str(DISPATCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(DISPATCHER_ROOT))
 
+from reducer import Reducer, derive_job_id  # noqa: E402
 from runners.base import (  # noqa: E402
     ResolvedRole,
     RunnerResult,
@@ -87,6 +88,7 @@ ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url,state"
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
+JOB_ROOT = Path(".agent/jobs")
 STATE_ROOT = Path(".agent/state")
 LOOP_ROOT = Path(".agent/loops")
 LOOP_ENV_ID = "DISPATCHER_LOOP_ID"
@@ -1082,16 +1084,24 @@ def ensure_agent_pr(
     """
     if not worktree_has_work(worktree):
         return None, ""
-    committed, reason = commit_agent_work(worktree, issue["number"], run_id)
-    if not committed:
+    base_sha = run(["git", "-C", str(worktree), "merge-base", "origin/main", "HEAD"])
+    head_sha = run(["git", "-C", str(worktree), "rev-parse", "HEAD"])
+    job_id = derive_job_id(
+        "implementer",
+        issue["number"],
+        (base_sha.stdout or "").strip(),
+        (head_sha.stdout or "").strip(),
+    )
+    reduced = Reducer(
+        runner=run, scanner=scan_staged_secrets, jobs_root=JOB_ROOT
+    ).commit_and_push(worktree, branch, issue, job_id, run_id=run_id)
+    if not reduced.ok:
+        reason = reduced.reason
         if reason.startswith("密钥扫描命中："):
             removed = remove_worktree(worktree)
             if removed is not None and removed.returncode != 0:
                 reason += f"；清理 worktree 失败：{removed.stderr.strip() or 'unknown'}"
         return None, reason
-    push = run(["git", "-C", str(worktree), "push", "-u", "origin", branch])
-    if push.returncode != 0:
-        return None, f"git push 失败：{push.stderr.strip() or 'unknown'}"
 
     title = f"chore(agent): 自动收尾 #{issue['number']}"
     created = run(
