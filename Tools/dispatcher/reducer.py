@@ -157,13 +157,21 @@ class _OperationLog:
                 return item
         return None
 
-    def has(self, step: str, **fields: Any) -> bool:
+    def _match(self, step: str, statuses: tuple[str, ...], fields: dict[str, Any]) -> bool:
         for item in self.records():
-            if item.get("step") != step or item.get("status") not in ("ok", "skipped"):
+            if item.get("step") != step or item.get("status") not in statuses:
                 continue
             if all(item.get(key) == value for key, value in fields.items()):
                 return True
         return False
+
+    def has(self, step: str, **fields: Any) -> bool:
+        """Return True only for a successful step with the same key."""
+        return self._match(step, ("ok",), fields)
+
+    def recorded(self, step: str, **fields: Any) -> bool:
+        """Return True when a success or skip is already logged (dedupe)."""
+        return self._match(step, ("ok", "skipped"), fields)
 
     def append(self, *, step: str, status: str, reason: str = "", **fields: Any) -> None:
         record = {"ts": _utc_now(), "step": step, "status": status, "reason": reason}
@@ -274,7 +282,7 @@ class Reducer:
             return ReduceResult(False, head, reason, job_id, tuple(skipped))
         else:
             skipped.append("commit")
-            if not log.has("commit", head=head):
+            if not log.recorded("commit", head=head):
                 log.append(step="commit", status="skipped", head=head, reason="没有待提交改动")
 
         remote = self._remote_head(path, branch)
@@ -307,7 +315,7 @@ class Reducer:
 
         if remote == head:
             skipped.append("push")
-            if not log.has("push", head=head, branch=branch):
+            if not log.recorded("push", head=head, branch=branch):
                 log.append(
                     step="push", status="skipped", reason="远端已包含本地 HEAD",
                     head=head, branch=branch,
@@ -356,10 +364,22 @@ class Reducer:
             log.append(step="pr", status="failed", reason=reason, branch=branch)
             return GitHubResult(False, reason=reason)
         if existing is not None:
-            pr = existing
-            if not log.has("pr", number=pr["number"], branch=branch):
+            pr = dict(existing)
+            marker = job_marker(job_id)
+            marker_added = marker not in str(pr.get("body") or "")
+            if marker_added:
+                marked = _with_marker(str(pr.get("body") or ""), job_id)
+                edited = self._gh(["pr", "edit", str(pr["number"]), "--body", marked])
+                if edited.returncode != 0:
+                    reason = f"补充 PR job marker 失败：{edited.stderr.strip() or 'unknown'}"
+                    log.append(step="pr", status="failed", reason=reason,
+                               branch=branch, number=pr["number"])
+                    return GitHubResult(False, reason=reason, pr=pr)
+                pr["body"] = marked
+            if not log.recorded("pr", number=pr["number"], branch=branch):
                 log.append(step="pr", status="skipped", reason="已存在 open PR",
-                           branch=branch, number=pr["number"], url=pr.get("url", ""))
+                           branch=branch, number=pr["number"], url=pr.get("url", ""),
+                           marker_added=marker_added)
         else:
             created = self._gh([
                 "pr", "create", "--base", "main", "--head", branch,
@@ -386,7 +406,7 @@ class Reducer:
         if wanted:
             labeled = self.set_labels("pr", pr["number"], wanted, (), job_id)
             if not labeled.ok:
-                return GitHubResult(False, reason=labeled.reason)
+                return GitHubResult(False, reason=labeled.reason, pr=pr)
         return GitHubResult(True, pr=pr, skipped=existing is not None)
 
     def comment_pr(
@@ -475,10 +495,15 @@ class Reducer:
         except json.JSONDecodeError:
             return None, f"无法解析 gh 输出：{(result.stdout or '').strip()[:200]}"
 
+    def find_open_pr(self, branch: str) -> dict[str, Any] | None:
+        """Return the open PR for ``branch``, or None."""
+        pr, _ = self._find_open_pr(branch)
+        return pr
+
     def _find_open_pr(self, branch: str) -> tuple[dict[str, Any] | None, str]:
         data, error = self._gh_json([
             "pr", "list", "--head", branch, "--state", "open",
-            "--json", "number,url,title,headRefName,isDraft", "--limit", "1",
+            "--json", "number,url,title,headRefName,isDraft,body", "--limit", "1",
         ])
         if error:
             return None, error

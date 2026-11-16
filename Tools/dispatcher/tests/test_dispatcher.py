@@ -1599,6 +1599,8 @@ class AutoSalvageTests(unittest.TestCase):
         secret: bool = False,
         create_ok: bool = True,
         create_output: str = "https://example/pull/77\n",
+        edit_ok: bool = True,
+        comment_ok: bool = True,
     ):
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -1647,8 +1649,14 @@ class AutoSalvageTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, "[]", "")
                 if args[:3] == ["gh", "pr", "view"]:
                     return subprocess.CompletedProcess(args, 0, '{"comments": []}', "")
-                if args[:3] in (["gh", "pr", "comment"], ["gh", "pr", "edit"]):
-                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args[:3] == ["gh", "pr", "edit"]:
+                    return subprocess.CompletedProcess(
+                        args, 0 if edit_ok else 1, "", "" if edit_ok else "gh edit failed"
+                    )
+                if args[:3] == ["gh", "pr", "comment"]:
+                    return subprocess.CompletedProcess(
+                        args, 0 if comment_ok else 1, "", "" if comment_ok else "gh comment failed"
+                    )
                 if args[:3] == ["gh", "pr", "create"]:
                     return subprocess.CompletedProcess(
                         args, 0 if create_ok else 1, create_output, "" if create_ok else "gh create failed"
@@ -1691,6 +1699,16 @@ class AutoSalvageTests(unittest.TestCase):
         self.assertIn("Refs: #40", commit[-1])
         self.assertIn("Agent-Run: run-1", commit[-1])
         self.assertIn("Job-Id: implementer-40-", commit[-1])
+
+    def test_label_or_comment_failure_still_returns_pr(self):
+        result, reason, _ = self._run(dirty=True, ahead=1, edit_ok=False)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["number"], 77)
+        self.assertIn("gh pr edit 失败", reason)
+
+        result, reason, _ = self._run(dirty=True, ahead=1, comment_ok=False)
+        self.assertIsNotNone(result)
+        self.assertIn("gh pr comment 失败", reason)
 
     def test_clean_but_unpushed_branch_is_pushed_and_pr_opened(self):
         result, reason, calls = self._run(dirty=False, ahead=1)
