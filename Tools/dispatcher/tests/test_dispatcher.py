@@ -5,6 +5,7 @@ import io
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -649,7 +650,7 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         verdict: str | None,
         review_body: str = P1_REVIEW,
         *,
-        test_passed: bool | None = True,
+        test_status: str = "passed",
         comments: list[dict] | None = None,
         agent_result=None,
     ):
@@ -682,7 +683,9 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
                 mock.patch.object(
                     dispatcher,
                     "run_review_tests",
-                    return_value=(test_passed, "make test-dispatcher", "OK"),
+                    return_value=dispatcher.ReviewTestResult(
+                        test_status, "make test-dispatcher", "OK"
+                    ),
                 ),
                 mock.patch.object(dispatcher, "comment_pr"),
                 mock.patch.object(dispatcher, "notify"),
@@ -786,11 +789,29 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
 
     def test_failed_dispatcher_tests_escalate_approve_to_p1(self):
         code, final, pr_edits = self._review(
-            {"status:in-progress"}, "APPROVE", test_passed=False
+            {"status:in-progress"}, "APPROVE", test_status="failed"
         )
         self.assertEqual(code, 1)
         self.assertEqual(final, {"status:in-progress"})
         self.assertEqual(pr_edits, [])
+
+    def test_timed_out_dispatcher_tests_do_not_block_approve(self):
+        code, final, pr_edits = self._review(
+            {"status:in-progress"}, "APPROVE", test_status="timeout"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        self.assertEqual(len(pr_edits), 1)
+        self.assertIn("merge:requested", pr_edits[0])
+
+    def test_skipped_dispatcher_tests_do_not_block_approve(self):
+        code, final, pr_edits = self._review(
+            {"status:in-progress"}, "APPROVE", test_status="skipped"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        self.assertEqual(len(pr_edits), 1)
+        self.assertIn("merge:requested", pr_edits[0])
 
 
 class P1BlockingPolicyTests(unittest.TestCase):
@@ -2207,55 +2228,174 @@ class RepairStateTests(IsolatedStateTestCase):
 
 
 class ReviewTestCheckoutTests(unittest.TestCase):
-    def test_fetch_failure_is_reported_as_not_run(self):
+    def _run_with_command(
+        self,
+        test_command: tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        git_result: subprocess.CompletedProcess[str] | None = None,
+        grace: float = 5.0,
+    ):
+        commands: list[list[str]] = []
+
+        def fake_run(args):
+            commands.append(args)
+            if args[:3] == ["git", "worktree", "add"]:
+                Path(args[4]).mkdir(parents=True, exist_ok=True)
+            return git_result or subprocess.CompletedProcess(args, 0, "", "")
+
+        env_patch = {
+            "MARKETUS_REVIEW_TESTS": "1",
+            "MARKETUS_REVIEW_TEST_TIMEOUT": "10",
+        }
+        env_patch.update(env or {})
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
-                mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/make"),
-                mock.patch.object(
-                    dispatcher,
-                    "run",
-                    return_value=subprocess.CompletedProcess([], 1, "", "network"),
+                mock.patch.object(dispatcher, "REVIEW_TEST_COMMAND", test_command),
+                mock.patch.object(dispatcher.shutil, "which", return_value=test_command[0]),
+                mock.patch.object(dispatcher, "run", side_effect=fake_run),
+                mock.patch.object(dispatcher, "REVIEW_TEST_KILL_GRACE_SECONDS", grace),
+                mock.patch.dict(os.environ, env_patch, clear=False),
+            ):
+                result = dispatcher.run_review_tests(38)
+        return result, commands
+
+    def test_fetch_failure_is_reported_as_environment(self):
+        result, _ = self._run_with_command(
+            ("make", "test-dispatcher"),
+            git_result=subprocess.CompletedProcess([], 1, "", "network"),
+        )
+        self.assertEqual(result.status, "environment")
+        self.assertFalse(result.blocks_review)
+        self.assertEqual(result.command, "git fetch")
+        self.assertIn("network", result.output)
+
+    def test_missing_make_is_reported_as_environment(self):
+        with (
+            mock.patch.object(
+                dispatcher, "REVIEW_TEST_COMMAND", ("make", "test-dispatcher")
+            ),
+            mock.patch.object(dispatcher.shutil, "which", return_value=None),
+            mock.patch.dict(os.environ, {"MARKETUS_REVIEW_TESTS": "1"}, clear=False),
+        ):
+            result = dispatcher.run_review_tests(38)
+        self.assertEqual(result.status, "environment")
+        self.assertFalse(result.blocks_review)
+        self.assertIn("make not found", result.output)
+
+    def test_disabled_by_config_skips_without_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "run") as git_run,
+                mock.patch.dict(
+                    os.environ, {"MARKETUS_REVIEW_TESTS": "0"}, clear=False
                 ),
             ):
-                passed, command, output = dispatcher.run_review_tests(38)
-        self.assertIsNone(passed)
-        self.assertEqual(command, "git fetch")
-        self.assertIn("network", output)
+                result = dispatcher.run_review_tests(38)
+        git_run.assert_not_called()
+        self.assertEqual(result.status, "skipped")
+        self.assertFalse(result.blocks_review)
+        self.assertIn("skipped by config", result.output)
+        self.assertEqual(result.command, "make test-dispatcher")
 
-    def _run_with_result(self, result):
-        commands = []
-        with tempfile.TemporaryDirectory() as tmp:
-            def fake_run(args):
-                commands.append(args)
-                return subprocess.CompletedProcess(args, 0, "", "")
-
-            with (
-                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
-                mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/make"),
-                mock.patch.object(dispatcher, "run", side_effect=fake_run),
-                mock.patch.object(dispatcher.subprocess, "run", return_value=result) as test_run,
-            ):
-                outcome = dispatcher.run_review_tests(38)
-        return outcome, commands, test_run
-
-    def test_success_runs_make_then_cleans_worktree_and_ref(self):
-        result = subprocess.CompletedProcess([], 0, "Ran 1 test in 0.1s\nOK\n", "")
-        (passed, command, output), commands, test_run = self._run_with_result(result)
-        self.assertTrue(passed)
-        self.assertEqual(command, "make test-dispatcher")
-        self.assertIn("OK", output)
-        self.assertEqual(test_run.call_args.args[0], ["make", "test-dispatcher"])
-        self.assertEqual(Path(test_run.call_args.kwargs["cwd"]), Path(commands[1][4]))
-        self.assertTrue(any(args[:3] == ["git", "worktree", "remove"] for args in commands))
+    def test_success_runs_command_then_cleans_worktree_and_ref(self):
+        command = (
+            sys.executable,
+            "-c",
+            "print('Ran 1 test in 0.1s'); print('OK')",
+        )
+        result, commands = self._run_with_command(command)
+        self.assertEqual(result.status, "passed")
+        self.assertFalse(result.blocks_review)
+        self.assertEqual(result.command, " ".join(command))
+        self.assertIn("OK", result.output)
+        self.assertTrue(
+            any(args[:3] == ["git", "worktree", "remove"] for args in commands)
+        )
         self.assertTrue(any(args[:2] == ["git", "update-ref"] for args in commands))
 
-    def test_failing_suite_returns_false(self):
-        result = subprocess.CompletedProcess([], 1, "FAILED (failures=1)\n", "")
-        (passed, command, output), _, _ = self._run_with_result(result)
-        self.assertFalse(passed)
-        self.assertEqual(command, "make test-dispatcher")
-        self.assertIn("FAILED", output)
+    def test_failing_suite_returns_failed_p1(self):
+        command = (
+            sys.executable,
+            "-c",
+            "import sys; print('FAILED (failures=1)'); sys.exit(1)",
+        )
+        result, _ = self._run_with_command(command)
+        self.assertEqual(result.status, "failed")
+        self.assertTrue(result.blocks_review)
+        self.assertEqual(result.command, " ".join(command))
+        self.assertIn("FAILED", result.output)
+
+    def test_timeout_kills_process_group_and_is_environment_only(self):
+        command = (
+            sys.executable,
+            "-c",
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('started', flush=True); time.sleep(10)",
+        )
+        started = time.monotonic()
+        result, _ = self._run_with_command(
+            command,
+            env={"MARKETUS_REVIEW_TEST_TIMEOUT": "1"},
+            grace=0.2,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.status, "timeout")
+        self.assertFalse(result.blocks_review)
+        self.assertIn("timeout after 1s", result.output)
+        self.assertIn("started", result.output)
+        self.assertLess(elapsed, 5)
+
+    def test_timeout_escalates_sigterm_to_sigkill(self):
+        class FakeProcess:
+            pid = 4321
+
+            def __init__(self):
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls <= 2:
+                    raise subprocess.TimeoutExpired("cmd", timeout)
+                return "partial output", None
+
+            def kill(self):
+                pass
+
+        process = FakeProcess()
+        with (
+            mock.patch.object(
+                dispatcher.subprocess, "Popen", return_value=process
+            ) as popen,
+            mock.patch.object(dispatcher.os, "killpg") as killpg,
+            mock.patch.object(dispatcher, "REVIEW_TEST_KILL_GRACE_SECONDS", 0.01),
+        ):
+            returncode, output, timed_out = dispatcher._run_review_test_command(
+                ("fake-command",), Path("."), 1
+            )
+        self.assertIsNone(returncode)
+        self.assertTrue(timed_out)
+        self.assertIn("partial output", output)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(
+            [call.args[1] for call in killpg.call_args_list],
+            [signal.SIGTERM, signal.SIGKILL],
+        )
+
+    def test_timeout_defaults_and_env_override(self):
+        with mock.patch.dict(
+            os.environ, {"MARKETUS_REVIEW_TEST_TIMEOUT": "42"}, clear=False
+        ):
+            self.assertEqual(dispatcher.review_test_timeout_seconds(), 42)
+        with mock.patch.dict(
+            os.environ, {"MARKETUS_REVIEW_TEST_TIMEOUT": "invalid"}, clear=False
+        ):
+            self.assertEqual(dispatcher.review_test_timeout_seconds(), 300)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(dispatcher.review_test_timeout_seconds(), 300)
 
 
 if __name__ == "__main__":
