@@ -1132,6 +1132,13 @@ def build_auto_pr_body(issue: dict[str, Any]) -> str:
     )
 
 
+def build_auto_pr_note(issue: dict[str, Any]) -> str:
+    number = issue["number"]
+    return (f"🤖 Dispatcher 自动收尾：Agent 退出时未创建 PR，已自动 commit/push 并创建本 PR。\n\n"
+            f"- Ticket: #{number}\n- 日志：`.agent/runs/{number}/`\n"
+            "- 验收证据需在合并前由人类复核补齐。")
+
+
 def remove_worktree(worktree: Path) -> subprocess.CompletedProcess[str] | None:
     if not worktree.exists():
         return None
@@ -1159,12 +1166,13 @@ def ensure_agent_pr(
         (base_sha.stdout or "").strip(),
         branch,
     )
-    reduced = Reducer(
+    reducer = Reducer(
         runner=run,
         scanner=scan_staged_secrets,
         range_scanner=scan_range_secrets,
         jobs_root=JOB_ROOT,
-    ).commit_and_push(worktree, branch, issue, job_id, run_id=run_id)
+    )
+    reduced = reducer.commit_and_push(worktree, branch, issue, job_id, run_id=run_id)
     if not reduced.ok:
         reason = reduced.reason
         if reason.startswith("密钥扫描命中："):
@@ -1174,27 +1182,15 @@ def ensure_agent_pr(
         return None, reason
 
     title = f"chore(agent): 自动收尾 #{issue['number']}"
-    created = run(
-        [
-            "gh", "pr", "create", "--base", "main", "--head", branch,
-            "--title", title, "--body", build_auto_pr_body(issue),
-            *[item for label in auto_pr_labels(issue) for item in ("--label", label)],
-        ]
+    opened = reducer.ensure_pr(
+        worktree, branch, issue, job_id, title, build_auto_pr_body(issue), auto_pr_labels(issue)
     )
-    if created.returncode != 0:
-        return None, f"gh pr create 失败：{created.stderr.strip() or 'unknown'}"
-    lines = [line.strip() for line in (created.stdout or "").splitlines() if line.strip()]
-    url = lines[-1] if lines else ""
-    match = re.search(r"/pull/(\d+)", url)
-    if match is None:
-        return None, f"gh pr create 未返回 PR URL：{url or '(empty)'}"
-    return {
-        "number": int(match.group(1)),
-        "url": url,
-        "title": title,
-        "headRefName": branch,
-        "isDraft": False,
-    }, ""
+    if not opened.ok or opened.pr is None:
+        return None, opened.reason or "创建 PR 失败"
+    noted = reducer.comment_pr(opened.pr["number"], job_id, build_auto_pr_note(issue))
+    if not noted.ok:
+        return None, noted.reason
+    return opened.pr, ""
 
 
 def acquire_named_lock(name: str, state_dir: Path | None = None) -> TextIO | None:

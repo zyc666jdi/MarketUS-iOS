@@ -1643,6 +1643,12 @@ class AutoSalvageTests(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         args, 0 if push_ok else 1, "", "" if push_ok else "push failed"
                     )
+                if args[:3] == ["gh", "pr", "list"]:
+                    return subprocess.CompletedProcess(args, 0, "[]", "")
+                if args[:3] == ["gh", "pr", "view"]:
+                    return subprocess.CompletedProcess(args, 0, '{"comments": []}', "")
+                if args[:3] in (["gh", "pr", "comment"], ["gh", "pr", "edit"]):
+                    return subprocess.CompletedProcess(args, 0, "", "")
                 if args[:3] == ["gh", "pr", "create"]:
                     return subprocess.CompletedProcess(
                         args, 0 if create_ok else 1, create_output, "" if create_ok else "gh create failed"
@@ -1672,9 +1678,15 @@ class AutoSalvageTests(unittest.TestCase):
         self.assertTrue(any("push" in args for args in calls))
         create = next(args for args in calls if args[:3] == ["gh", "pr", "create"])
         self.assertNotIn("--draft", create)
-        self.assertIn("ai:generated", create)
-        self.assertIn("risk:medium", create)
-        self.assertIn("size:s", create)
+        self.assertNotIn("--label", create)
+        body = create[create.index("--body") + 1]
+        self.assertIn("<!-- job:implementer-40-", body)
+        edit = next(args for args in calls if args[:3] == ["gh", "pr", "edit"])
+        self.assertIn("ai:generated", edit)
+        self.assertIn("risk:medium", edit)
+        self.assertIn("size:s", edit)
+        comment = next(args for args in calls if args[:3] == ["gh", "pr", "comment"])
+        self.assertIn("<!-- job:implementer-40-", comment[-1])
         commit = next(args for args in calls if "commit" in args)
         self.assertIn("Refs: #40", commit[-1])
         self.assertIn("Agent-Run: run-1", commit[-1])
