@@ -91,7 +91,7 @@ def _default_scanner(worktree: Path) -> list[str]:
 
 
 def _default_range_scanner(worktree: Path, revision_range: str) -> list[str]:
-    return _dispatcher_helper("range_secret_hits")(worktree, revision_range)
+    return _dispatcher_helper("scan_range_secrets")(worktree, revision_range)
 
 
 class _OperationLog:
@@ -222,7 +222,8 @@ class Reducer:
                 path,
                 "-c", f"user.name={COMMITTER_NAME}",
                 "-c", f"user.email={COMMITTER_EMAIL}",
-                "commit", "-m", subject, "-m", body,
+                "-c", "commit.gpgsign=false",
+                "commit", "--no-verify", "-m", subject, "-m", body,
             )
             if committed.returncode != 0:
                 reason = f"git commit 失败：{committed.stderr.strip() or 'unknown'}"

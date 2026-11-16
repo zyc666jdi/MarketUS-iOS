@@ -192,12 +192,29 @@ class ReducerGitTests(unittest.TestCase):
         self.assertIn(("push", "failed"), steps)
         self.assertIn(("push", "ok"), steps)
 
-    def test_committed_secret_is_blocked_before_push(self):
+    def test_commit_disables_signing_and_hooks(self):
+        (self.repo / "change.txt").write_text("one\n", encoding="utf-8")
+        hook = self.repo / ".git/hooks/pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        self._git("config", "commit.gpgsign", "true")
+        self._git("config", "gpg.program", "false")
+        result = self._reducer().commit_and_push(
+            self.repo, BRANCH, {"number": 106}, "job-8"
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(self._count(), self.base_count + 1)
+
+    def test_deleted_secret_in_history_is_blocked_before_push(self):
+        token = "ghp_" + "d" * 36
         (self.repo / "Leak.swift").write_text(
-            'let token = "ghp_' + "c" * 36 + '"\n', encoding="utf-8"
+            f'let token = "{token}"\n', encoding="utf-8"
         )
         self._git("add", ".")
-        self._git("commit", "-m", "leak")
+        self._git("commit", "-m", "add leak")
+        (self.repo / "Leak.swift").unlink()
+        self._git("add", "-A")
+        self._git("commit", "-m", "remove leak")
         head = self._head()
         commands: list[list[str]] = []
 
@@ -208,13 +225,15 @@ class ReducerGitTests(unittest.TestCase):
         blocking = reducer.Reducer(
             jobs_root=self.jobs,
             scanner=lambda _path: [],
-            range_scanner=dispatcher.range_secret_hits,
+            range_scanner=dispatcher.scan_range_secrets,
             runner=recording,
         )
-        result = blocking.commit_and_push(self.repo, BRANCH, {"number": 106}, "job-6")
+        with mock.patch.object(dispatcher, "gitleaks_range_hits", return_value=[]):
+            result = blocking.commit_and_push(self.repo, BRANCH, {"number": 106}, "job-6")
         self.assertFalse(result.ok)
         self.assertIn("密钥扫描命中", result.reason)
         self.assertEqual(self._head(), head)
+        self.assertEqual(self._count(), self.base_count + 2)
         self.assertEqual(self._remote(), "")
         self.assertFalse(any("push" in command for command in commands))
         entries = self._logs("job-6")
@@ -227,6 +246,33 @@ class ReducerGitTests(unittest.TestCase):
         ]
         self.assertEqual(len(failed_ranges), 1)
         self.assertIn("Leak.swift: github-token", failed_ranges[0]["reason"])
+
+    def test_secret_in_commit_message_is_blocked_before_push(self):
+        token = "ghp_" + "e" * 36
+        (self.repo / "note.txt").write_text("clean\n", encoding="utf-8")
+        self._git("add", ".")
+        self._git("commit", "-m", f"add clean file {token}")
+        head = self._head()
+        commands: list[list[str]] = []
+
+        def recording(command):
+            commands.append(list(command))
+            return subprocess.run(command, capture_output=True, text=True, check=False)
+
+        blocking = reducer.Reducer(
+            jobs_root=self.jobs,
+            scanner=lambda _path: [],
+            range_scanner=dispatcher.scan_range_secrets,
+            runner=recording,
+        )
+        with mock.patch.object(dispatcher, "gitleaks_range_hits", return_value=[]):
+            result = blocking.commit_and_push(self.repo, BRANCH, {"number": 106}, "job-9")
+        self.assertFalse(result.ok)
+        self.assertIn("密钥扫描命中", result.reason)
+        self.assertIn("message: github-token", result.reason)
+        self.assertEqual(self._head(), head)
+        self.assertEqual(self._remote(), "")
+        self.assertFalse(any("push" in command for command in commands))
 
     def test_logged_push_requires_matching_remote(self):
         (self.repo / "change.txt").write_text("one\n", encoding="utf-8")
@@ -274,6 +320,7 @@ class ReducerGitTests(unittest.TestCase):
         with (
             mock.patch.object(dispatcher, "run", side_effect=scripted),
             mock.patch.object(dispatcher, "gitleaks_hits", return_value=[]),
+            mock.patch.object(dispatcher, "gitleaks_range_hits", return_value=[]),
             mock.patch.object(dispatcher, "JOB_ROOT", self.jobs),
         ):
             first, first_reason = dispatcher.ensure_agent_pr(

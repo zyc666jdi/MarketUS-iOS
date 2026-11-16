@@ -1754,6 +1754,23 @@ class SecretScanTests(unittest.TestCase):
             hits = dispatcher.scan_staged_secrets(Path("/tmp/worktree"))
         self.assertEqual(hits, ["gitleaks: staged change contains a secret"])
 
+    def test_gitleaks_range_scan_skips_when_binary_missing(self):
+        with mock.patch.object(dispatcher.shutil, "which", return_value=None):
+            hits = dispatcher.gitleaks_range_hits(Path("/tmp/worktree"), "base..HEAD")
+        self.assertEqual(hits, [])
+
+    def test_gitleaks_range_scan_passes_range_and_reports_secret(self):
+        result = subprocess.CompletedProcess([], 1, "", "")
+        with (
+            mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/gitleaks"),
+            mock.patch.object(dispatcher.subprocess, "run", return_value=result) as invoke,
+        ):
+            hits = dispatcher.gitleaks_range_hits(Path("/tmp/worktree"), "base..HEAD")
+        self.assertEqual(hits, ["gitleaks: commit range base..HEAD contains a secret"])
+        command = invoke.call_args.args[0]
+        self.assertIn("--log-opts", command)
+        self.assertIn("base..HEAD", command)
+
 
 class AutoPrBodyTests(unittest.TestCase):
     def test_body_uses_ticket_criteria_and_labels(self):

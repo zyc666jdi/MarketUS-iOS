@@ -948,14 +948,11 @@ SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _diff_secret_hits(worktree: Path, diff_args: list[str]) -> list[str]:
-    """Scan added lines in a git diff; never include the matched value."""
-    diff = run(["git", "-C", str(worktree), "diff", *diff_args, "--unified=0"])
-    if diff.returncode != 0:
-        return [f"无法读取 diff：{diff.stderr.strip() or 'unknown'}"]
+def _added_line_hits(patch: str) -> list[str]:
+    """Scan added lines in a unified diff; never include the matched value."""
     findings: list[str] = []
     path = ""
-    for line in (diff.stdout or "").splitlines():
+    for line in patch.splitlines():
         if line.startswith("+++ b/"):
             path = line[6:]
             continue
@@ -964,7 +961,23 @@ def _diff_secret_hits(worktree: Path, diff_args: list[str]) -> list[str]:
         for name, pattern in SECRET_RULES:
             if pattern.search(line):
                 findings.append(f"{path or '<unknown>'}: {name}")
-    return sorted(set(findings))
+    return findings
+
+
+def _message_secret_hits(message: str, sha: str) -> list[str]:
+    findings: list[str] = []
+    for line in message.splitlines():
+        for name, pattern in SECRET_RULES:
+            if pattern.search(line):
+                findings.append(f"commit {sha[:12]} message: {name}")
+    return findings
+
+
+def _diff_secret_hits(worktree: Path, diff_args: list[str]) -> list[str]:
+    diff = run(["git", "-C", str(worktree), "diff", *diff_args, "--unified=0"])
+    if diff.returncode != 0:
+        return [f"无法读取 diff：{diff.stderr.strip() or 'unknown'}"]
+    return sorted(set(_added_line_hits(diff.stdout or "")))
 
 
 def staged_secret_hits(worktree: Path) -> list[str]:
@@ -973,8 +986,25 @@ def staged_secret_hits(worktree: Path) -> list[str]:
 
 
 def range_secret_hits(worktree: Path, revision_range: str) -> list[str]:
-    """Scan added lines in a committed range, e.g. ``origin/branch..HEAD``."""
-    return _diff_secret_hits(worktree, [revision_range])
+    """Scan every commit in a range, including added lines and commit messages."""
+    commits = run(["git", "-C", str(worktree), "rev-list", "--reverse", revision_range])
+    if commits.returncode != 0:
+        return [f"无法读取提交范围 {revision_range}：{commits.stderr.strip() or 'unknown'}"]
+    findings: list[str] = []
+    for sha in (commits.stdout or "").split():
+        patch = run(
+            ["git", "-C", str(worktree), "show", sha, "--format=", "--unified=0"]
+        )
+        if patch.returncode != 0:
+            findings.append(f"无法读取提交 {sha[:12]}：{patch.stderr.strip() or 'unknown'}")
+            continue
+        findings.extend(_added_line_hits(patch.stdout or ""))
+        message = run(["git", "-C", str(worktree), "show", "-s", "--format=%B", sha])
+        if message.returncode != 0:
+            findings.append(f"无法读取提交信息 {sha[:12]}：{message.stderr.strip() or 'unknown'}")
+            continue
+        findings.extend(_message_secret_hits(message.stdout or "", sha))
+    return sorted(set(findings))
 
 
 def gitleaks_hits(worktree: Path) -> list[str]:
@@ -995,8 +1025,36 @@ def gitleaks_hits(worktree: Path) -> list[str]:
     return [f"gitleaks: scan failed (exit={result.returncode})"]
 
 
+def gitleaks_range_hits(worktree: Path, revision_range: str) -> list[str]:
+    """Run gitleaks over a commit range when the binary is available."""
+    binary = shutil.which("gitleaks")
+    if binary is None:
+        return []
+    result = subprocess.run(
+        [
+            binary, "detect", "--source", str(worktree),
+            "--log-opts", revision_range,
+            "--redact", "--no-banner", "--verbose",
+        ],
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return []
+    if result.returncode == 1:
+        return [f"gitleaks: commit range {revision_range} contains a secret"]
+    return [f"gitleaks: range scan failed (exit={result.returncode})"]
+
+
 def scan_staged_secrets(worktree: Path) -> list[str]:
     return staged_secret_hits(worktree) + gitleaks_hits(worktree)
+
+
+def scan_range_secrets(worktree: Path, revision_range: str) -> list[str]:
+    return range_secret_hits(worktree, revision_range) + gitleaks_range_hits(
+        worktree, revision_range
+    )
 
 
 def commit_agent_work(worktree: Path, issue_number: int, run_id: str = "") -> tuple[bool, str]:
@@ -1104,7 +1162,7 @@ def ensure_agent_pr(
     reduced = Reducer(
         runner=run,
         scanner=scan_staged_secrets,
-        range_scanner=range_secret_hits,
+        range_scanner=scan_range_secrets,
         jobs_root=JOB_ROOT,
     ).commit_and_push(worktree, branch, issue, job_id, run_id=run_id)
     if not reduced.ok:
