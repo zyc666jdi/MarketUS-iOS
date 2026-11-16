@@ -1605,6 +1605,7 @@ class AutoSalvageTests(unittest.TestCase):
             worktree = Path(tmp) / "agent-worktree"
             worktree.mkdir()
             prefix = ["git", "-C", str(worktree)]
+            state = {"committed": False}
 
             def fake_run(args):
                 calls.append(list(args))
@@ -1612,7 +1613,18 @@ class AutoSalvageTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, " M Sources/File.swift\n" if dirty else "", "")
                 if args[:3] == prefix and "rev-list" in args:
                     return subprocess.CompletedProcess(args, 0, f"{ahead}\n", "")
+                if args[:3] == prefix and "merge-base" in args:
+                    return subprocess.CompletedProcess(args, 0, "base123\n", "")
+                if args[:3] == prefix and "rev-parse" in args:
+                    sha = "def456" if state["committed"] else "abc123"
+                    return subprocess.CompletedProcess(args, 0, f"{sha}\n", "")
+                if args[:3] == prefix and "write-tree" in args:
+                    return subprocess.CompletedProcess(args, 0, "tree123\n", "")
+                if args[:3] == prefix and "ls-remote" in args:
+                    return subprocess.CompletedProcess(args, 0, "", "")
                 if args[:3] == prefix and "diff" in args and "--cached" in args:
+                    if "--quiet" in args:
+                        return subprocess.CompletedProcess(args, 1 if dirty else 0, "", "")
                     staged = ""
                     if secret:
                         staged = (
@@ -1622,6 +1634,8 @@ class AutoSalvageTests(unittest.TestCase):
                         )
                     return subprocess.CompletedProcess(args, 0, staged, "")
                 if args[:3] == prefix and "commit" in args:
+                    if commit_ok:
+                        state["committed"] = True
                     return subprocess.CompletedProcess(
                         args, 0 if commit_ok else 1, "", "" if commit_ok else "commit failed"
                     )
@@ -1638,6 +1652,7 @@ class AutoSalvageTests(unittest.TestCase):
             with (
                 mock.patch.object(dispatcher, "run", side_effect=fake_run),
                 mock.patch.object(dispatcher, "gitleaks_hits", return_value=[]),
+                mock.patch.object(dispatcher, "JOB_ROOT", Path(tmp) / "jobs"),
             ):
                 result, reason = dispatcher.ensure_agent_pr(
                     worktree,
@@ -1663,6 +1678,7 @@ class AutoSalvageTests(unittest.TestCase):
         commit = next(args for args in calls if "commit" in args)
         self.assertIn("Refs: #40", commit[-1])
         self.assertIn("Agent-Run: run-1", commit[-1])
+        self.assertIn("Job-Id: implementer-40-", commit[-1])
 
     def test_clean_but_unpushed_branch_is_pushed_and_pr_opened(self):
         result, reason, calls = self._run(dirty=False, ahead=1)
@@ -1737,6 +1753,23 @@ class SecretScanTests(unittest.TestCase):
         ):
             hits = dispatcher.scan_staged_secrets(Path("/tmp/worktree"))
         self.assertEqual(hits, ["gitleaks: staged change contains a secret"])
+
+    def test_gitleaks_range_scan_skips_when_binary_missing(self):
+        with mock.patch.object(dispatcher.shutil, "which", return_value=None):
+            hits = dispatcher.gitleaks_range_hits(Path("/tmp/worktree"), "base..HEAD")
+        self.assertEqual(hits, [])
+
+    def test_gitleaks_range_scan_passes_range_and_reports_secret(self):
+        result = subprocess.CompletedProcess([], 1, "", "")
+        with (
+            mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/gitleaks"),
+            mock.patch.object(dispatcher.subprocess, "run", return_value=result) as invoke,
+        ):
+            hits = dispatcher.gitleaks_range_hits(Path("/tmp/worktree"), "base..HEAD")
+        self.assertEqual(hits, ["gitleaks: commit range base..HEAD contains a secret"])
+        command = invoke.call_args.args[0]
+        self.assertIn("--log-opts", command)
+        self.assertIn("base..HEAD", command)
 
 
 class AutoPrBodyTests(unittest.TestCase):
