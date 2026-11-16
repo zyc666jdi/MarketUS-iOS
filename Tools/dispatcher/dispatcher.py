@@ -948,11 +948,11 @@ SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def staged_secret_hits(worktree: Path) -> list[str]:
-    """Scan added lines in the staged diff; never include the matched value."""
-    diff = run(["git", "-C", str(worktree), "diff", "--cached", "--unified=0"])
+def _diff_secret_hits(worktree: Path, diff_args: list[str]) -> list[str]:
+    """Scan added lines in a git diff; never include the matched value."""
+    diff = run(["git", "-C", str(worktree), "diff", *diff_args, "--unified=0"])
     if diff.returncode != 0:
-        return [f"无法读取 staged diff：{diff.stderr.strip() or 'unknown'}"]
+        return [f"无法读取 diff：{diff.stderr.strip() or 'unknown'}"]
     findings: list[str] = []
     path = ""
     for line in (diff.stdout or "").splitlines():
@@ -965,6 +965,16 @@ def staged_secret_hits(worktree: Path) -> list[str]:
             if pattern.search(line):
                 findings.append(f"{path or '<unknown>'}: {name}")
     return sorted(set(findings))
+
+
+def staged_secret_hits(worktree: Path) -> list[str]:
+    """Scan added lines in the staged diff."""
+    return _diff_secret_hits(worktree, ["--cached"])
+
+
+def range_secret_hits(worktree: Path, revision_range: str) -> list[str]:
+    """Scan added lines in a committed range, e.g. ``origin/branch..HEAD``."""
+    return _diff_secret_hits(worktree, [revision_range])
 
 
 def gitleaks_hits(worktree: Path) -> list[str]:
@@ -1085,15 +1095,17 @@ def ensure_agent_pr(
     if not worktree_has_work(worktree):
         return None, ""
     base_sha = run(["git", "-C", str(worktree), "merge-base", "origin/main", "HEAD"])
-    head_sha = run(["git", "-C", str(worktree), "rev-parse", "HEAD"])
     job_id = derive_job_id(
         "implementer",
         issue["number"],
         (base_sha.stdout or "").strip(),
-        (head_sha.stdout or "").strip(),
+        branch,
     )
     reduced = Reducer(
-        runner=run, scanner=scan_staged_secrets, jobs_root=JOB_ROOT
+        runner=run,
+        scanner=scan_staged_secrets,
+        range_scanner=range_secret_hits,
+        jobs_root=JOB_ROOT,
     ).commit_and_push(worktree, branch, issue, job_id, run_id=run_id)
     if not reduced.ok:
         reason = reduced.reason

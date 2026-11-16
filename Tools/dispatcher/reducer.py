@@ -27,6 +27,7 @@ JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 RunCallable = Callable[[list[str]], subprocess.CompletedProcess[str]]
 ScanCallable = Callable[[Path], list[str]]
+RangeScanCallable = Callable[[Path, str], list[str]]
 
 
 @dataclass(frozen=True)
@@ -40,10 +41,14 @@ class ReduceResult:
     skipped: tuple[str, ...] = ()
 
 
-def derive_job_id(role: str, issue: int, base_sha: str = "", head_sha: str = "") -> str:
-    """Derive a deterministic, filesystem-safe job id from role and git context."""
+def derive_job_id(role: str, issue: int, base_sha: str = "", branch: str = "") -> str:
+    """Derive a deterministic job id from role, ticket, base and branch.
+
+    HEAD/tree are deliberately excluded: a retry after a commit must reuse the
+    same job directory and operation log.
+    """
     digest = hashlib.sha256(
-        f"{role}|{issue}|{base_sha}|{head_sha}".encode("utf-8")
+        f"{role}|{issue}|{base_sha}|{branch}".encode("utf-8")
     ).hexdigest()[:16]
     slug = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-") or "job"
     return f"{slug}-{issue}-{digest}"
@@ -68,18 +73,25 @@ def _default_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def _default_scanner(worktree: Path) -> list[str]:
-    """Reuse dispatcher's secret helpers without a circular top-level import."""
-    for name in ("dispatcher", "__main__"):
-        module = sys.modules.get(name)
-        scanner = getattr(module, "scan_staged_secrets", None)
-        if callable(scanner):
-            return scanner(worktree)
+def _dispatcher_helper(name: str) -> Callable[..., list[str]]:
+    """Resolve a dispatcher secret helper without a circular top-level import."""
+    for module_name in ("dispatcher", "__main__"):
+        helper = getattr(sys.modules.get(module_name), name, None)
+        if callable(helper):
+            return helper
     try:
         import dispatcher as module  # noqa: PLC0415 - import-safe fallback
     except ImportError as error:  # pragma: no cover - dispatcher is checked in
-        raise RuntimeError("无法加载 dispatcher 的密钥扫描器") from error
-    return module.scan_staged_secrets(worktree)
+        raise RuntimeError(f"无法加载 dispatcher.{name}") from error
+    return getattr(module, name)
+
+
+def _default_scanner(worktree: Path) -> list[str]:
+    return _dispatcher_helper("scan_staged_secrets")(worktree)
+
+
+def _default_range_scanner(worktree: Path, revision_range: str) -> list[str]:
+    return _dispatcher_helper("range_secret_hits")(worktree, revision_range)
 
 
 class _OperationLog:
@@ -103,9 +115,11 @@ class _OperationLog:
                 entries.append(item)
         return entries
 
-    def last(self, step: str) -> dict[str, Any] | None:
+    def last(self, step: str, **fields: Any) -> dict[str, Any] | None:
         for item in reversed(self.records()):
-            if item.get("step") == step and item.get("status") in ("ok", "skipped"):
+            if item.get("step") != step or item.get("status") not in ("ok", "skipped"):
+                continue
+            if all(item.get(key) == value for key, value in fields.items()):
                 return item
         return None
 
@@ -138,10 +152,12 @@ class Reducer:
         *,
         runner: RunCallable | None = None,
         scanner: ScanCallable | None = None,
+        range_scanner: RangeScanCallable | None = None,
         jobs_root: Path | None = None,
     ) -> None:
         self.runner = runner or _default_runner
         self.scanner = scanner or _default_scanner
+        self.range_scanner = range_scanner or _default_range_scanner
         self.jobs_root = Path(jobs_root) if jobs_root is not None else JOBS_ROOT
 
     def commit_and_push(
@@ -172,26 +188,32 @@ class Reducer:
         staged = self._git(path, "add", "-A")
         if staged.returncode != 0:
             reason = f"git add 失败：{staged.stderr.strip() or 'unknown'}"
-            log.append(step="scan", status="failed", reason=reason, head=self._head(path))
+            log.append(
+                step="scan", status="failed", reason=reason,
+                scope="staged", head=self._head(path),
+            )
             return ReduceResult(False, self._head(path), reason, job_id)
 
         head = self._head(path)
         tree = self._tree(path)
         if not head or not tree:
             reason = "无法读取 git HEAD/tree"
-            log.append(step="scan", status="failed", reason=reason)
+            log.append(step="scan", status="failed", reason=reason, scope="staged")
             return ReduceResult(False, head, reason, job_id)
 
-        scanned = log.last("scan")
+        scanned = log.last("scan", scope="staged")
         if scanned is not None and scanned.get("tree") == tree:
             skipped.append("scan")
         else:
             findings = self.scanner(path)
             if findings:
                 reason = "密钥扫描命中：" + "; ".join(findings)
-                log.append(step="scan", status="failed", reason=reason, head=head, tree=tree)
+                log.append(
+                    step="scan", status="failed", reason=reason,
+                    scope="staged", head=head, tree=tree,
+                )
                 return ReduceResult(False, head, reason, job_id)
-            log.append(step="scan", status="ok", head=head, tree=tree)
+            log.append(step="scan", status="ok", scope="staged", head=head, tree=tree)
 
         staged_diff = self._git(path, "diff", "--cached", "--quiet")
         if staged_diff.returncode == 1:
@@ -221,24 +243,54 @@ class Reducer:
             if not log.has("commit", head=head):
                 log.append(step="commit", status="skipped", head=head, reason="没有待提交改动")
 
+        remote = self._remote_head(path, branch)
+        range_spec = self._range_spec(path, remote)
+        if not range_spec:
+            reason = "无法确定提交扫描范围"
+            log.append(
+                step="scan", status="failed", reason=reason,
+                scope="range", head=head,
+            )
+            return ReduceResult(False, head, reason, job_id, tuple(skipped))
+        findings = self.range_scanner(path, range_spec)
+        if findings:
+            reason = "密钥扫描命中：" + "; ".join(findings)
+            log.append(
+                step="scan", status="failed", reason=reason,
+                scope="range", range=range_spec, head=head,
+            )
+            return ReduceResult(False, head, reason, job_id, tuple(skipped))
+        log.append(step="scan", status="ok", scope="range", range=range_spec, head=head)
+
         recorded_push = log.last("push")
-        if recorded_push is not None and recorded_push.get("head") == head:
+        if (
+            recorded_push is not None
+            and recorded_push.get("head") == head
+            and remote == head
+        ):
             skipped.append("push")
             return ReduceResult(True, head, "", job_id, tuple(skipped))
 
-        remote = self._remote_head(path, branch)
         if remote == head:
             skipped.append("push")
-            if not log.has("push", head=head):
-                log.append(step="push", status="skipped", head=head, reason="远端已包含本地 HEAD")
+            if not log.has("push", head=head, branch=branch):
+                log.append(
+                    step="push", status="skipped", reason="远端已包含本地 HEAD",
+                    head=head, branch=branch,
+                )
             return ReduceResult(True, head, "", job_id, tuple(skipped))
 
         push_result = self._git(path, "push", "-u", "origin", f"HEAD:refs/heads/{branch}")
         if push_result.returncode != 0:
             reason = f"git push 失败：{push_result.stderr.strip() or 'unknown'}"
-            log.append(step="push", status="failed", reason=reason, head=head, remote=remote)
+            log.append(
+                step="push", status="failed", reason=reason,
+                head=head, branch=branch, remote=remote,
+            )
             return ReduceResult(False, head, reason, job_id, tuple(skipped))
-        log.append(step="push", status="ok", head=head, remote=remote)
+        log.append(
+            step="push", status="ok", head=head, branch=branch, remote=remote,
+        )
         return ReduceResult(True, head, "", job_id, tuple(skipped))
 
     @staticmethod
@@ -267,3 +319,11 @@ class Reducer:
             return ""
         parts = [line.split() for line in (result.stdout or "").splitlines()]
         return next((item[0] for item in parts if len(item) >= 2 and item[1] == ref), "")
+
+    def _range_spec(self, worktree: Path, remote: str) -> str:
+        """Scan everything not on the remote; fall back to the branch fork point."""
+        if remote:
+            return f"{remote}..HEAD"
+        base = self._git(worktree, "merge-base", "origin/main", "HEAD")
+        base_sha = base.stdout.strip() if base.returncode == 0 else ""
+        return f"{base_sha}..HEAD" if base_sha else ""
