@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dispatcher runner input",
+  "description": "Unified job input passed by the dispatcher to a runner adapter.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "role",
+    "prompt",
+    "ticket",
+    "pr",
+    "worktree",
+    "limits",
+    "capabilities"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "role": {
+      "enum": ["implementer", "reviewer", "repair", "planner"]
+    },
+    "prompt": { "type": "string", "minLength": 1 },
+    "ticket": { "type": ["integer", "null"], "minimum": 1 },
+    "pr": { "type": ["integer", "null"], "minimum": 1 },
+    "worktree": { "type": ["string", "null"] },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout_seconds"],
+      "properties": {
+        "timeout_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
