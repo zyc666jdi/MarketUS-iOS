@@ -813,6 +813,15 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         self.assertEqual(len(pr_edits), 1)
         self.assertIn("merge:requested", pr_edits[0])
 
+    def test_environment_dispatcher_tests_do_not_block_approve(self):
+        code, final, pr_edits = self._review(
+            {"status:in-progress"}, "APPROVE", test_status="environment"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        self.assertEqual(len(pr_edits), 1)
+        self.assertIn("merge:requested", pr_edits[0])
+
 
 class P1BlockingPolicyTests(unittest.TestCase):
     def test_p1_section_is_the_only_blocking_section(self):
@@ -2236,10 +2245,10 @@ class ReviewTestCheckoutTests(unittest.TestCase):
         git_result: subprocess.CompletedProcess[str] | None = None,
         grace: float = 5.0,
     ):
-        commands: list[list[str]] = []
+        commands: list[tuple[list[str], int]] = []
 
-        def fake_run(args):
-            commands.append(args)
+        def fake_run(args, *, timeout_seconds, cwd=None):
+            commands.append((args, timeout_seconds))
             if args[:3] == ["git", "worktree", "add"]:
                 Path(args[4]).mkdir(parents=True, exist_ok=True)
             return git_result or subprocess.CompletedProcess(args, 0, "", "")
@@ -2254,7 +2263,7 @@ class ReviewTestCheckoutTests(unittest.TestCase):
                 mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
                 mock.patch.object(dispatcher, "REVIEW_TEST_COMMAND", test_command),
                 mock.patch.object(dispatcher.shutil, "which", return_value=test_command[0]),
-                mock.patch.object(dispatcher, "run", side_effect=fake_run),
+                mock.patch.object(dispatcher, "run_bounded", side_effect=fake_run),
                 mock.patch.object(dispatcher, "REVIEW_TEST_KILL_GRACE_SECONDS", grace),
                 mock.patch.dict(os.environ, env_patch, clear=False),
             ):
@@ -2288,7 +2297,7 @@ class ReviewTestCheckoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
-                mock.patch.object(dispatcher, "run") as git_run,
+                mock.patch.object(dispatcher, "run_bounded") as git_run,
                 mock.patch.dict(
                     os.environ, {"MARKETUS_REVIEW_TESTS": "0"}, clear=False
                 ),
@@ -2312,9 +2321,14 @@ class ReviewTestCheckoutTests(unittest.TestCase):
         self.assertEqual(result.command, " ".join(command))
         self.assertIn("OK", result.output)
         self.assertTrue(
-            any(args[:3] == ["git", "worktree", "remove"] for args in commands)
+            any(
+                args[:3] == ["git", "worktree", "remove"]
+                for args, _timeout in commands
+            )
         )
-        self.assertTrue(any(args[:2] == ["git", "update-ref"] for args in commands))
+        self.assertTrue(
+            any(args[:2] == ["git", "update-ref"] for args, _timeout in commands)
+        )
 
     def test_failing_suite_returns_failed_p1(self):
         command = (
@@ -2327,6 +2341,61 @@ class ReviewTestCheckoutTests(unittest.TestCase):
         self.assertTrue(result.blocks_review)
         self.assertEqual(result.command, " ".join(command))
         self.assertIn("FAILED", result.output)
+
+    def test_signal_terminated_suite_is_reported_as_environment(self):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(signal=sig):
+                command = (
+                    sys.executable,
+                    "-c",
+                    f"import os, signal; os.kill(os.getpid(), signal.{sig.name})",
+                )
+                result, _ = self._run_with_command(command)
+                self.assertEqual(result.status, "environment")
+                self.assertFalse(result.blocks_review)
+                self.assertIn(f"signal {int(sig)}", result.output)
+
+    def test_git_checkout_commands_are_bounded(self):
+        command = (sys.executable, "-c", "print('OK')")
+        _, commands = self._run_with_command(command)
+        git_calls = [
+            (args, timeout) for args, timeout in commands if args[:1] == ["git"]
+        ]
+        self.assertTrue(git_calls)
+        self.assertTrue(any(args[:2] == ["git", "fetch"] for args, _ in git_calls))
+        self.assertTrue(
+            any(args[:3] == ["git", "worktree", "add"] for args, _ in git_calls)
+        )
+        self.assertTrue(
+            all(
+                timeout == dispatcher.REVIEW_GIT_TIMEOUT_SECONDS
+                for _, timeout in git_calls
+            )
+        )
+
+    def test_bounded_command_times_out_and_kills_group(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('started', flush=True); time.sleep(10)",
+        ]
+        started = time.monotonic()
+        with mock.patch.object(dispatcher, "REVIEW_TEST_KILL_GRACE_SECONDS", 0.2):
+            result = dispatcher.run_bounded(command, timeout_seconds=1)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, dispatcher.REVIEW_COMMAND_TIMEOUT_EXIT)
+        self.assertIn("timeout after 1s", result.stderr)
+        self.assertIn("started", result.stdout)
+        self.assertLess(elapsed, 5)
+
+    def test_unknown_status_is_non_blocking_and_alarmed(self):
+        result = dispatcher.ReviewTestResult("mystery", "make test-dispatcher", "")
+        self.assertFalse(result.blocks_review)
+        text = dispatcher.format_review_tests(result)
+        self.assertIn("未知状态", text)
+        self.assertIn("不阻塞", text)
 
     def test_timeout_kills_process_group_and_is_environment_only(self):
         command = (

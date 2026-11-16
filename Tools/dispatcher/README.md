@@ -86,6 +86,17 @@ Reviewer 以只读沙箱运行：dsh 使用 `DSH_PERMISSION_MODE=read-only`，co
 GitHub 不允许 approve 自己的 PR，所以 Dispatcher 用 **评论 verdict + `merge:requested` 标签**
 表示通过，最终仍由人类合并。
 
+### 独立测试执行
+
+`review` 会在 PR head 的临时 worktree 中运行 `make test-dispatcher`：
+
+- 默认硬超时 300s，可用 `MARKETUS_REVIEW_TEST_TIMEOUT` 覆盖（正整数秒）。
+- `MARKETUS_REVIEW_TESTS=0` 跳过执行；也接受 `false` / `no` / `off`（不区分大小写）。
+  跳过时报告 `skipped by config`，CI 已覆盖 dispatcher-tests。
+- 超时、被信号终止、checkout/环境失败都记为 environment，不单独阻塞评审；
+  只有正数非零退出（测试断言失败）才是 P1。
+- `git fetch` / `git worktree add` 等 checkout 命令同样有 60s 超时和进程组清理。
+
 ### launchd（不会自动安装）
 
 ```bash
