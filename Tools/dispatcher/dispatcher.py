@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,7 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, NamedTuple, TextIO
 
 DISPATCHER_ROOT = Path(__file__).resolve().parent
 if str(DISPATCHER_ROOT) not in sys.path:
@@ -1760,60 +1761,262 @@ def comment_pr(number: int, body: str) -> None:
     gh(["pr", "comment", str(number), "--body", body])
 
 
-REVIEW_TEST_TIMEOUT_SECONDS = 600
+REVIEW_TEST_TIMEOUT_SECONDS = 300
+REVIEW_TEST_TIMEOUT_ENV = "MARKETUS_REVIEW_TEST_TIMEOUT"
+REVIEW_TESTS_ENV = "MARKETUS_REVIEW_TESTS"
+REVIEW_TEST_KILL_GRACE_SECONDS = 5.0
+REVIEW_TEST_COMMAND = ("make", "test-dispatcher")
+REVIEW_GIT_TIMEOUT_SECONDS = 60
+REVIEW_COMMAND_TIMEOUT_EXIT = 124
+REVIEW_COMMAND_LAUNCH_EXIT = 127
+REVIEW_TEST_STATUSES = frozenset(
+    {"passed", "failed", "skipped", "timeout", "environment"}
+)
 
 
-def run_review_tests(pr: int) -> tuple[bool | None, str, str]:
-    """Run ``make test-dispatcher`` on a throwaway checkout of the PR head.
+class ReviewTestResult(NamedTuple):
+    """Structured outcome of the dispatcher's independent review test run.
 
-    Returns ``(passed, command, output)``. ``passed`` is ``None`` when the
-    checkout itself failed, so callers can distinguish a real test failure from
-    an environment problem. The PR branch is never modified: a detached
-    worktree is used and removed (including its temporary ref) afterwards.
+    ``status`` is one of ``REVIEW_TEST_STATUSES``. Only ``failed`` (a positive
+    process exit code) is objective evidence of a code failure; timeout,
+    signal termination and environment problems never block a review alone.
+    Unknown statuses are rendered as alarmed, environment-only results.
     """
-    if shutil.which("make") is None:
-        return None, "make test-dispatcher", "make not found"
+
+    status: str
+    command: str
+    output: str
+
+    @property
+    def blocks_review(self) -> bool:
+        """Whether this result is P1 evidence against the PR."""
+        return self.status == "failed"
+
+
+def review_test_timeout_seconds() -> int:
+    """Return the configured hard timeout, falling back to the default."""
+    raw = os.environ.get(REVIEW_TEST_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return REVIEW_TEST_TIMEOUT_SECONDS
+    try:
+        configured = int(raw)
+    except ValueError:
+        return REVIEW_TEST_TIMEOUT_SECONDS
+    return configured if configured > 0 else REVIEW_TEST_TIMEOUT_SECONDS
+
+
+def review_tests_enabled() -> bool:
+    """Whether the dispatcher should run its independent test suite.
+
+    The default is enabled. ``MARKETUS_REVIEW_TESTS`` accepts ``0``,
+    ``false``, ``no`` or ``off`` (case-insensitive) to skip the run; CI
+    already executes the dispatcher tests.
+    """
+    raw = os.environ.get(REVIEW_TESTS_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _signal_process_group(process: subprocess.Popen[str], sig: int) -> None:
+    """Signal the whole process group; ``start_new_session`` makes pid the PGID."""
+    try:
+        os.killpg(process.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
+    """Terminate a timed-out process group, drain its output and reap it.
+
+    SIGTERM is sent first so ``make`` / ``git`` and their children can flush
+    logs; if the group outlives the grace period every member is SIGKILLed.
+    ``communicate`` then closes the pipes and reaps the group leader.
+    """
+
+    def drain() -> tuple[str, str]:
+        stdout, stderr = process.communicate(timeout=REVIEW_TEST_KILL_GRACE_SECONDS)
+        return stdout or "", stderr or ""
+
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        return drain()
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_process_group(process, signal.SIGKILL)
+    try:
+        return drain()
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            return drain()
+        except subprocess.TimeoutExpired:
+            return "", ""
+
+
+def _run_bounded_process(
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    cwd: str | None = None,
+    merge_stderr: bool = False,
+) -> tuple[int | None, str, str, bool]:
+    """Run a command with a hard timeout and process-group cleanup.
+
+    Returns ``(returncode, stdout, stderr, timed_out)``. ``returncode`` is
+    ``None`` when the command could not be started or timed out.
+    """
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as error:
+        return None, "", str(error), False
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        return process.returncode, stdout or "", stderr or "", False
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_process_group(process)
+        return None, stdout, stderr, True
+
+
+def run_bounded(
+    command: list[str], *, timeout_seconds: int, cwd: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run a command with a hard timeout and process-group cleanup.
+
+    Unlike ``run()`` this never blocks forever. A timeout is reported as exit
+    code 124 and a launch failure as 127, matching common CLI conventions.
+    """
+    returncode, stdout, stderr, timed_out = _run_bounded_process(
+        command, timeout_seconds=timeout_seconds, cwd=cwd
+    )
+    if timed_out:
+        note = f"timeout after {timeout_seconds}s; process group terminated"
+        stderr = f"{stderr.rstrip()}\n{note}".strip()
+        return subprocess.CompletedProcess(
+            command, REVIEW_COMMAND_TIMEOUT_EXIT, stdout, stderr
+        )
+    if returncode is None:
+        return subprocess.CompletedProcess(
+            command, REVIEW_COMMAND_LAUNCH_EXIT, stdout, stderr
+        )
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+def _run_review_test_command(
+    command: tuple[str, ...], worktree: Path, timeout_seconds: int
+) -> tuple[int | None, str, bool]:
+    """Run the test command in its own session.
+
+    Returns ``(returncode, output, timed_out)``. ``returncode`` is ``None``
+    when the command could not be started or timed out.
+    """
+    returncode, stdout, _, timed_out = _run_bounded_process(
+        list(command),
+        cwd=str(worktree),
+        timeout_seconds=timeout_seconds,
+        merge_stderr=True,
+    )
+    return returncode, stdout, timed_out
+
+
+def run_review_tests(pr: int) -> ReviewTestResult:
+    """Run the dispatcher suite on a throwaway checkout of the PR head.
+
+    The run can be skipped with ``MARKETUS_REVIEW_TESTS=0`` and is bounded by
+    ``MARKETUS_REVIEW_TEST_TIMEOUT`` (default 300s). Checkout commands are
+    bounded by ``REVIEW_GIT_TIMEOUT_SECONDS``. A timeout kills the whole
+    process group and is reported as an environment problem, not a code
+    failure. The PR branch is never modified: a detached worktree is used and
+    removed (including its temporary ref) afterwards.
+    """
+    command = tuple(REVIEW_TEST_COMMAND)
+    command_text = " ".join(command)
+    if not review_tests_enabled():
+        return ReviewTestResult(
+            "skipped",
+            command_text,
+            f"skipped by config ({REVIEW_TESTS_ENV}=0)",
+        )
+    if shutil.which(command[0]) is None:
+        return ReviewTestResult("environment", command_text, f"{command[0]} not found")
+    timeout_seconds = review_test_timeout_seconds()
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     worktree = Path(tempfile.mkdtemp(prefix=f"review-{pr}-", dir=str(WORKTREE_ROOT)))
     worktree.rmdir()
     ref = f"refs/dispatcher-review/pr-{pr}"
-    fetched = run(["git", "fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{ref}"])
+    fetched = run_bounded(
+        ["git", "fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{ref}"],
+        timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
+    )
     if fetched.returncode != 0:
-        return None, "git fetch", fetched.stderr.strip() or "git fetch failed"
+        return ReviewTestResult(
+            "environment", "git fetch", fetched.stderr.strip() or "git fetch failed"
+        )
     try:
-        added = run(["git", "worktree", "add", "--detach", str(worktree), ref])
+        added = run_bounded(
+            ["git", "worktree", "add", "--detach", str(worktree), ref],
+            timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
+        )
         if added.returncode != 0:
-            return None, "git worktree add", added.stderr.strip() or "git worktree add failed"
-        try:
-            result = subprocess.run(
-                ["make", "test-dispatcher"],
-                cwd=str(worktree),
-                capture_output=True,
-                text=True,
-                timeout=REVIEW_TEST_TIMEOUT_SECONDS,
+            return ReviewTestResult(
+                "environment",
+                "git worktree add",
+                added.stderr.strip() or "git worktree add failed",
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return None, "make test-dispatcher", str(error)
-        output = ((result.stdout or "") + (result.stderr or "")).strip()
-        return result.returncode == 0, "make test-dispatcher", output[-4000:]
+        returncode, output, timed_out = _run_review_test_command(
+            command, worktree, timeout_seconds
+        )
+        output = output.strip()
+        if timed_out:
+            if output:
+                output += "\n"
+            output += f"timeout after {timeout_seconds}s; process group terminated"
+            return ReviewTestResult("timeout", command_text, output[-4000:])
+        if returncode is None:
+            return ReviewTestResult("environment", command_text, output[-4000:])
+        if returncode < 0:
+            output = f"{output}\nprocess terminated by signal {-returncode}".strip()
+            return ReviewTestResult("environment", command_text, output[-4000:])
+        if returncode != 0:
+            return ReviewTestResult("failed", command_text, output[-4000:])
+        return ReviewTestResult("passed", command_text, output[-4000:])
     finally:
-        removed = run(["git", "worktree", "remove", "--force", str(worktree)])
+        removed = run_bounded(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
+        )
         if removed.returncode != 0:
             shutil.rmtree(worktree, ignore_errors=True)
-            run(["git", "worktree", "prune"])
-        run(["git", "update-ref", "-d", ref])
+            run_bounded(
+                ["git", "worktree", "prune"],
+                timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
+            )
+        run_bounded(
+            ["git", "update-ref", "-d", ref],
+            timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
+        )
 
 
-def format_review_tests(passed: bool | None, command: str, output: str) -> str:
-    if passed is True:
-        state = "✅ 通过"
-    elif passed is False:
-        state = "❌ 失败（P1）"
+def format_review_tests(result: ReviewTestResult) -> str:
+    states = {
+        "passed": "✅ 通过",
+        "failed": "❌ 失败（P1）",
+        "skipped": "⏭️ 跳过（配置，不阻塞）",
+        "timeout": "⚠️ 超时（环境问题，不阻塞；已终止进程组）",
+        "environment": "⚠️ 未能运行（环境问题，不阻塞）",
+    }
+    if result.status not in REVIEW_TEST_STATUSES:
+        state = "⚠️ 未知状态（环境问题，不阻塞；请检查 dispatcher 状态映射）"
     else:
-        state = "⚠️ 未能运行（环境问题，不阻塞）"
-    text = f"## Dispatcher 独立测试\n\n- 命令：`{command}`\n- 结果：{state}\n"
-    if output:
-        text += f"\n```\n{output[-2000:]}\n```\n"
+        state = states[result.status]
+    text = f"## Dispatcher 独立测试\n\n- 命令：`{result.command}`\n- 结果：{state}\n"
+    if result.output:
+        text += f"\n```\n{result.output[-2000:]}\n```\n"
     return text
 
 
@@ -1940,14 +2143,14 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
 
     if pr.get("isCrossRepository"):
         # AGENTS.md forbids checking out and executing fork code.
-        test_passed, test_command, test_output = (
-            None,
+        test_result = ReviewTestResult(
+            "environment",
             "make test-dispatcher",
             "fork PR：按安全约束不检出运行",
         )
     else:
-        test_passed, test_command, test_output = run_review_tests(args.pr)
-    test_evidence = format_review_tests(test_passed, test_command, test_output)
+        test_result = run_review_tests(args.pr)
+    test_evidence = format_review_tests(test_result)
     prompt += f"\n\n---\n\n# Dispatcher 独立测试（read-only worktree）\n\n{test_evidence}\n"
 
     run_dir = review_dir
@@ -1987,7 +2190,7 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
         else parse_verdict(text)
     )
     print(f"verdict  {verdict or 'MISSING'} (exit={code})")
-    print(f"tests    {test_passed if test_passed is not None else 'not-run'}")
+    print(f"tests    {test_result.status}")
 
     if verdict is None:
         comment_pr(
@@ -2000,7 +2203,7 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
         return 1
 
     blockers = parse_p1_blockers(text)
-    test_blocker = test_passed is False
+    test_blocker = test_result.blocks_review
     if test_blocker:
         # A failing dispatcher suite is objective P1 evidence; never let the
         # Reviewer's prose downgrade it to an advisory approval.
