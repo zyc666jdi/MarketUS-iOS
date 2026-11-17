@@ -547,8 +547,12 @@ def finish_deferred_loop(trace: LoopTrace, status: str | None = None) -> bool:
         if state.get("closed"):
             return True
         if not state:
-            # State is missing/unreadable; the caller must close locally.
-            return False
+            if trace.state_failed:
+                # State cannot be read or written; the caller must close locally.
+                return False
+            # loop-state.json is missing/corrupt but writable: still close the
+            # timeline as stale instead of falling back to ok/failed.
+            state["loop_id"] = trace.loop_id
         state["parent_done"] = True
         state["parent_status"] = status
         state["parent_error"] = trace.error

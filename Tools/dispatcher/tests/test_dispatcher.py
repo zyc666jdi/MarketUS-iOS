@@ -2744,6 +2744,7 @@ class LoopTraceTests(unittest.TestCase):
         loop_id: str,
         *,
         started_at: datetime,
+        last_event_at: datetime | None = None,
         with_start: bool = True,
     ) -> Path:
         path = self.root / loop_id / "timeline.jsonl"
@@ -2756,6 +2757,10 @@ class LoopTraceTests(unittest.TestCase):
         events.append(
             {"ts": self._iso(started_at), "event": "step_start", "step": "dispatch"}
         )
+        if last_event_at is not None:
+            events.append(
+                {"ts": self._iso(last_event_at), "event": "step_start", "step": "watch"}
+            )
         lines = [
             json.dumps(
                 {
@@ -3016,6 +3021,31 @@ class LoopTraceTests(unittest.TestCase):
         self.assertIsInstance(events[-1]["duration_ms"], int)
         self.assertGreaterEqual(events[-1]["duration_ms"], 0)
 
+    def test_missing_or_corrupt_loop_state_still_closes_stale(self):
+        for corruption, suffix in (("missing", "aaaaaaaa"), ("corrupt", "bbbbbbbb")):
+            with self.subTest(corruption=corruption):
+                trace = self._trace(f"20260101T000000-{suffix}")
+                trace.emit("loop_start")
+                dispatcher.defer_loop(trace, "repair", time.time())
+                state_path = trace.path.parent / dispatcher.LOOP_STATE_NAME
+                if corruption == "missing":
+                    state_path.unlink()
+                else:
+                    state_path.write_text("{broken", encoding="utf-8")
+
+                trace.finish_or_defer()
+
+                events = self._events(trace)
+                self.assertEqual(events[-1]["event"], "loop_end")
+                self.assertEqual(events[-1]["status"], "stale")
+                self.assertIn(
+                    "deferred repair child not done at parent exit",
+                    events[-1]["details"]["reason"],
+                )
+                self.assertFalse(trace.state_failed)
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertTrue(state["closed"])
+
     def test_normal_loop_end_statuses_are_unchanged(self):
         ok_trace = self._trace("20260101T000000-aaaaaaaa")
         ok_trace.emit("loop_start")
@@ -3052,6 +3082,16 @@ class LoopTraceTests(unittest.TestCase):
         path = self._write_open_timeline(
             "20260102T000000-cccccccc", started_at=now - timedelta(hours=2)
         )
+        # Injected threshold: exactly at the boundary stays running, one
+        # second over the boundary turns stale.
+        self.assertEqual(
+            dispatcher.summarize_loop(path, now=now, stale_seconds=7200)["status"],
+            "running",
+        )
+        self.assertEqual(
+            dispatcher.summarize_loop(path, now=now, stale_seconds=7199)["status"],
+            "stale",
+        )
         with mock.patch.dict(
             os.environ, {dispatcher.LOOP_STALE_SECONDS_ENV: ""}, clear=False
         ):
@@ -3067,12 +3107,25 @@ class LoopTraceTests(unittest.TestCase):
 
     def test_no_loop_start_uses_last_event_for_stale_age(self):
         now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
-        path = self._write_open_timeline(
+        # Two timestamps and no loop_start: the newest event must win over the
+        # initial event, both for "still running" and for stale age.
+        running = self._write_open_timeline(
             "20260102T000000-dddddddd",
-            started_at=now - timedelta(hours=3),
+            started_at=now - timedelta(hours=22),
+            last_event_at=now - timedelta(hours=1),
             with_start=False,
         )
-        summary = dispatcher.summarize_loop(path, now=now)
+        summary = dispatcher.summarize_loop(running, now=now)
+        self.assertEqual(summary["status"], "running")
+        self.assertEqual(summary["duration_ms"], 60 * 60 * 1000)
+
+        stale = self._write_open_timeline(
+            "20260102T000000-ddddddde",
+            started_at=now - timedelta(hours=22),
+            last_event_at=now - timedelta(hours=3),
+            with_start=False,
+        )
+        summary = dispatcher.summarize_loop(stale, now=now)
         self.assertEqual(summary["status"], "stale")
         self.assertEqual(summary["duration_ms"], 3 * 60 * 60 * 1000)
 
