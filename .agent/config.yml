@@ -38,8 +38,8 @@ concurrency:
 
 limits:
   timeout_minutes: 90
-  max_changed_lines: 400           # 超过则必须拆票
-  hard_max_changed_lines: 800      # 绝对上限，超过直接终止并上报
+  max_changed_lines: 1000          # 超过则必须拆票
+  hard_max_changed_lines: 1000     # 绝对上限，超过直接终止并上报
   max_files_changed: 25
   max_new_dependencies: 0          # 新增 SPM 依赖需人类批准
   tool_call_budget: 400
