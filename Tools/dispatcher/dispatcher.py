@@ -1133,6 +1133,13 @@ def build_auto_pr_body(issue: dict[str, Any]) -> str:
     )
 
 
+def build_auto_pr_note(issue: dict[str, Any]) -> str:
+    number = issue["number"]
+    return (f"🤖 Dispatcher 自动收尾：Agent 退出时未创建 PR，已自动 commit/push 并创建本 PR。\n\n"
+            f"- Ticket: #{number}\n- 日志：`.agent/runs/{number}/`\n"
+            "- 验收证据需在合并前由人类复核补齐。")
+
+
 def remove_worktree(worktree: Path) -> subprocess.CompletedProcess[str] | None:
     if not worktree.exists():
         return None
@@ -1145,14 +1152,14 @@ def ensure_agent_pr(
     issue: dict[str, Any],
     run_id: str = "",
 ) -> tuple[dict[str, Any] | None, str]:
-    """Salvage an Agent run that left changes but no PR.
+    """Salvage an Agent run that left changes, a pushed commit, or a PR.
 
-    Returns ``(pr, "")`` on success, ``(None, "")`` when there is nothing to
-    salvage, and ``(None, reason)`` when a step fails. A secret-scan hit also
-    removes the dirty worktree so the token never reaches the public remote.
+    Returns ``(pr, warning)`` when a PR exists (``warning`` is non-empty when
+    labels or the salvage comment degraded), ``(None, "")`` when there is
+    nothing to salvage, and ``(None, reason)`` when PR creation fails. A
+    secret-scan hit also removes the dirty worktree so the token never reaches
+    the public remote.
     """
-    if not worktree_has_work(worktree):
-        return None, ""
     base_sha = run(["git", "-C", str(worktree), "merge-base", "origin/main", "HEAD"])
     job_id = derive_job_id(
         "implementer",
@@ -1160,42 +1167,43 @@ def ensure_agent_pr(
         (base_sha.stdout or "").strip(),
         branch,
     )
-    reduced = Reducer(
+    reducer = Reducer(
         runner=run,
         scanner=scan_staged_secrets,
         range_scanner=scan_range_secrets,
         jobs_root=JOB_ROOT,
-    ).commit_and_push(worktree, branch, issue, job_id, run_id=run_id)
-    if not reduced.ok:
-        reason = reduced.reason
-        if reason.startswith("密钥扫描命中："):
-            removed = remove_worktree(worktree)
-            if removed is not None and removed.returncode != 0:
-                reason += f"；清理 worktree 失败：{removed.stderr.strip() or 'unknown'}"
-        return None, reason
+    )
+    existing = reducer.find_open_pr(branch)
+    remote = run([
+        "git", "-C", str(worktree),
+        "ls-remote", "--heads", "origin", f"refs/heads/{branch}",
+    ])
+    remote_commit = remote.returncode == 0 and bool(remote.stdout.strip())
+    has_work = worktree_has_work(worktree)
+    if not has_work and existing is None and not remote_commit:
+        return None, ""
+
+    if has_work:
+        reduced = reducer.commit_and_push(worktree, branch, issue, job_id, run_id=run_id)
+        if not reduced.ok:
+            reason = reduced.reason
+            if reason.startswith("密钥扫描命中："):
+                removed = remove_worktree(worktree)
+                if removed is not None and removed.returncode != 0:
+                    reason += f"；清理 worktree 失败：{removed.stderr.strip() or 'unknown'}"
+            return None, reason
 
     title = f"chore(agent): 自动收尾 #{issue['number']}"
-    created = run(
-        [
-            "gh", "pr", "create", "--base", "main", "--head", branch,
-            "--title", title, "--body", build_auto_pr_body(issue),
-            *[item for label in auto_pr_labels(issue) for item in ("--label", label)],
-        ]
+    opened = reducer.ensure_pr(
+        worktree, branch, issue, job_id, title, build_auto_pr_body(issue), auto_pr_labels(issue)
     )
-    if created.returncode != 0:
-        return None, f"gh pr create 失败：{created.stderr.strip() or 'unknown'}"
-    lines = [line.strip() for line in (created.stdout or "").splitlines() if line.strip()]
-    url = lines[-1] if lines else ""
-    match = re.search(r"/pull/(\d+)", url)
-    if match is None:
-        return None, f"gh pr create 未返回 PR URL：{url or '(empty)'}"
-    return {
-        "number": int(match.group(1)),
-        "url": url,
-        "title": title,
-        "headRefName": branch,
-        "isDraft": False,
-    }, ""
+    if opened.pr is None:
+        return None, opened.reason or "创建 PR 失败"
+    warnings = [opened.reason] if not opened.ok else []
+    noted = reducer.comment_pr(opened.pr["number"], job_id, build_auto_pr_note(issue))
+    if not noted.ok:
+        warnings.append(noted.reason)
+    return opened.pr, "；".join(warnings)
 
 
 def acquire_named_lock(name: str, state_dir: Path | None = None) -> TextIO | None:
@@ -1512,11 +1520,12 @@ def cmd_once(args: argparse.Namespace) -> int:
         pr = prs[0]
         set_status(number, "status:in-review")
         if auto_pr is not None:
+            degraded = f"\n\n⚠️ {auto_reason}" if auto_reason else ""
             comment(
                 number,
                 f"✅ 已创建 PR（Dispatcher 自动收尾）：{pr['url']}\n\n"
                 "已转入评审，Reviewer 会继续跟进；验收证据需在合并前由人类复核。"
-                f"\n\n日志：`.agent/runs/{number}/`",
+                f"{degraded}\n\n日志：`.agent/runs/{number}/`",
             )
         else:
             comment(number, f"✅ PR 已创建：{pr['url']}\n\n日志：`.agent/runs/{number}/`")

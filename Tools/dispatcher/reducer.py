@@ -1,10 +1,10 @@
-"""Phase 1b-i: idempotent reducer for the implementer commit/push path.
+"""Phase 1b: idempotent reducer for the implementer/auto-salvage path.
 
-A job's ``scan -> commit -> push`` steps are recorded in
-``.agent/jobs/<job_id>/operations.jsonl``; a re-run skips recorded steps and
-resumes at the first failure.  Git state is re-checked too, so repeated calls
-never duplicate a commit or force a push.  PR creation, comments, labels and
-merges are out of scope, and this module never force-pushes.
+A job's ``scan -> commit -> push -> pr -> labels -> comment`` steps are recorded
+in ``.agent/jobs/<job_id>/operations.jsonl``; a re-run skips recorded steps and
+resumes at the first failure.  Git and GitHub state are re-checked too, so
+repeated calls never duplicate a commit, PR, label edit or comment.  This
+module never force-pushes and never merges.
 """
 
 from __future__ import annotations
@@ -39,6 +39,40 @@ class ReduceResult:
     reason: str = ""
     job_id: str = ""
     skipped: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class GitHubResult:
+    """Outcome of an idempotent GitHub write; ``pr`` is set by ensure_pr()."""
+
+    ok: bool
+    reason: str = ""
+    pr: dict[str, Any] | None = None
+    skipped: bool = False
+
+
+def job_marker(job_id: str) -> str:
+    """Return the marker that makes a job's GitHub writes idempotent."""
+    return f"<!-- job:{job_id} -->"
+
+
+def _with_marker(body: str, job_id: str) -> str:
+    marker = job_marker(job_id)
+    if not body:
+        return marker
+    return body if marker in body else f"{body.rstrip()}\n\n{marker}\n"
+
+
+def _valid_job_id(job_id: str) -> bool:
+    return bool(JOB_ID_PATTERN.match(job_id or ""))
+
+
+def _valid_branch(branch: str) -> bool:
+    return (
+        bool(BRANCH_PATTERN.match(branch or ""))
+        and ".." not in (branch or "")
+        and not (branch or "").endswith(("/", ".lock"))
+    )
 
 
 def derive_job_id(role: str, issue: int, base_sha: str = "", branch: str = "") -> str:
@@ -123,13 +157,21 @@ class _OperationLog:
                 return item
         return None
 
-    def has(self, step: str, **fields: Any) -> bool:
+    def _match(self, step: str, statuses: tuple[str, ...], fields: dict[str, Any]) -> bool:
         for item in self.records():
-            if item.get("step") != step or item.get("status") not in ("ok", "skipped"):
+            if item.get("step") != step or item.get("status") not in statuses:
                 continue
             if all(item.get(key) == value for key, value in fields.items()):
                 return True
         return False
+
+    def has(self, step: str, **fields: Any) -> bool:
+        """Return True only for a successful step with the same key."""
+        return self._match(step, ("ok",), fields)
+
+    def recorded(self, step: str, **fields: Any) -> bool:
+        """Return True when a success or skip is already logged (dedupe)."""
+        return self._match(step, ("ok", "skipped"), fields)
 
     def append(self, *, step: str, status: str, reason: str = "", **fields: Any) -> None:
         record = {"ts": _utc_now(), "step": step, "status": status, "reason": reason}
@@ -174,10 +216,9 @@ class Reducer:
         number = issue_number(issue)
         if number <= 0:
             return ReduceResult(False, reason="issue 缺少有效的 number", job_id=job_id)
-        if not JOB_ID_PATTERN.match(job_id or ""):
+        if not _valid_job_id(job_id):
             return ReduceResult(False, reason=f"job_id 非法：{job_id!r}", job_id=job_id)
-        valid_branch = BRANCH_PATTERN.match(branch or "") and ".." not in branch
-        if not valid_branch or branch.endswith(("/", ".lock")):
+        if not _valid_branch(branch):
             return ReduceResult(False, reason=f"branch 非法：{branch!r}", job_id=job_id)
         if not path.is_dir():
             return ReduceResult(False, reason=f"worktree 不存在：{path}", job_id=job_id)
@@ -241,7 +282,7 @@ class Reducer:
             return ReduceResult(False, head, reason, job_id, tuple(skipped))
         else:
             skipped.append("commit")
-            if not log.has("commit", head=head):
+            if not log.recorded("commit", head=head):
                 log.append(step="commit", status="skipped", head=head, reason="没有待提交改动")
 
         remote = self._remote_head(path, branch)
@@ -274,7 +315,7 @@ class Reducer:
 
         if remote == head:
             skipped.append("push")
-            if not log.has("push", head=head, branch=branch):
+            if not log.recorded("push", head=head, branch=branch):
                 log.append(
                     step="push", status="skipped", reason="远端已包含本地 HEAD",
                     head=head, branch=branch,
@@ -293,6 +334,193 @@ class Reducer:
             step="push", status="ok", head=head, branch=branch, remote=remote,
         )
         return ReduceResult(True, head, "", job_id, tuple(skipped))
+
+    def ensure_pr(
+        self,
+        worktree: Path,
+        branch: str,
+        issue: dict[str, Any] | int,
+        job_id: str,
+        title: str,
+        body: str,
+        labels: list[str] | tuple[str, ...] = (),
+    ) -> GitHubResult:
+        """Create or reuse the open PR for ``branch``, then apply labels.
+
+        An existing PR is found by head branch first; a created body carries
+        ``<!-- job:<job_id> -->`` and labels go through :meth:`set_labels`.
+        """
+        if issue_number(issue) <= 0:
+            return GitHubResult(False, reason="issue 缺少有效的 number")
+        if not _valid_job_id(job_id):
+            return GitHubResult(False, reason=f"job_id 非法：{job_id!r}")
+        if not Path(worktree).is_dir():
+            return GitHubResult(False, reason=f"worktree 不存在：{worktree}")
+        log = _OperationLog(self.jobs_root / job_id / "operations.jsonl")
+        wanted = sorted({str(label) for label in (labels or ())})
+        existing, error = self._find_open_pr(branch)
+        if error:
+            reason = f"gh pr list 失败：{error}"
+            log.append(step="pr", status="failed", reason=reason, branch=branch)
+            return GitHubResult(False, reason=reason)
+        if existing is not None:
+            pr = dict(existing)
+            marker = job_marker(job_id)
+            marker_added = marker not in str(pr.get("body") or "")
+            if marker_added:
+                marked = _with_marker(str(pr.get("body") or ""), job_id)
+                edited = self._gh(["pr", "edit", str(pr["number"]), "--body", marked])
+                if edited.returncode != 0:
+                    reason = f"补充 PR job marker 失败：{edited.stderr.strip() or 'unknown'}"
+                    log.append(step="pr", status="failed", reason=reason,
+                               branch=branch, number=pr["number"])
+                    return GitHubResult(False, reason=reason, pr=pr)
+                pr["body"] = marked
+            if not log.recorded("pr", number=pr["number"], branch=branch):
+                log.append(step="pr", status="skipped", reason="已存在 open PR",
+                           branch=branch, number=pr["number"], url=pr.get("url", ""),
+                           marker_added=marker_added)
+        else:
+            created = self._gh([
+                "pr", "create", "--base", "main", "--head", branch,
+                "--title", title, "--body", _with_marker(body, job_id),
+            ])
+            if created.returncode != 0:
+                reason = f"gh pr create 失败：{created.stderr.strip() or 'unknown'}"
+                log.append(step="pr", status="failed", reason=reason, branch=branch)
+                return GitHubResult(False, reason=reason)
+            url = next(
+                (line.strip() for line in reversed((created.stdout or "").splitlines()) if line.strip()),
+                "",
+            )
+            match = re.search(r"/pull/(\d+)", url)
+            if match is None:
+                reason = f"gh pr create 未返回 PR URL：{url or '(empty)'}"
+                log.append(step="pr", status="failed", reason=reason, branch=branch)
+                return GitHubResult(False, reason=reason)
+            pr = {
+                "number": int(match.group(1)), "url": url,
+                "title": title, "headRefName": branch, "isDraft": False,
+            }
+            log.append(step="pr", status="ok", branch=branch, number=pr["number"], url=url)
+        if wanted:
+            labeled = self.set_labels("pr", pr["number"], wanted, (), job_id)
+            if not labeled.ok:
+                return GitHubResult(False, reason=labeled.reason, pr=pr)
+        return GitHubResult(True, pr=pr, skipped=existing is not None)
+
+    def comment_pr(
+        self,
+        pr: dict[str, Any] | int,
+        job_id: str,
+        body: str,
+    ) -> GitHubResult:
+        """Post ``body`` on a PR once per job, guarded by its marker."""
+        number = pr if isinstance(pr, int) else int((pr or {}).get("number") or 0)
+        if number <= 0:
+            return GitHubResult(False, reason="PR 编号非法")
+        if not _valid_job_id(job_id):
+            return GitHubResult(False, reason=f"job_id 非法：{job_id!r}")
+        marker = job_marker(job_id)
+        log = _OperationLog(self.jobs_root / job_id / "operations.jsonl")
+        if log.has("comment", number=number, marker=marker):
+            return GitHubResult(True, skipped=True)
+
+        comments, error = self._pr_comment_bodies(number)
+        if error:
+            reason = f"读取 PR 评论失败：{error}"
+            log.append(step="comment", status="failed", reason=reason, number=number)
+            return GitHubResult(False, reason=reason)
+        if any(marker in text for text in comments):
+            log.append(step="comment", status="skipped", reason="marker 已存在",
+                       number=number, marker=marker)
+            return GitHubResult(True, skipped=True)
+
+        posted = self._gh(["pr", "comment", str(number), "--body", _with_marker(body, job_id)])
+        if posted.returncode != 0:
+            reason = f"gh pr comment 失败：{posted.stderr.strip() or 'unknown'}"
+            log.append(step="comment", status="failed", reason=reason, number=number)
+            return GitHubResult(False, reason=reason)
+        log.append(step="comment", status="ok", number=number, marker=marker)
+        return GitHubResult(True)
+
+    def set_labels(
+        self,
+        kind: str,
+        number: int,
+        add: list[str] | tuple[str, ...] | None,
+        remove: list[str] | tuple[str, ...] | None,
+        job_id: str,
+    ) -> GitHubResult:
+        """Add/remove labels on a PR or issue, once per job."""
+        if kind not in ("pr", "issue"):
+            return GitHubResult(False, reason=f"kind 非法：{kind!r}")
+        target = int(number or 0)
+        if target <= 0:
+            return GitHubResult(False, reason="number 非法")
+        if not _valid_job_id(job_id):
+            return GitHubResult(False, reason=f"job_id 非法：{job_id!r}")
+
+        added = sorted({str(label) for label in (add or ())})
+        removed = sorted({str(label) for label in (remove or ())} - set(added))
+        log = _OperationLog(self.jobs_root / job_id / "operations.jsonl")
+        if log.has("labels", kind=kind, number=target, add=added, remove=removed):
+            return GitHubResult(True, skipped=True)
+        command = [kind, "edit", str(target)]
+        for label in added:
+            command += ["--add-label", label]
+        for label in removed:
+            command += ["--remove-label", label]
+        if len(command) == 3:
+            return GitHubResult(True, skipped=True)
+        result = self._gh(command)
+        if result.returncode != 0:
+            reason = f"gh {kind} edit 失败：{result.stderr.strip() or 'unknown'}"
+            log.append(step="labels", status="failed", reason=reason,
+                       kind=kind, number=target, add=added, remove=removed)
+            return GitHubResult(False, reason=reason)
+        log.append(step="labels", status="ok", kind=kind, number=target,
+                   add=added, remove=removed)
+        return GitHubResult(True)
+
+    def _gh(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        return self.runner(["gh", *args])
+
+    def _gh_json(self, args: list[str]) -> tuple[Any, str]:
+        result = self._gh(args)
+        if result.returncode != 0:
+            return None, result.stderr.strip() or "unknown"
+        try:
+            return json.loads(result.stdout or "null"), ""
+        except json.JSONDecodeError:
+            return None, f"无法解析 gh 输出：{(result.stdout or '').strip()[:200]}"
+
+    def find_open_pr(self, branch: str) -> dict[str, Any] | None:
+        """Return the open PR for ``branch``, or None."""
+        pr, _ = self._find_open_pr(branch)
+        return pr
+
+    def _find_open_pr(self, branch: str) -> tuple[dict[str, Any] | None, str]:
+        data, error = self._gh_json([
+            "pr", "list", "--head", branch, "--state", "open",
+            "--json", "number,url,title,headRefName,isDraft,body", "--limit", "1",
+        ])
+        if error:
+            return None, error
+        if not isinstance(data, list):
+            return None, "gh pr list 返回格式异常"
+        if not data:
+            return None, ""
+        return (data[0], "") if isinstance(data[0], dict) else (None, "gh pr list 返回格式异常")
+
+    def _pr_comment_bodies(self, number: int) -> tuple[list[str], str]:
+        data, error = self._gh_json(["pr", "view", str(number), "--json", "comments"])
+        if error:
+            return [], error
+        if not isinstance(data, dict):
+            return [], "gh pr view 返回格式异常"
+        return [str(item.get("body") or "") for item in data.get("comments") or []
+                if isinstance(item, dict)], ""
 
     @staticmethod
     def _commit_message(number: int, job_id: str, run_id: str) -> tuple[str, str]:

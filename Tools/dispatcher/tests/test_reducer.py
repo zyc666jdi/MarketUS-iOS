@@ -301,12 +301,20 @@ class ReducerGitTests(unittest.TestCase):
     def test_ensure_agent_pr_reuses_job_dir_after_push_failure(self):
         (self.repo / "change.txt").write_text("one\n", encoding="utf-8")
         pushes = {"failures": 1, "count": 0}
+        commands: list[list[str]] = []
 
         def scripted(command):
+            commands.append(list(command))
+            if command[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
             if command[:3] == ["gh", "pr", "create"]:
                 return subprocess.CompletedProcess(
                     command, 0, "https://example/pull/77\n", ""
                 )
+            if command[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(command, 0, '{"comments": []}', "")
+            if command[:2] == ["gh", "pr"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
             if "push" in command:
                 pushes["count"] += 1
                 if pushes["failures"]:
@@ -347,6 +355,67 @@ class ReducerGitTests(unittest.TestCase):
         self.assertEqual(len([e for e in entries if e["step"] == "push" and e["status"] == "ok"]), 1)
         self.assertEqual(len([e for e in entries if e["step"] == "push" and e["status"] == "failed"]), 1)
         self.assertEqual(pushes["count"], 2)
+        creates = [command for command in commands if command[:3] == ["gh", "pr", "create"]]
+        self.assertEqual(len(creates), 1)
+        self.assertIn(
+            "<!-- job:implementer-106-",
+            creates[0][creates[0].index("--body") + 1],
+        )
+        comments = [command for command in commands if command[:3] == ["gh", "pr", "comment"]]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("<!-- job:implementer-106-", comments[0][-1])
+
+    def test_ensure_agent_pr_retries_pr_when_branch_not_ahead(self):
+        (self.repo / "change.txt").write_text("one\n", encoding="utf-8")
+        creates = {"count": 0}
+
+        def scripted(command):
+            if command[:3] == ["gh", "pr", "list"]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[:3] == ["gh", "pr", "create"]:
+                creates["count"] += 1
+                if creates["count"] == 1:
+                    return subprocess.CompletedProcess(command, 1, "", "simulated create failure")
+                return subprocess.CompletedProcess(
+                    command, 0, "https://example/pull/77\n", ""
+                )
+            if command[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(command, 0, '{"comments": []}', "")
+            if command[:2] == ["gh", "pr"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, capture_output=True, text=True, check=False)
+
+        issue = {"number": 106, "title": "test"}
+        with (
+            mock.patch.object(dispatcher, "run", side_effect=scripted),
+            mock.patch.object(dispatcher, "gitleaks_hits", return_value=[]),
+            mock.patch.object(dispatcher, "gitleaks_range_hits", return_value=[]),
+            mock.patch.object(dispatcher, "JOB_ROOT", self.jobs),
+        ):
+            first, first_reason = dispatcher.ensure_agent_pr(
+                self.repo, BRANCH, issue, run_id="run-1"
+            )
+            self.assertTrue(self._remote())
+            self._git("reset", "--hard", "origin/main")
+            second, second_reason = dispatcher.ensure_agent_pr(
+                self.repo, BRANCH, issue, run_id="run-1"
+            )
+        self.assertIsNone(first)
+        self.assertIn("gh pr create 失败", first_reason)
+        self.assertIsNotNone(second)
+        self.assertEqual(second["number"], 77)
+        self.assertEqual(second_reason, "")
+        self.assertEqual(creates["count"], 2)
+        job_dirs = [path for path in self.jobs.iterdir() if path.is_dir()]
+        self.assertEqual(len(job_dirs), 1)
+        entries = [
+            json.loads(line)
+            for line in (job_dirs[0] / "operations.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        pr_steps = [e for e in entries if e["step"] == "pr"]
+        self.assertEqual([e["status"] for e in pr_steps], ["failed", "ok"])
+        self.assertEqual(len([e for e in entries if e["step"] == "commit" and e["status"] == "ok"]), 1)
+        self.assertEqual(len([e for e in entries if e["step"] == "push" and e["status"] == "ok"]), 1)
 
     def test_diverged_remote_push_fails_without_force(self):
         other = self.root / "other"
@@ -380,3 +449,136 @@ class ReducerGitTests(unittest.TestCase):
                 {"--force", "-f", "--force-with-lease"} & set(command), command
             )
         self.assertEqual(self._remote(), remote_before)
+
+
+class ReducerGitHubTests(unittest.TestCase):
+    """Idempotent PR, comment and label writes against a fake gh."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.jobs = self.root / "jobs"
+        self.worktree = self.root / "worktree"
+        self.worktree.mkdir()
+        self.calls = []
+        self.prs = []
+        self.comments = {}
+        self.fail_once = {}
+
+    def _runner(self, command):
+        self.calls.append(list(command))
+        key = " ".join(command[:3])
+        if self.fail_once.get(key, 0):
+            self.fail_once[key] -= 1
+            return subprocess.CompletedProcess(command, 1, "", f"simulated {key} failure")
+        if command[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(command, 0, json.dumps(self.prs), "")
+        if command[:3] == ["gh", "pr", "create"]:
+            number = 77 + len(self.prs)
+            url = f"https://example/pull/{number}"
+            self.prs.append({"number": number, "url": url})
+            return subprocess.CompletedProcess(command, 0, f"{url}\n", "")
+        if command[:3] == ["gh", "pr", "view"]:
+            bodies = [{"body": b} for b in self.comments.get(int(command[3]), [])]
+            return subprocess.CompletedProcess(command, 0, json.dumps({"comments": bodies}), "")
+        if command[:3] == ["gh", "pr", "comment"]:
+            self.comments.setdefault(int(command[3]), []).append(command[command.index("--body") + 1])
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:3] in (["gh", "pr", "edit"], ["gh", "issue", "edit"]):
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 1, "", f"unexpected: {command}")
+
+    def _reducer(self):
+        return reducer.Reducer(runner=self._runner, jobs_root=self.jobs)
+
+    def test_ensure_pr_creates_once_then_reuses_open_pr(self):
+        issue = {"number": 108}
+        labels = ["risk:medium", "ai:generated"]
+        self.fail_once["gh pr create"] = 1
+        failed = self._reducer().ensure_pr(
+            self.worktree, BRANCH, issue, "job-1", "title", "body", labels
+        )
+        self.assertFalse(failed.ok)
+        self.assertIn("gh pr create 失败", failed.reason)
+        first = self._reducer().ensure_pr(
+            self.worktree, BRANCH, issue, "job-1", "title", "body", labels
+        )
+        self.assertTrue(first.ok, first.reason)
+        self.assertEqual(first.pr["number"], 77)
+        creates = [c for c in self.calls if c[:3] == ["gh", "pr", "create"]]
+        self.assertEqual(len(creates), 2)
+        self.assertIn("<!-- job:job-1 -->", creates[-1][creates[-1].index("--body") + 1])
+        log_text = (self.jobs / "job-1" / "operations.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"step": "pr"', log_text)
+        self.assertIn('"step": "labels"', log_text)
+        self.assertIn('"status": "failed"', log_text)
+
+        second = self._reducer().ensure_pr(
+            self.worktree, BRANCH, issue, "job-1", "title", "body", labels
+        )
+        self.assertTrue(second.ok, second.reason)
+        self.assertTrue(second.skipped)
+        body_edits = [
+            c for c in self.calls
+            if c[:3] == ["gh", "pr", "edit"] and "--body" in c
+        ]
+        self.assertEqual(len(body_edits), 1)
+        self.assertIn(
+            "<!-- job:job-1 -->", body_edits[0][body_edits[0].index("--body") + 1]
+        )
+
+    def test_comment_pr_posts_once_and_marker_blocks_duplicate(self):
+        first = self._reducer().comment_pr(77, "job-1", "salvage note")
+        self.assertTrue(first.ok, first.reason)
+        second = self._reducer().comment_pr(77, "job-1", "salvage note")
+        self.assertTrue(second.skipped)
+        self.assertEqual(len(self.comments[77]), 1)
+        self.assertIn("<!-- job:job-1 -->", self.comments[77][0])
+        (self.jobs / "job-1" / "operations.jsonl").unlink()
+        third = self._reducer().comment_pr(77, "job-1", "again")
+        self.assertTrue(third.skipped)
+        self.assertEqual(len(self.comments[77]), 1)
+
+    def test_set_labels_is_idempotent_and_supports_issues(self):
+        self.fail_once["gh pr edit"] = 1
+        first = self._reducer().set_labels(
+            "pr", 77, ["risk:medium", "ai:generated"], [], "job-1"
+        )
+        self.assertFalse(first.ok)
+        second = self._reducer().set_labels(
+            "pr", 77, ["ai:generated", "risk:medium"], [], "job-1"
+        )
+        self.assertTrue(second.ok, second.reason)
+        again = self._reducer().set_labels(
+            "pr", 77, ["ai:generated", "risk:medium"], [], "job-1"
+        )
+        self.assertTrue(again.skipped)
+        issue = self._reducer().set_labels(
+            "issue", 108, ["ai:generated"], ["status:ready"], "job-2"
+        )
+        self.assertTrue(issue.ok, issue.reason)
+        issue_edit = [c for c in self.calls if c[:3] == ["gh", "issue", "edit"]][0]
+        self.assertIn("--remove-label", issue_edit)
+
+    def test_skipped_log_does_not_suppress_retry(self):
+        path = self.jobs / "job-1" / "operations.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "step": "comment", "status": "skipped", "number": 77,
+            "marker": "<!-- job:job-1 -->",
+        }) + "\n", encoding="utf-8")
+        result = self._reducer().comment_pr(77, "job-1", "note")
+        self.assertTrue(result.ok, result.reason)
+        self.assertFalse(result.skipped)
+        self.assertEqual(len(self.comments[77]), 1)
+
+    def test_ensure_pr_keeps_pr_when_labels_fail(self):
+        self.fail_once["gh pr edit"] = 1
+        result = self._reducer().ensure_pr(
+            self.worktree, BRANCH, 108, "job-1", "title", "body", ["ai:generated"]
+        )
+        self.assertFalse(result.ok)
+        self.assertIsNotNone(result.pr)
+        self.assertEqual(result.pr["number"], 77)
+        self.assertIn("gh pr edit 失败", result.reason)
