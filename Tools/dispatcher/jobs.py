@@ -13,6 +13,13 @@ comparison; the CLI renders them as ISO-8601.
 
 SQLite is used in WAL mode so a reader (``jobs list``) never blocks the writer
 that is heartbeating a lease.
+
+The reducer's ``derive_job_id(role, issue, base_sha, branch)`` names the
+per-job operation log under ``.agent/jobs/<id>/operations.jsonl`` and is a
+different namespace: it includes the branch but not ``pr`` / ``prompt_hash``.
+A later scheduler integration must choose one canonical id (or persist an
+explicit mapping); this module intentionally does not reuse the reducer id so
+the two schemes cannot silently collide.
 """
 
 from __future__ import annotations
@@ -171,7 +178,11 @@ class JobStore:
 
         The stable id makes this an idempotent upsert: callers may safely retry
         after a crash without creating a second job for the same work identity.
+        An explicit ``job_id`` is only accepted when it does not already belong
+        to a different identity, so a caller cannot silently receive another
+        job's row.
         """
+        explicit_id = bool(job_id)
         job_id = job_id or derive_job_id(role, ticket, pr, base_sha, prompt_hash)
         current = self._now(now)
         role = str(role or "").strip().lower()
@@ -183,7 +194,24 @@ class JobStore:
         pr_value = int(pr) if pr not in (None, "") else None
         if pr_value is not None and pr_value < 0:
             raise ValueError("pr 不能为负数")
+        base_value = str(base_sha or "")
+        prompt_value = str(prompt_hash or "")
         with self._write() as connection:
+            if explicit_id:
+                existing = connection.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if existing is not None:
+                    identity = (
+                        str(existing["role"]),
+                        int(existing["ticket"]),
+                        existing["pr"],
+                        str(existing["base_sha"]),
+                        str(existing["prompt_hash"]),
+                    )
+                    if identity != (role, ticket, pr_value, base_value, prompt_value):
+                        raise ValueError(f"job_id {job_id} 已存在且身份不匹配")
+                    return dict(existing)
             connection.execute(
                 """
                 INSERT OR IGNORE INTO jobs (
@@ -196,9 +224,9 @@ class JobStore:
                     role,
                     ticket,
                     pr_value,
-                    str(base_sha or ""),
+                    base_value,
                     str(head_sha or ""),
-                    str(prompt_hash or ""),
+                    prompt_value,
                     current,
                     current,
                 ),
@@ -297,24 +325,64 @@ class JobStore:
         job_id: str,
         state: str,
         error: str = "",
+        owner: str | None = None,
         *,
+        attempt: int | None = None,
         now: float | int | datetime | None = None,
     ) -> bool:
-        """Move a job to a terminal state and release its lease."""
+        """Move a job to a terminal state, fenced by its current lease owner.
+
+        A leased/running/reducing job can only be finished by the ``owner``
+        that currently holds its lease; a stale owner whose lease was already
+        re-claimed returns ``False`` and cannot clear the new owner's state.
+        Pass ``attempt`` too for a stronger fencing token (the store increments
+        it on every claim).  A queued job has no lease and is cancelled with
+        ``owner=None``; finishing a leased job without an owner is rejected.
+        """
         if state not in TERMINAL_STATES:
             raise ValueError(f"finish 只接受 {TERMINAL_STATES}，收到 {state!r}")
+        owner_value = None if owner is None else str(owner).strip()
+        if owner_value == "":
+            raise ValueError("owner 不能为空")
+        attempt_value: int | None = None
+        if attempt is not None:
+            attempt_value = int(attempt)
+            if attempt_value < 0:
+                raise ValueError("attempt 不能为负数")
         current = self._now(now)
-        active = ", ".join(f"'{item}'" for item in ("queued",) + ACTIVE_STATES)
+        error_text = str(error or "")
+        active = ", ".join(f"'{item}'" for item in ACTIVE_STATES)
         with self._write() as connection:
-            updated = connection.execute(
-                f"""
-                UPDATE jobs
-                SET state = ?, error = ?, updated_at = ?,
-                    lease_owner = NULL, lease_until = NULL
-                WHERE job_id = ? AND state IN ({active})
-                """,
-                (state, str(error or ""), current, str(job_id)),
-            )
+            if owner_value is None:
+                # Explicit no-lease path: only a queued or reaped job can be
+                # cancelled without fencing against a live worker.
+                updated = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, error = ?, updated_at = ?,
+                        lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL
+                    WHERE job_id = ? AND lease_owner IS NULL
+                      AND state IN ('queued', 'stale')
+                    """,
+                    (state, error_text, current, str(job_id)),
+                )
+            else:
+                conditions = ["job_id = ?", "lease_owner = ?", f"state IN ({active})"]
+                parameters: list[Any] = [
+                    state, error_text, current, str(job_id), owner_value
+                ]
+                if attempt_value is not None:
+                    conditions.append("attempt = ?")
+                    parameters.append(attempt_value)
+                updated = connection.execute(
+                    f"""
+                    UPDATE jobs
+                    SET state = ?, error = ?, updated_at = ?,
+                        lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL
+                    WHERE {' AND '.join(conditions)}
+                    """,
+                    parameters,
+                )
             return updated.rowcount == 1
 
     def reap_stale(

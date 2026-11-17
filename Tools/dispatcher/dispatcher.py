@@ -36,8 +36,8 @@ DISPATCHER_ROOT = Path(__file__).resolve().parent
 if str(DISPATCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(DISPATCHER_ROOT))
 
-from jobs import JOB_STATES, JobStore  # noqa: E402
-from reducer import Reducer, derive_job_id  # noqa: E402
+from jobs import JOB_STATES, JOBS_DB, JobStore  # noqa: E402
+from reducer import Reducer, derive_job_id as derive_operation_id  # noqa: E402
 from runners.base import (  # noqa: E402
     ResolvedRole,
     RunnerResult,
@@ -92,7 +92,7 @@ TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
 JOB_ROOT = Path(".agent/jobs")
-JOBS_DB_PATH = JOB_ROOT / "jobs.db"
+JOBS_DB_PATH = JOBS_DB
 STATE_ROOT = Path(".agent/state")
 LOOP_ROOT = Path(".agent/loops")
 LOOP_ENV_ID = "DISPATCHER_LOOP_ID"
@@ -1210,7 +1210,10 @@ def ensure_agent_pr(
     the public remote.
     """
     base_sha = run(["git", "-C", str(worktree), "merge-base", "origin/main", "HEAD"])
-    job_id = derive_job_id(
+    # Operation-log id (reducer scheme), not the scheduler store id.  The
+    # store's jobs.derive_job_id is a separate namespace until the Phase 1c
+    # integration picks one canonical mapping.
+    job_id = derive_operation_id(
         "implementer",
         issue["number"],
         (base_sha.stdout or "").strip(),
@@ -3488,7 +3491,7 @@ def _job_store() -> JobStore:
 def cmd_jobs_list(args: argparse.Namespace) -> int:
     """List jobs from the shadow SQLite store (read-only for scheduling)."""
     state = getattr(args, "state", None)
-    limit = max(1, int(getattr(args, "limit", 50)))
+    limit = int(getattr(args, "limit", 50))
     try:
         rows = _job_store().list_jobs(state=state, limit=limit)
     except (OSError, sqlite3.Error, ValueError) as error:

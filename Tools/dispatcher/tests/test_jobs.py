@@ -18,6 +18,7 @@ if str(DISPATCHER_ROOT) not in sys.path:
 
 import dispatcher  # noqa: E402
 import jobs  # noqa: E402
+import reducer  # noqa: E402
 
 PROMPT_HASH = "sha256:0123456789abcdef"
 
@@ -58,6 +59,28 @@ class JobIdTests(unittest.TestCase):
             jobs.derive_job_id("implementer", 0, 1, "base", PROMPT_HASH)
         with self.assertRaises(ValueError):
             jobs.derive_job_id("implementer", 114, -1, "base", PROMPT_HASH)
+
+
+class JobIdNamespaceTests(unittest.TestCase):
+    def test_store_and_reducer_job_ids_are_distinct_namespaces(self):
+        store_id = jobs.derive_job_id("implementer", 114, 42, "base000", PROMPT_HASH)
+        operation_id = reducer.derive_job_id(
+            "implementer", 114, "base000", "ai/114-job-store"
+        )
+        self.assertRegex(store_id, r"^implementer-114-[0-9a-f]{16}$")
+        self.assertRegex(operation_id, r"^implementer-114-[0-9a-f]{16}$")
+        self.assertNotEqual(store_id, operation_id)
+        # The store binds pr + prompt_hash; the operation log binds branch.
+        self.assertNotEqual(
+            store_id, jobs.derive_job_id("implementer", 114, 43, "base000", PROMPT_HASH)
+        )
+        self.assertNotEqual(
+            operation_id,
+            reducer.derive_job_id("implementer", 114, "base000", "ai/other"),
+        )
+        # dispatcher.py keeps the reducer scheme explicitly named so scheduler
+        # integration cannot mistake it for the store id.
+        self.assertIs(dispatcher.derive_operation_id, reducer.derive_job_id)
 
 
 class JobStoreTestCase(unittest.TestCase):
@@ -147,6 +170,24 @@ class EnqueueTests(JobStoreTestCase):
         job = self.enqueue(job_id="manual-job-1")
         self.assertEqual(job["job_id"], "manual-job-1")
         self.assertEqual(self.store.get_job("manual-job-1")["state"], "queued")
+
+    def test_enqueue_explicit_job_id_rejects_a_different_identity(self):
+        self.enqueue(job_id="manual-job-1")
+        with self.assertRaises(ValueError):
+            self.store.enqueue(
+                "reviewer",
+                115,
+                43,
+                base_sha="other-base",
+                head_sha="head",
+                prompt_hash="other-prompt",
+                job_id="manual-job-1",
+                now=200.0,
+            )
+        stored = self.store.get_job("manual-job-1")
+        self.assertEqual(stored["role"], "implementer")
+        self.assertEqual(stored["ticket"], 114)
+        self.assertEqual(stored["pr"], 42)
 
 
 class ClaimTests(JobStoreTestCase):
@@ -241,7 +282,9 @@ class HeartbeatTests(JobStoreTestCase):
         self.store.claim("runner-a", 30, now=100.0)
         self.assertFalse(self.store.heartbeat(job["job_id"], "runner-b", 60, now=110.0))
         self.assertEqual(self.store.get_job(job["job_id"])["lease_until"], 130.0)
-        self.assertTrue(self.store.finish(job["job_id"], "done", now=120.0))
+        self.assertTrue(
+            self.store.finish(job["job_id"], "done", owner="runner-a", now=120.0)
+        )
         self.assertFalse(self.store.heartbeat(job["job_id"], "runner-a", 60, now=130.0))
         self.assertEqual(self.store.get_job(job["job_id"])["lease_until"], None)
 
@@ -255,27 +298,96 @@ class FinishTests(JobStoreTestCase):
     def test_finish_done_clears_lease_and_sets_terminal_state(self):
         job = self.enqueue()
         self.store.claim("runner-a", 30, now=100.0)
-        self.assertTrue(self.store.finish(job["job_id"], "done", now=120.0))
+        self.assertTrue(
+            self.store.finish(job["job_id"], "done", owner="runner-a", now=120.0)
+        )
         stored = self.store.get_job(job["job_id"])
         self.assertEqual(stored["state"], "done")
         self.assertEqual(stored["error"], "")
         self.assertIsNone(stored["lease_owner"])
         self.assertIsNone(stored["lease_until"])
+        self.assertIsNone(stored["heartbeat_at"])
         self.assertEqual(stored["updated_at"], 120.0)
         self.assertEqual(stored["attempt"], 1)
-        self.assertFalse(self.store.finish(job["job_id"], "done", now=130.0))
+        self.assertFalse(
+            self.store.finish(job["job_id"], "done", owner="runner-a", now=130.0)
+        )
 
     def test_finish_failed_records_error_and_releases_job(self):
         job = self.enqueue()
         self.store.claim("runner-a", 30, now=100.0)
         self.assertTrue(
-            self.store.finish(job["job_id"], "failed", "agent exited 1", now=120.0)
+            self.store.finish(
+                job["job_id"], "failed", "agent exited 1", owner="runner-a", now=120.0
+            )
         )
         stored = self.store.get_job(job["job_id"])
         self.assertEqual(stored["state"], "failed")
         self.assertEqual(stored["error"], "agent exited 1")
         self.assertIsNone(stored["lease_until"])
         self.assertIsNone(self.store.claim("runner-b", 30, now=200.0))
+
+    def test_finish_by_stale_owner_cannot_override_the_new_lease(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 1, now=100.0)
+        second = self.store.claim("runner-b", 30, now=102.0)
+        self.assertEqual(second["attempt"], 2)
+
+        self.assertFalse(
+            self.store.finish(job["job_id"], "done", owner="runner-a", now=103.0)
+        )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "leased")
+        self.assertEqual(stored["lease_owner"], "runner-b")
+        self.assertEqual(stored["lease_until"], 132.0)
+        self.assertEqual(stored["attempt"], 2)
+
+        self.assertTrue(
+            self.store.finish(job["job_id"], "done", owner="runner-b", now=104.0)
+        )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "done")
+        self.assertIsNone(stored["lease_owner"])
+
+    def test_finish_with_attempt_fences_old_attempt_from_the_same_owner(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 1, now=100.0)
+        self.store.claim("runner-a", 30, now=102.0)
+
+        self.assertFalse(
+            self.store.finish(
+                job["job_id"], "done", owner="runner-a", attempt=1, now=103.0
+            )
+        )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "leased")
+        self.assertEqual(stored["attempt"], 2)
+        self.assertEqual(stored["lease_until"], 132.0)
+
+        self.assertTrue(
+            self.store.finish(
+                job["job_id"], "done", owner="runner-a", attempt=2, now=104.0
+            )
+        )
+        self.assertEqual(self.store.get_job(job["job_id"])["state"], "done")
+
+    def test_finish_queued_job_without_owner_is_explicit_cancel_path(self):
+        job = self.enqueue()
+        self.assertTrue(
+            self.store.finish(job["job_id"], "failed", "cancelled", now=110.0)
+        )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "failed")
+        self.assertEqual(stored["error"], "cancelled")
+
+    def test_finish_leased_job_without_owner_is_rejected(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 30, now=100.0)
+        self.assertFalse(self.store.finish(job["job_id"], "done", now=110.0))
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "leased")
+        self.assertEqual(stored["lease_owner"], "runner-a")
+        self.assertEqual(stored["lease_until"], 130.0)
 
     def test_finish_rejects_non_terminal_state(self):
         job = self.enqueue()
@@ -303,7 +415,7 @@ class ReapStaleTests(JobStoreTestCase):
     def test_reap_stale_ignores_finished_and_queued_jobs(self):
         done = self.enqueue(ticket=1, now=100.0)
         self.store.claim("runner-a", 10, now=100.0)
-        self.store.finish(done["job_id"], "done", now=101.0)
+        self.store.finish(done["job_id"], "done", owner="runner-a", now=101.0)
         self.enqueue(ticket=2, now=102.0)
         self.assertEqual(self.store.reap_stale(now=10_000.0), [])
         self.assertEqual(self.store.get_job(done["job_id"])["state"], "done")
@@ -326,7 +438,7 @@ class ListingTests(JobStoreTestCase):
         middle = self.enqueue(ticket=2, now=200.0)
         newest = self.enqueue(ticket=3, now=300.0)
         self.store.claim("runner-a", 30, now=400.0)
-        self.store.finish(oldest["job_id"], "done", now=500.0)
+        self.store.finish(oldest["job_id"], "done", owner="runner-a", now=500.0)
 
         all_jobs = self.store.list_jobs()
         self.assertEqual(
