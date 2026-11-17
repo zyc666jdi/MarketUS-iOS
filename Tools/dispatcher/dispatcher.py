@@ -97,6 +97,9 @@ LOOP_ENV_TIMELINE = "DISPATCHER_LOOP_TIMELINE"
 LOOP_ENV_STEP = "DISPATCHER_LOOP_STEP"
 LOOP_ENV_STEP_STARTED = "DISPATCHER_LOOP_STEP_STARTED"
 LOOP_STATE_NAME = "loop-state.json"
+LOOP_STALE_SECONDS_ENV = "MARKETUS_LOOP_STALE_SECONDS"
+LOOP_STALE_SECONDS = 7200
+LOOP_STALE_STATUS = "stale"
 AGENT_ROLE_STEPS = {
     "implementer": "dispatch",
     "reviewer": "review",
@@ -224,6 +227,18 @@ def duration_ms_since(started: float) -> int:
     return max(0, int(round((time.monotonic() - started) * 1000)))
 
 
+def loop_stale_seconds() -> int:
+    """Return the configured stale threshold, falling back to two hours."""
+    raw = os.environ.get(LOOP_STALE_SECONDS_ENV, "").strip()
+    if not raw:
+        return LOOP_STALE_SECONDS
+    try:
+        configured = int(raw)
+    except ValueError:
+        return LOOP_STALE_SECONDS
+    return configured if configured > 0 else LOOP_STALE_SECONDS
+
+
 def error_summary(error: BaseException) -> str:
     message = str(error).strip()
     name = type(error).__name__
@@ -326,10 +341,9 @@ class LoopTrace:
         if self.deferred:
             if finish_deferred_loop(self, status):
                 return
-            if self.state_failed:
-                # Shared state is unusable; close locally instead of leaving the
-                # loop stuck in "running" with no way for the child to finish it.
-                self.finish(status)
+            # Shared state is unusable; close locally instead of leaving the
+            # loop stuck in "running" with no way for the child to finish it.
+            self.finish(status)
         else:
             self.finish(status)
 
@@ -479,12 +493,14 @@ def _combined_loop_status(state: dict[str, Any]) -> str:
     return "ok"
 
 
-def _emit_shared_loop_end(trace: LoopTrace, state: dict[str, Any]) -> None:
+def _shared_duration_ms(trace: LoopTrace, state: dict[str, Any]) -> int:
     started = state.get("loop_started_at")
     if isinstance(started, (int, float)) and not isinstance(started, bool):
-        duration = max(0, int((time.time() - float(started)) * 1000))
-    else:
-        duration = trace.elapsed_ms()
+        return max(0, int((time.time() - float(started)) * 1000))
+    return trace.elapsed_ms()
+
+
+def _emit_shared_loop_end(trace: LoopTrace, state: dict[str, Any]) -> None:
     errors = [
         str(state.get(key)) for key in ("parent_error", "child_error") if state.get(key)
     ]
@@ -492,13 +508,34 @@ def _emit_shared_loop_end(trace: LoopTrace, state: dict[str, Any]) -> None:
     trace.emit(
         "loop_end",
         status=_combined_loop_status(state),
-        duration_ms=duration,
+        duration_ms=_shared_duration_ms(trace, state),
         details=details,
     )
 
 
+def _emit_stale_loop_end(trace: LoopTrace, state: dict[str, Any]) -> str:
+    """Close a loop whose detached child outlived the parent sweep."""
+    step = str(state.get("step") or trace.deferred_step or "background")
+    reason = f"deferred {step} child not done at parent exit"
+    details: dict[str, Any] = {"reason": reason}
+    if trace.error:
+        details["error"] = trace.error[:300]
+    trace.emit(
+        "loop_end",
+        status=LOOP_STALE_STATUS,
+        duration_ms=_shared_duration_ms(trace, state),
+        details=details,
+    )
+    return reason
+
+
 def finish_deferred_loop(trace: LoopTrace, status: str | None = None) -> bool:
     """Mark the parent side done; the last finisher writes ``loop_end``.
+
+    A deferred child that is still running when the parent exits gets a
+    ``stale`` loop_end immediately, so the timeline never stays ``running``
+    forever. If the child finishes later, its events are appended after that
+    ``loop_end`` and are ignored for the loop status.
 
     Returns True when this call closed the loop (or it was already closed), so
     the caller can fall back to a local ``loop_end`` if shared state is broken.
@@ -509,14 +546,19 @@ def finish_deferred_loop(trace: LoopTrace, status: str | None = None) -> bool:
     with _locked_loop_state(trace) as state:
         if state.get("closed"):
             return True
+        if not state:
+            # State is missing/unreadable; the caller must close locally.
+            return False
         state["parent_done"] = True
         state["parent_status"] = status
         state["parent_error"] = trace.error
         state.setdefault("loop_started_at", time.time() - trace.elapsed_ms() / 1000.0)
         if state.get("child_done"):
             _emit_shared_loop_end(trace, state)
-            state["closed"] = True
-            closed = True
+        else:
+            _emit_stale_loop_end(trace, state)
+        state["closed"] = True
+        closed = True
     return closed
 
 
@@ -3238,41 +3280,96 @@ def format_duration(duration_ms: int) -> str:
     return f"{minutes}m{remainder}s"
 
 
-def summarize_loop(path: Path) -> dict[str, Any]:
-    """Summarize one timeline for ``loop list`` and ``observe``."""
+def _loop_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _loop_reference_time(
+    events: list[dict[str, Any]], start_ts: str
+) -> datetime | None:
+    """Prefer loop_start; fall back to the newest event for legacy timelines."""
+    started = _parse_timestamp(start_ts)
+    if started is not None:
+        return started
+    for event in reversed(events):
+        parsed = _parse_timestamp(event.get("ts"))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def summarize_loop(
+    path: Path,
+    *,
+    now: datetime | None = None,
+    stale_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Summarize one timeline for ``loop list``, ``loop show`` and ``observe``.
+
+    A timeline without ``loop_end`` stays ``running`` until its age exceeds the
+    stale threshold (``MARKETUS_LOOP_STALE_SECONDS``, default 7200 seconds) and
+    then becomes ``stale``. Both report the actual elapsed duration. ``now`` and
+    ``stale_seconds`` are injection points for a deterministic clock.
+    """
     events = read_timeline(path)
     start_ts = next(
         (str(event.get("ts")) for event in events
          if event.get("event") == "loop_start" and event.get("ts")),
         "",
     )
-    end_event = next(
-        (event for event in reversed(events) if event.get("event") == "loop_end"),
+    end_index = next(
+        (index for index in range(len(events) - 1, -1, -1)
+         if events[index].get("event") == "loop_end"),
         None,
     )
-    if end_event is not None:
-        status = str(end_event.get("status") or "ok")
-        raw_duration = end_event.get("duration_ms")
-        duration = raw_duration if isinstance(raw_duration, int) else 0
-    else:
-        status = "running"
-        started = _parse_timestamp(start_ts)
-        if started is None:
-            duration = 0
-        else:
-            duration = max(
-                0, int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-            )
     steps: dict[str, str] = {}
-    for event in events:
+    status_steps: dict[str, str] = {}
+    for index, event in enumerate(events):
         step = event.get("step")
         if not isinstance(step, str) or not step:
             continue
         if event.get("event") == "step_start":
-            steps[step] = "running"
+            step_status = "running"
         elif event.get("event") == "step_end":
-            steps[step] = str(event.get("status") or "ok")
-    if status != "running" and "failed" in steps.values():
+            step_status = str(event.get("status") or "ok")
+        else:
+            continue
+        steps[step] = step_status
+        # Events appended after loop_end (a late repair child) may be shown,
+        # but they must not rewrite the loop status that was already closed.
+        if end_index is None or index <= end_index:
+            status_steps[step] = step_status
+
+    events_after_end = len(events) - end_index - 1 if end_index is not None else 0
+    reason = ""
+    if end_index is not None:
+        end_event = events[end_index]
+        status = str(end_event.get("status") or "ok")
+        raw_duration = end_event.get("duration_ms")
+        duration = raw_duration if isinstance(raw_duration, int) else 0
+        if status == LOOP_STALE_STATUS:
+            details = end_event.get("details")
+            if isinstance(details, dict):
+                reason = str(details.get("reason") or details.get("error") or "")
+            reason = reason or "loop_end marked stale"
+    else:
+        reference = _loop_reference_time(events, start_ts)
+        if reference is None:
+            status = "running"
+            duration = 0
+        else:
+            current = now if now is not None else _loop_now()
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            age_seconds = (current - reference).total_seconds()
+            duration = max(0, int(age_seconds * 1000))
+            threshold = loop_stale_seconds() if stale_seconds is None else stale_seconds
+            if age_seconds > threshold:
+                status = LOOP_STALE_STATUS
+                reason = f"no loop_end; loop age {format_duration(duration)}"
+            else:
+                status = "running"
+    if status not in ("running", LOOP_STALE_STATUS) and "failed" in status_steps.values():
         status = "failed"
     return {
         "loop_id": path.parent.name,
@@ -3280,6 +3377,8 @@ def summarize_loop(path: Path) -> dict[str, Any]:
         "duration_ms": duration,
         "status": status,
         "steps": steps,
+        "events_after_end": events_after_end,
+        "reason": reason,
     }
 
 
@@ -3324,6 +3423,13 @@ def cmd_loop_show(args: argparse.Namespace) -> int:
     print(f"start    {row['start'] or '-'}")
     print(f"duration {format_duration(row['duration_ms'])}")
     print(f"status   {row['status']}")
+    if row["status"] == LOOP_STALE_STATUS:
+        print(f"reason   {row['reason'] or '-'}")
+    if row["events_after_end"]:
+        print(
+            f"note     events after loop_end: {row['events_after_end']} "
+            "(ignored for status)"
+        )
     print("")
     for event in events:
         duration = event.get("duration_ms")
