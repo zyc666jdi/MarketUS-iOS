@@ -159,8 +159,13 @@ python3 Tools/dispatcher/dispatcher.py observe --watch
 `ts / loop_id / event / step / status / duration_ms / details`，
 覆盖 `postmerge/watch/repair/dispatch/review/planner` 六个阶段；
 implementer/reviewer/repair 子进程额外记录 `agent_start` / `agent_end`
-（role、pid、exit_code、duration_ms）。后台 repair 的 `step_end` 与
-`loop_end` 由子进程在结束时写入，父循环不会提前把 loop 标成 `ok`。
+（role、pid、exit_code、duration_ms）。后台 repair 的 `step_end` 由子进程在
+结束时写入；父进程退出时若 child 尚未完成，会立即补写 `loop_end`（状态
+`stale`，`details.reason` 说明原因），避免 loop 永远停在 `running`。
+child 之后追加的事件保留在 `loop_end` 之后，`loop show` 会标注
+“events after loop_end”，但这些事件不再参与状态计算。缺失 `loop_end` 且
+age 超过 `MARKETUS_LOOP_STALE_SECONDS`（默认 7200 秒）的 loop 同样显示
+`stale`，并展示真实已用时长。
 单条事件失败不会中断调度，但会把该 loop 标记为 `failed`。
 `loop-state.json` 的读写同样是 best-effort：路径不可写时只标记 loop failed，
 不阻断 repair 后台进程启动；repair 子进程因锁占用而跳过时记为 `skipped`，
