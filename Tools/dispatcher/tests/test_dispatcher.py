@@ -973,10 +973,18 @@ class CmdOnceStatusTests(unittest.TestCase):
         self.assertEqual(status_after(labels, calls), {"status:blocked"})
 
 
-class PostmergeStatusTests(unittest.TestCase):
+class PostmergeStatusTests(IsolatedStateTestCase):
     def test_postmerge_leaves_only_done(self):
         labels = {"status:in-progress", "status:claimed", "status:awaiting-human"}
-        prs = [{"number": 42, "body": "", "headRefName": "ai/40-test", "url": "https://example/pr/42"}]
+        prs = [
+            {
+                "number": 42,
+                "body": "",
+                "headRefName": "ai/40-test",
+                "url": "https://example/pr/42",
+                "mergedAt": "2026-01-01T00:00:00Z",
+            }
+        ]
         issue = {"number": 40, "labels": [{"name": name} for name in labels]}
         calls = []
         with (
@@ -1479,7 +1487,7 @@ class PlannerCommandTests(unittest.TestCase):
         self.assertFalse(self.state_path.exists())
 
 
-class PostmergeIdempotencyTests(unittest.TestCase):
+class PostmergeIdempotencyTests(IsolatedStateTestCase):
     def _postmerge(
         self,
         issue_labels: set[str],
@@ -1495,6 +1503,7 @@ class PostmergeIdempotencyTests(unittest.TestCase):
                 "headRefName": "ai/40-test",
                 "url": "https://example/pr/42",
                 "labels": [{"name": name} for name in pr_labels],
+                "mergedAt": "2026-01-01T00:00:00Z",
             }
         ]
         issue = {"number": 40, "labels": [{"name": name} for name in issue_labels]}
@@ -1599,6 +1608,168 @@ class PostmergeIdempotencyTests(unittest.TestCase):
         self.assertEqual(status_after({"status:in-progress", "status:claimed"}, calls), {"status:done"})
         self.assertTrue(any(args[:2] == ["issue", "comment"] for args in calls))
         self.assertTrue(any(args[:2] == ["pr", "edit"] for args in calls))
+
+
+class PostmergeCursorTests(IsolatedStateTestCase):
+    def _pr(self, number: int, merged_at: str, *, issue: int, labels: tuple[str, ...] = ()):
+        return {
+            "number": number,
+            "title": f"PR {number}",
+            "body": "",
+            "headRefName": f"ai/{issue}-test",
+            "url": f"https://example/pr/{number}",
+            "labels": [{"name": name} for name in labels],
+            "mergedAt": merged_at,
+        }
+
+    def _postmerge(
+        self,
+        prs,
+        *,
+        cursor: tuple[str, int] | None = None,
+        issue_labels: tuple[str, ...] = ("status:done",),
+        dry_run: bool = False,
+        gh_error: bool = False,
+    ):
+        if cursor is not None:
+            dispatcher._write_postmerge_cursor(cursor[0], cursor[1])
+        labels = set(issue_labels)
+
+        def fake_detail(number):
+            return {"number": number, "labels": [{"name": name} for name in labels]}
+
+        calls = []
+
+        def fake_gh(args, check=True):
+            calls.append(list(args))
+            if gh_error:
+                raise SystemExit("gh failed")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "gh_json", return_value=prs) as gh_json,
+                mock.patch.object(dispatcher, "issue_detail", side_effect=fake_detail) as detail,
+                mock.patch.object(dispatcher, "issue_comment_bodies", return_value=[]) as comments,
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh),
+            ):
+                code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=dry_run))
+        return code, calls, detail, gh_json, comments
+
+    def _cursor(self):
+        return json.loads(
+            (dispatcher.STATE_ROOT / "postmerge-cursor.json").read_text(encoding="utf-8")
+        )
+
+    def test_query_is_bounded_and_reads_merged_at(self):
+        with mock.patch.object(dispatcher, "gh_json", return_value=[]) as gh_json:
+            code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=False))
+        self.assertEqual(code, 0)
+        args = gh_json.call_args.args[0]
+        self.assertEqual(args[:4], ["pr", "list", "--state", "merged"])
+        self.assertEqual(args[args.index("--limit") + 1], str(dispatcher.POSTMERGE_PR_LIMIT))
+        self.assertIn("sort:updated-desc", args)
+        fields = args[args.index("--json") + 1]
+        self.assertIn("mergedAt", fields)
+
+    def test_cursor_skips_processed_prs_without_issue_lookup(self):
+        code, _, detail, _, _ = self._postmerge(
+            [
+                self._pr(101, "2026-01-01T00:00:00Z", issue=100),
+                self._pr(102, "2026-01-02T00:00:00Z", issue=101),
+                self._pr(103, "2026-01-03T00:00:00Z", issue=102),
+            ],
+            cursor=("2026-01-02T00:00:00Z", 102),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0] for call in detail.call_args_list], [102])
+        self.assertEqual(
+            self._cursor(),
+            {"lastMergedAt": "2026-01-03T00:00:00Z", "lastPr": 103},
+        )
+
+    def test_new_merged_pr_after_cursor_is_processed(self):
+        code, calls, detail, _, _ = self._postmerge(
+            [self._pr(105, "2026-01-05T00:00:00Z", issue=104)],
+            cursor=("2026-01-04T00:00:00Z", 104),
+            issue_labels=("status:in-review",),
+        )
+        self.assertEqual(code, 0)
+        detail.assert_called_once_with(104)
+        self.assertEqual(status_after({"status:in-review"}, calls), {"status:done"})
+        self.assertTrue(any(args[:2] == ["issue", "comment"] for args in calls))
+        self.assertEqual(
+            self._cursor(),
+            {"lastMergedAt": "2026-01-05T00:00:00Z", "lastPr": 105},
+        )
+
+    def test_same_second_merge_with_higher_number_is_processed(self):
+        code, _, detail, _, _ = self._postmerge(
+            [self._pr(201, "2026-01-05T00:00:00Z", issue=200)],
+            cursor=("2026-01-05T00:00:00Z", 200),
+        )
+        self.assertEqual(code, 0)
+        detail.assert_called_once_with(200)
+        self.assertEqual(self._cursor()["lastPr"], 201)
+
+    def test_cursor_does_not_advance_when_issue_update_fails(self):
+        with self.assertRaises(SystemExit):
+            self._postmerge(
+                [self._pr(106, "2026-01-06T00:00:00Z", issue=105)],
+                cursor=("2026-01-05T00:00:00Z", 105),
+                issue_labels=("status:in-review",),
+                gh_error=True,
+            )
+        self.assertEqual(
+            self._cursor(),
+            {"lastMergedAt": "2026-01-05T00:00:00Z", "lastPr": 105},
+        )
+
+    def test_missing_cursor_falls_back_to_recent_window_and_seeds_cursor(self):
+        code, _, detail, _, _ = self._postmerge(
+            [
+                self._pr(301, "2025-12-01T00:00:00Z", issue=300),
+                self._pr(302, "2025-12-02T00:00:00Z", issue=301),
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0] for call in detail.call_args_list], [300, 301])
+        self.assertEqual(
+            self._cursor(),
+            {"lastMergedAt": "2025-12-02T00:00:00Z", "lastPr": 302},
+        )
+
+    def test_corrupt_cursor_falls_back_to_recent_window(self):
+        path = dispatcher.postmerge_cursor_path()
+        for body in ("not-json", "[]", '{"lastMergedAt":"nope","lastPr":5}',
+                     '{"lastMergedAt":"2026-01-01T00:00:00Z","lastPr":"5"}'):
+            with self.subTest(body=body):
+                dispatcher.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+                path.write_text(body, encoding="utf-8")
+                code, _, detail, _, _ = self._postmerge(
+                    [self._pr(401, "2025-11-01T00:00:00Z", issue=400)]
+                )
+                self.assertEqual(code, 0)
+                detail.assert_called_once_with(400)
+                self.assertEqual(self._cursor()["lastPr"], 401)
+
+    def test_dry_run_does_not_write_cursor(self):
+        code, _, detail, _, _ = self._postmerge(
+            [self._pr(501, "2026-02-01T00:00:00Z", issue=500)],
+            dry_run=True,
+        )
+        self.assertEqual(code, 0)
+        detail.assert_called_once_with(500)
+        self.assertFalse(dispatcher.postmerge_cursor_path().exists())
+
+    def test_cursor_round_trips_without_temp_files(self):
+        dispatcher._write_postmerge_cursor("2026-03-01T12:00:00Z", 601)
+        self.assertEqual(
+            dispatcher._read_postmerge_cursor(),
+            (datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc), 601),
+        )
+        self.assertEqual(list(dispatcher.STATE_ROOT.glob("*.tmp")), [])
 
 
 class ImplementerPromptTests(unittest.TestCase):
@@ -2527,6 +2698,8 @@ def watch_pr(
     mergeable: str = "MERGEABLE",
     merge_state: str = "BEHIND",
     sha: str = "abc123",
+    updated_at: str = "2026-01-01T00:00:00Z",
+    checks: list[dict] | None = None,
     title: str = "test PR",
 ) -> dict:
     return {
@@ -2534,16 +2707,56 @@ def watch_pr(
         "title": title,
         "headRefName": f"ai/{number}-test",
         "headRefOid": sha,
+        "updatedAt": updated_at,
         "mergeable": mergeable,
         "mergeStateStatus": merge_state,
-        "statusCheckRollup": [],
+        "statusCheckRollup": [] if checks is None else checks,
     }
 
 
+def ci_checks(conclusion: str = "SUCCESS") -> list[dict]:
+    return [{"name": "CI", "status": "COMPLETED", "conclusion": conclusion}]
+
+
 class WatchTests(IsolatedStateTestCase):
-    def _watch(self, prs, *, dry_run=False, update_rc=0):
+    def _watch(
+        self,
+        prs,
+        *,
+        dry_run=False,
+        update_rc=0,
+        details: dict[int, dict] | None = None,
+        terminal: dict[int, str] | None = None,
+        calls: list[list[str]] | None = None,
+    ):
+        detail_map = dict(details or {})
+        terminal_map = dict(terminal or {})
+
+        def fake_json(args):
+            if calls is not None:
+                calls.append(list(args))
+            if args[:3] == ["pr", "list", "--state"]:
+                return prs
+            if args[:2] == ["pr", "view"]:
+                number = int(args[2])
+                if number in terminal_map:
+                    return {"state": terminal_map[number], "title": "test PR", "url": ""}
+                for pr in prs:
+                    if pr["number"] == number:
+                        return detail_map.get(
+                            number,
+                            {
+                                "number": number,
+                                "mergeable": pr.get("mergeable", "MERGEABLE"),
+                                "mergeStateStatus": pr.get("mergeStateStatus", "BEHIND"),
+                                "statusCheckRollup": pr.get("statusCheckRollup", []),
+                            },
+                        )
+                return {"state": "CLOSED", "title": "test PR", "url": ""}
+            raise AssertionError(f"unexpected gh_json args: {args}")
+
         with (
-            mock.patch.object(dispatcher, "gh_json", return_value=prs) as gh_json,
+            mock.patch.object(dispatcher, "gh_json", side_effect=fake_json) as gh_json,
             mock.patch.object(dispatcher, "repo_slug", return_value="owner/repo") as slug,
             mock.patch.object(
                 dispatcher,
@@ -2636,6 +2849,94 @@ class WatchTests(IsolatedStateTestCase):
         _, run, _, _, _, slug, _ = self._watch([watch_pr(91), watch_pr(92)])
         self.assertEqual(slug.call_count, 1)
         self.assertEqual(run.call_count, 2)
+
+    def test_state_stores_per_pr_signature(self):
+        self._watch([watch_pr(merge_state="CLEAN", checks=ci_checks())])
+        state = json.loads((dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8"))
+        signature = state["known"]["91"]
+        self.assertEqual(signature["headRefOid"], "abc123")
+        self.assertEqual(signature["updatedAt"], "2026-01-01T00:00:00Z")
+        self.assertEqual(signature["mergeStateStatus"], "CLEAN")
+        self.assertEqual(signature["mergeable"], "MERGEABLE")
+        self.assertEqual(signature["ci"], "CI:COMPLETED:SUCCESS")
+        self.assertFalse(signature["ciPending"])
+
+    def test_unchanged_pr_skips_detail_and_ci_call(self):
+        pr = watch_pr(merge_state="CLEAN", checks=ci_checks())
+        first_calls: list[list[str]] = []
+        self._watch([pr], calls=first_calls)
+        self.assertEqual(sum(1 for args in first_calls if args[:2] == ["pr", "view"]), 1)
+        second_calls: list[list[str]] = []
+        _, run, comment, status, notify, _, _ = self._watch([pr], calls=second_calls)
+        self.assertEqual([args for args in second_calls if args[:2] == ["pr", "view"]], [])
+        self.assertEqual(sum(1 for args in second_calls if args[:2] == ["pr", "list"]), 1)
+        run.assert_not_called()
+        comment.assert_not_called()
+        status.assert_not_called()
+        notify.assert_not_called()
+
+    def test_changed_pr_fetches_detail_and_detects_ci_failure(self):
+        self._watch([watch_pr(merge_state="CLEAN", checks=ci_checks())])
+        calls: list[list[str]] = []
+        _, _, _, _, notify, _, _ = self._watch(
+            [
+                watch_pr(
+                    merge_state="CLEAN",
+                    sha="def456",
+                    updated_at="2026-01-01T00:05:00Z",
+                    checks=ci_checks("FAILURE"),
+                )
+            ],
+            calls=calls,
+        )
+        self.assertTrue(any(args[:2] == ["pr", "view"] for args in calls))
+        notify.assert_called_once()
+        self.assertIn("CI 失败", notify.call_args.args[0])
+
+    def test_pending_ci_is_refetched_until_result_is_known(self):
+        pr = watch_pr(
+            merge_state="CLEAN",
+            checks=[{"name": "CI", "status": "IN_PROGRESS", "conclusion": None}],
+        )
+        self._watch([pr])
+        calls: list[list[str]] = []
+        detail = {
+            "number": 91,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": ci_checks("FAILURE"),
+        }
+        _, _, _, _, notify, _, _ = self._watch([pr], details={91: detail}, calls=calls)
+        self.assertTrue(any(args[:2] == ["pr", "view"] for args in calls))
+        notify.assert_called_once()
+        self.assertIn("CI 失败", notify.call_args.args[0])
+
+    def test_pr_without_cached_signature_fetches_detail(self):
+        dispatcher.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (dispatcher.STATE_ROOT / "pr-watch.json").write_text(
+            json.dumps({"known": {"91": "OPEN"}}), encoding="utf-8"
+        )
+        calls: list[list[str]] = []
+        self._watch([watch_pr(merge_state="CLEAN", checks=ci_checks())], calls=calls)
+        self.assertTrue(any(args[:2] == ["pr", "view"] for args in calls))
+
+    def test_merged_pr_triggers_postmerge(self):
+        dispatcher.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (dispatcher.STATE_ROOT / "pr-watch.json").write_text(
+            json.dumps({"known": {"90": "OPEN"}}), encoding="utf-8"
+        )
+        with mock.patch.object(dispatcher, "cmd_postmerge") as postmerge:
+            self._watch([], terminal={90: "MERGED"})
+        postmerge.assert_called_once()
+
+    def test_closed_pr_does_not_trigger_postmerge(self):
+        dispatcher.STATE_ROOT.mkdir(parents=True, exist_ok=True)
+        (dispatcher.STATE_ROOT / "pr-watch.json").write_text(
+            json.dumps({"known": {"90": "OPEN"}}), encoding="utf-8"
+        )
+        with mock.patch.object(dispatcher, "cmd_postmerge") as postmerge:
+            self._watch([], terminal={90: "CLOSED"})
+        postmerge.assert_not_called()
 
 
 class ReviewCursorTests(IsolatedStateTestCase):

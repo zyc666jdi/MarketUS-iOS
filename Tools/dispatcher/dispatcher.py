@@ -117,8 +117,11 @@ OPEN_PR_LIMIT = 200
 
 # Post-merge convergence only needs to look at the PRs merged since the last
 # run: a wider window re-reads issues that are already done and costs GitHub
-# API calls for no state change.
+# API calls for no state change. The cursor below normally filters this window
+# down to zero or one PR; the limit is the fallback when the cursor is absent
+# or corrupt.
 POSTMERGE_PR_LIMIT = 10
+POSTMERGE_CURSOR_NAME = "postmerge-cursor.json"
 
 # Autopilot Planner：只在没有 ready / 进行中工作时选题，永远只读运行。
 AUTOPILOT_STATE = Path(".agent/state/autopilot.json")
@@ -2310,6 +2313,79 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     return 1
 
 
+def postmerge_cursor_path() -> Path:
+    return STATE_ROOT / POSTMERGE_CURSOR_NAME
+
+
+def _read_postmerge_cursor() -> tuple[datetime, int] | None:
+    """Return ``(lastMergedAt, lastPr)``; ``None`` when absent or corrupt."""
+    try:
+        data = json.loads(postmerge_cursor_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    merged_at = _parse_timestamp(data.get("lastMergedAt"))
+    last_pr = data.get("lastPr")
+    if merged_at is None or isinstance(last_pr, bool) or not isinstance(last_pr, int) or last_pr <= 0:
+        return None
+    return merged_at, last_pr
+
+
+def _write_postmerge_cursor(merged_at: str, last_pr: int) -> None:
+    _write_state_file(
+        postmerge_cursor_path(),
+        {"lastMergedAt": merged_at, "lastPr": last_pr},
+    )
+
+
+def postmerge_pr_is_new(pr: dict[str, Any], cursor: tuple[datetime, int] | None) -> bool:
+    """Return True when ``pr`` was merged after the cursor.
+
+    A missing/corrupt cursor means "no cursor" and processes every PR in the
+    bounded window (the pre-cursor behaviour). PRs merged in the same second
+    are still processed when their number is greater, so a fresh merge is not
+    lost to timestamp granularity. A PR without a usable mergedAt is always
+    processed and must not advance the cursor.
+    """
+    if cursor is None:
+        return True
+    merged_at = _parse_timestamp(pr.get("mergedAt"))
+    if merged_at is None:
+        return True
+    cursor_at, cursor_pr = cursor
+    if merged_at != cursor_at:
+        return merged_at > cursor_at
+    number = pr.get("number")
+    return not isinstance(number, int) or number > cursor_pr
+
+
+def _advance_postmerge_cursor(
+    pr: dict[str, Any], cursor: tuple[datetime, int] | None
+) -> tuple[datetime, int] | None:
+    """Persist the cursor after a PR was processed and return the new value."""
+    merged_at = _parse_timestamp(pr.get("mergedAt"))
+    number = pr.get("number")
+    if merged_at is None or not isinstance(number, int):
+        return cursor
+    raw = pr.get("mergedAt")
+    if not isinstance(raw, str):
+        return cursor
+    _write_postmerge_cursor(raw, number)
+    return merged_at, number
+
+
+def _postmerge_sort_key(pr: dict[str, Any]) -> tuple[bool, datetime, int]:
+    """Oldest merge first so a failure never advances past unprocessed PRs."""
+    merged_at = _parse_timestamp(pr.get("mergedAt"))
+    number = pr.get("number")
+    return (
+        merged_at is None,
+        merged_at or datetime.min.replace(tzinfo=timezone.utc),
+        number if isinstance(number, int) else 0,
+    )
+
+
 def cmd_postmerge(args: argparse.Namespace) -> int:
     prs = gh_json(
         [
@@ -2319,14 +2395,25 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
             "merged",
             "--limit",
             str(POSTMERGE_PR_LIMIT),
+            "--search",
+            "sort:updated-desc",
             "--json",
-            "number,title,body,headRefName,url,labels",
+            "number,title,body,headRefName,url,labels,mergedAt",
         ]
     )
+    if not isinstance(prs, list):
+        prs = []
+    cursor = _read_postmerge_cursor()
     changed = 0
-    for pr in prs:
+    skipped = 0
+    for pr in sorted((item for item in prs if isinstance(item, dict)), key=_postmerge_sort_key):
+        if not postmerge_pr_is_new(pr, cursor):
+            skipped += 1
+            continue
         issue_number = extract_issue_number(pr)
         if issue_number is None:
+            if not args.dry_run:
+                cursor = _advance_postmerge_cursor(pr, cursor)
             continue
         try:
             issue = issue_detail(issue_number)
@@ -2371,6 +2458,11 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
                 updated = True
         if updated:
             changed += 1
+        # Only a fully processed PR moves the cursor, so a crash or GitHub error
+        # leaves the same PR in the next window for an idempotent retry.
+        cursor = _advance_postmerge_cursor(pr, cursor)
+    if skipped:
+        print(f"postmerge: skipped {skipped} already-processed PR(s)")
     print(f"postmerge: {changed} issue(s) updated")
     return 0
 
@@ -2658,6 +2750,87 @@ def should_auto_review(labels: set[str], has_review: bool, age: float) -> bool:
 WATCH_STATE_NAME = "pr-watch.json"
 WATCH_CONFLICT_MARKER = "<!-- dispatcher-conflict pr={} sha={} -->"
 WATCH_BEHIND_MARKER = "<!-- dispatcher-behind pr={} sha={} -->"
+WATCH_CI_FAILURES = ("FAILURE", "CANCELLED")
+WATCH_LIST_FIELDS = "number,title,headRefName,headRefOid,updatedAt,mergeStateStatus"
+WATCH_DETAIL_FIELDS = "mergeable,mergeStateStatus,statusCheckRollup"
+
+
+def _watch_ci_entries(rollup: Any) -> list[dict[str, str]]:
+    """Normalize check runs and legacy status contexts into comparable entries."""
+    entries: list[dict[str, str]] = []
+    if not isinstance(rollup, list):
+        return entries
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        entries.append(
+            {
+                "name": str(check.get("name") or check.get("context") or ""),
+                "status": str(check.get("status") or check.get("state") or ""),
+                "conclusion": str(check.get("conclusion") or ""),
+            }
+        )
+    return entries
+
+
+def watch_ci_fingerprint(rollup: Any) -> str:
+    """Stable summary of a rollup; only status/conclusion changes matter."""
+    return "|".join(
+        sorted(
+            f"{entry['name']}:{entry['status']}:{entry['conclusion']}"
+            for entry in _watch_ci_entries(rollup)
+        )
+    )
+
+
+def watch_ci_pending(rollup: Any) -> bool:
+    """Whether a check may still change; settled rollups can be skipped."""
+    for entry in _watch_ci_entries(rollup):
+        state = entry["status"].upper()
+        if state in ("SUCCESS", "FAILURE", "ERROR"):  # legacy StatusContext
+            continue
+        if state != "COMPLETED":
+            return True
+    return False
+
+
+def watch_pr_signature(pr: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
+    """Build the cached signature used to skip unchanged PR detail/CI calls."""
+    rollup = detail.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        rollup = pr.get("statusCheckRollup")
+    entries = _watch_ci_entries(rollup)
+    failed = [entry for entry in entries if entry["conclusion"] in WATCH_CI_FAILURES]
+    return {
+        "headRefOid": str(pr.get("headRefOid") or ""),
+        "updatedAt": str(pr.get("updatedAt") or ""),
+        "mergeStateStatus": str(pr.get("mergeStateStatus") or ""),
+        "mergeable": str(detail.get("mergeable") or pr.get("mergeable") or ""),
+        "ci": watch_ci_fingerprint(rollup),
+        "ciPending": watch_ci_pending(rollup),
+        "failedChecks": len(failed),
+    }
+
+
+def watch_signature_is_fresh(cached: Any, pr: dict[str, Any]) -> bool:
+    """Return True when the cache allows skipping the PR detail/CI call.
+
+    A missing or legacy entry forces a fetch. A rollup with in-flight checks
+    also forces a fetch: CI can finish without headRefOid or updatedAt moving,
+    so only settled signatures are safe to reuse.
+    """
+    if not isinstance(cached, dict):
+        return False
+    for key in ("headRefOid", "updatedAt", "mergeStateStatus"):
+        if str(cached.get(key) or "") != str(pr.get(key) or ""):
+            return False
+    if cached.get("ciPending"):
+        return False
+    if str(cached.get("mergeable") or "") in ("", "UNKNOWN"):
+        return False
+    if str(cached.get("mergeStateStatus") or "").upper() == "UNKNOWN":
+        return False
+    return isinstance(cached.get("failedChecks"), int) and "mergeable" in cached
 
 
 def _acquire_watch_update_locks(number: int) -> list[TextIO] | None:
@@ -2680,6 +2853,10 @@ def _acquire_watch_update_locks(number: int) -> list[TextIO] | None:
 
 def cmd_watch(args: argparse.Namespace) -> int:
     """跟踪 ai/* PR 的创建/合并/关闭/冲突/CI 失败，去重通知。
+
+    ``pr-watch.json`` 为每个 open PR 保存 head/updatedAt/mergeState/CI 签名。
+    签名未变化时跳过 ``gh pr view`` 详情/CI 调用；没有缓存（包括旧格式）或
+    仍有 pending check 时一定重新拉取，避免漏掉合并、冲突与 CI 结果。
 
     ``dry_run`` 时只打印计划：不更新远端分支、不评论、不改 issue 状态，也不写
     本地 watch 状态，保证 ``run --dry-run`` 是纯预览。
@@ -2711,20 +2888,36 @@ def cmd_watch(args: argparse.Namespace) -> int:
     prs = gh_json(
         [
             "pr", "list", "--state", "open", "--limit", "50",
-            "--json", "number,title,headRefName,headRefOid,mergeable,mergeStateStatus,statusCheckRollup",
+            "--json", WATCH_LIST_FIELDS,
         ]
     )
+    if not isinstance(prs, list):
+        prs = []
     events: list[tuple[str, str, str]] = []
-    current: dict[str, str] = {}
+    current: dict[str, dict[str, Any]] = {}
     for pr in prs:
+        if not isinstance(pr, dict):
+            continue
         if not pr.get("headRefName", "").startswith("ai/"):
             continue
-        n = str(pr["number"]); current[n] = "OPEN"
+        n = str(pr["number"])
         sha = str(pr.get("headRefOid") or "")
         issue_number = extract_issue_number(pr)
+        cached = known.get(n)
+        if watch_signature_is_fresh(cached, pr):
+            signature = cached
+        else:
+            detail = gh_json(["pr", "view", n, "--json", WATCH_DETAIL_FIELDS])
+            if not isinstance(detail, dict):
+                detail = {}
+            signature = watch_pr_signature(pr, detail)
+        current[n] = signature
+        mergeable = str(signature.get("mergeable") or "")
+        merge_state = str(signature.get("mergeStateStatus") or "")
+        failed_checks = int(signature.get("failedChecks") or 0)
         if initialized and n not in known:
             events.append(("MarketUS PR 已创建", f"#{n} {pr['title']}", f"created:{n}"))
-        if pr.get("mergeable") == "CONFLICTING":
+        if mergeable == "CONFLICTING":
             key = f"conflict:{n}:{sha}"
             if key not in handled:
                 if not dry_run:
@@ -2738,7 +2931,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         set_status(issue_number, "status:blocked")
                 handled.add(key)
                 events.append(("MarketUS PR 有冲突", f"#{n} {pr['title']}", key))
-        elif pr.get("mergeStateStatus") == "BEHIND":
+        elif merge_state == "BEHIND":
             key = f"behind:{n}:{sha}"
             if key not in handled and dry_run:
                 print(f"(dry-run) 将 update-branch PR #{n} ({sha[:8]})")
@@ -2773,14 +2966,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         if issue_number is not None:
                             set_status(issue_number, "status:blocked")
                         events.append(("MarketUS PR 无法自动更新", f"#{n} {pr['title']}", key))
-        failed = [c for c in (pr.get("statusCheckRollup") or []) if c.get("conclusion") in ("FAILURE", "CANCELLED")]
-        if failed:
-            events.append(("MarketUS PR CI 失败", f"#{n} {len(failed)} 个 check 失败", f"ci:{n}:{sha}"))
+        if failed_checks:
+            events.append(("MarketUS PR CI 失败", f"#{n} {failed_checks} 个 check 失败", f"ci:{n}:{sha}"))
 
     for n in set(known) - set(current):
         try:
             detail = gh_json(["pr", "view", n, "--json", "state,title,url"])
         except SystemExit:
+            continue
+        if not isinstance(detail, dict):
             continue
         state_value = detail.get("state")
         if state_value == "MERGED":
