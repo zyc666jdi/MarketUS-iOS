@@ -21,6 +21,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,8 @@ DISPATCHER_ROOT = Path(__file__).resolve().parent
 if str(DISPATCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(DISPATCHER_ROOT))
 
-from reducer import Reducer, derive_job_id  # noqa: E402
+from jobs import JOB_STATES, JOBS_DB, JobStore  # noqa: E402
+from reducer import Reducer, derive_job_id as derive_operation_id  # noqa: E402
 from runners.base import (  # noqa: E402
     ResolvedRole,
     RunnerResult,
@@ -90,6 +92,7 @@ TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
 JOB_ROOT = Path(".agent/jobs")
+JOBS_DB_PATH = JOBS_DB
 STATE_ROOT = Path(".agent/state")
 LOOP_ROOT = Path(".agent/loops")
 LOOP_ENV_ID = "DISPATCHER_LOOP_ID"
@@ -1207,7 +1210,10 @@ def ensure_agent_pr(
     the public remote.
     """
     base_sha = run(["git", "-C", str(worktree), "merge-base", "origin/main", "HEAD"])
-    job_id = derive_job_id(
+    # Operation-log id (reducer scheme), not the scheduler store id.  The
+    # store's jobs.derive_job_id is a separate namespace until the Phase 1c
+    # integration picks one canonical mapping.
+    job_id = derive_operation_id(
         "implementer",
         issue["number"],
         (base_sha.stdout or "").strip(),
@@ -3469,6 +3475,89 @@ def cmd_loop(args: argparse.Namespace) -> int:
     return cmd_loop_show(args)
 
 
+def _format_job_time(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
+def _job_store() -> JobStore:
+    return JobStore(JOBS_DB_PATH)
+
+
+def cmd_jobs_list(args: argparse.Namespace) -> int:
+    """List jobs from the shadow SQLite store (read-only for scheduling)."""
+    state = getattr(args, "state", None)
+    limit = int(getattr(args, "limit", 50))
+    try:
+        rows = _job_store().list_jobs(state=state, limit=limit)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"⛔ jobs list: {error}")
+        return 1
+    if not rows:
+        print("jobs list: 暂无记录")
+        return 0
+    print(
+        f"{'job_id':<34} {'state':<8} {'role':<12} {'ticket':>6} "
+        f"{'pr':>5} {'attempt':>7} {'lease_until':<21} updated_at"
+    )
+    for row in rows:
+        pr = row.get("pr")
+        print(
+            f"{str(row.get('job_id') or '-'):<34} {str(row.get('state') or '-'):<8} "
+            f"{str(row.get('role') or '-'):<12} {int(row.get('ticket') or 0):>6} "
+            f"{(str(pr) if pr is not None else '-'):>5} {int(row.get('attempt') or 0):>7} "
+            f"{_format_job_time(row.get('lease_until')):<21} "
+            f"{_format_job_time(row.get('updated_at'))}"
+        )
+    return 0
+
+
+def cmd_jobs_show(args: argparse.Namespace) -> int:
+    """Show one job from the shadow SQLite store."""
+    job_id = str(getattr(args, "job_id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", job_id):
+        print(f"⛔ 未找到 job：{job_id}")
+        return 1
+    try:
+        job = _job_store().get_job(job_id)
+    except (OSError, sqlite3.Error) as error:
+        print(f"⛔ jobs show: {error}")
+        return 1
+    if job is None:
+        print(f"⛔ 未找到 job：{job_id}")
+        return 1
+    fields = (
+        ("job_id", job.get("job_id")),
+        ("role", job.get("role")),
+        ("ticket", job.get("ticket")),
+        ("pr", job.get("pr") if job.get("pr") is not None else "-"),
+        ("state", job.get("state")),
+        ("attempt", job.get("attempt")),
+        ("lease_owner", job.get("lease_owner") or "-"),
+        ("lease_until", _format_job_time(job.get("lease_until"))),
+        ("heartbeat_at", _format_job_time(job.get("heartbeat_at"))),
+        ("created_at", _format_job_time(job.get("created_at"))),
+        ("updated_at", _format_job_time(job.get("updated_at"))),
+        ("base_sha", job.get("base_sha") or "-"),
+        ("head_sha", job.get("head_sha") or "-"),
+        ("prompt_hash", job.get("prompt_hash") or "-"),
+        ("error", job.get("error") or "-"),
+    )
+    for label, value in fields:
+        print(f"{label:<12} {value}")
+    return 0
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    if args.jobs_command == "list":
+        return cmd_jobs_list(args)
+    return cmd_jobs_show(args)
+
+
 def cmd_observe(args: argparse.Namespace) -> int:
     """本地实时观测：launchd、agent、PR、最后日志。"""
     import time
@@ -3813,6 +3902,14 @@ def main() -> int:
     loop_show_parser = loop_subparsers.add_parser("show", help="显示一个 loop 的时间线")
     loop_show_parser.add_argument("loop_id")
 
+    jobs_parser = subparsers.add_parser("jobs", help="查看 SQLite job store（影子，不参与调度）")
+    jobs_subparsers = jobs_parser.add_subparsers(dest="jobs_command", required=True)
+    jobs_list_parser = jobs_subparsers.add_parser("list", help="列出 job")
+    jobs_list_parser.add_argument("--state", choices=JOB_STATES, help="按 state 过滤")
+    jobs_list_parser.add_argument("--limit", type=int, default=50, help="最多显示条数")
+    jobs_show_parser = jobs_subparsers.add_parser("show", help="显示一个 job")
+    jobs_show_parser.add_argument("job_id")
+
     run_parser = subparsers.add_parser("run", help="单次巡检：postmerge → dispatch → review → planner")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--timeout", type=int, default=90)
@@ -3843,6 +3940,8 @@ def main() -> int:
         return cmd_planner(args)
     if args.command == "loop":
         return cmd_loop(args)
+    if args.command == "jobs":
+        return cmd_jobs(args)
     if args.command == "observe":
         return cmd_observe(args)
     if args.command == "observe":
