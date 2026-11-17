@@ -3105,29 +3105,30 @@ class LoopTraceTests(unittest.TestCase):
         ):
             self.assertEqual(dispatcher.summarize_loop(path, now=now)["status"], "running")
 
-    def test_no_loop_start_uses_last_event_for_stale_age(self):
+    def test_no_loop_start_uses_earliest_event_for_stale_age(self):
         now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
-        # Two timestamps and no loop_start: the newest event must win over the
-        # initial event, both for "still running" and for stale age.
-        running = self._write_open_timeline(
+        # No loop_start and two timestamps: a recent child event must not hide
+        # the 22h-old first event.
+        stale = self._write_open_timeline(
             "20260102T000000-dddddddd",
             started_at=now - timedelta(hours=22),
             last_event_at=now - timedelta(hours=1),
             with_start=False,
         )
+        summary = dispatcher.summarize_loop(stale, now=now)
+        self.assertEqual(summary["status"], "stale")
+        self.assertEqual(summary["duration_ms"], 22 * 60 * 60 * 1000)
+
+        # A genuinely fresh legacy timeline still stays running.
+        running = self._write_open_timeline(
+            "20260102T000000-ddddddde",
+            started_at=now - timedelta(hours=1),
+            last_event_at=now - timedelta(minutes=5),
+            with_start=False,
+        )
         summary = dispatcher.summarize_loop(running, now=now)
         self.assertEqual(summary["status"], "running")
         self.assertEqual(summary["duration_ms"], 60 * 60 * 1000)
-
-        stale = self._write_open_timeline(
-            "20260102T000000-ddddddde",
-            started_at=now - timedelta(hours=22),
-            last_event_at=now - timedelta(hours=3),
-            with_start=False,
-        )
-        summary = dispatcher.summarize_loop(stale, now=now)
-        self.assertEqual(summary["status"], "stale")
-        self.assertEqual(summary["duration_ms"], 3 * 60 * 60 * 1000)
 
     def test_loop_list_renders_stale_and_suppresses_running(self):
         now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)

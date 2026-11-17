@@ -3291,15 +3291,20 @@ def _loop_now() -> datetime:
 def _loop_reference_time(
     events: list[dict[str, Any]], start_ts: str
 ) -> datetime | None:
-    """Prefer loop_start; fall back to the newest event for legacy timelines."""
+    """Prefer loop_start; fall back to the earliest event for legacy timelines.
+
+    The earliest event is used so a loop that has been running for 22h cannot
+    look fresh just because a repair child appended one recent event.
+    """
     started = _parse_timestamp(start_ts)
     if started is not None:
         return started
-    for event in reversed(events):
+    earliest: datetime | None = None
+    for event in events:
         parsed = _parse_timestamp(event.get("ts"))
-        if parsed is not None:
-            return parsed
-    return None
+        if parsed is not None and (earliest is None or parsed < earliest):
+            earliest = parsed
+    return earliest
 
 
 def summarize_loop(
