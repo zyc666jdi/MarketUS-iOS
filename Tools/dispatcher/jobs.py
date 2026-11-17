@@ -1,18 +1,9 @@
 """Phase 1c-i: durable SQLite job store for the dispatcher (shadow only).
 
-The store is the hand-off point a later scheduler phase will use to hand work
-to runners.  This phase only provides the schema and the CAS/lease primitives;
-``dispatcher.py run`` / ``once`` do not enqueue or claim jobs yet, so existing
-scheduling behaviour is unchanged.
-
-Job ids are derived from the immutable job identity
-``(role, ticket, pr, base_sha, prompt_hash)``.  A retry reuses the same row and
-job id; the per-row ``attempt`` counter is the only thing that changes.  Lease
-timestamps are UTC epoch seconds so the CAS predicate is a simple numeric
-comparison; the CLI renders them as ISO-8601.
-
-SQLite is used in WAL mode so a reader (``jobs list``) never blocks the writer
-that is heartbeating a lease.
+The store only provides schema and CAS/lease primitives; ``dispatcher.py
+run`` / ``once`` do not enqueue or claim jobs yet.  Job ids hash
+``(role, ticket, pr, base_sha, prompt_hash)``; a retry after a stale lease
+reuses the row while ``attempt`` increments.  WAL keeps readers non-blocking.
 """
 
 from __future__ import annotations
@@ -33,9 +24,7 @@ JOBS_DB = JOBS_ROOT / "jobs.db"
 JOB_STATES = ("queued", "leased", "running", "reducing", "done", "failed", "stale")
 ACTIVE_STATES = ("leased", "running", "reducing")
 TERMINAL_STATES = ("done", "failed")
-
 DEFAULT_BUSY_TIMEOUT_MS = 5000
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id       TEXT PRIMARY KEY,
@@ -74,9 +63,9 @@ def derive_job_id(
 ) -> str:
     """Return the stable id for one job identity.
 
-    The attempt number is deliberately absent: a retry after a failed or stale
-    lease must resume the same row instead of creating a duplicate.  ``head_sha``
-    is absent for the same reason (it changes when the worker commits).
+    Attempt and ``head_sha`` are absent so a retry or new commit reuses the
+    row.  This is the store's id, not the reducer's ``(role, issue, base_sha,
+    branch)`` run id; scheduler integration must map the two explicitly.
     """
     role = str(role or "").strip().lower()
     if not role:
@@ -98,8 +87,7 @@ def _as_epoch(value: float | int | datetime | None) -> float:
     if value is None:
         raise ValueError("timestamp 不能为空")
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
+        value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
         return value.timestamp()
     return float(value)
 
@@ -116,12 +104,9 @@ class JobStore:
         self.busy_timeout_ms = max(0, int(busy_timeout_ms))
         self._init_db()
 
-    # -- connection / schema -------------------------------------------------
-
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            str(self.db_path), timeout=self.busy_timeout_ms / 1000.0, isolation_level=None
-        )
+        connection = sqlite3.connect(str(self.db_path),
+                                     timeout=self.busy_timeout_ms / 1000.0, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA synchronous = NORMAL")
@@ -130,7 +115,6 @@ class JobStore:
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
-            # WAL is persistent on the database file; set it once at creation.
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(_SCHEMA)
 
@@ -153,8 +137,6 @@ class JobStore:
     def _now(self, value: float | int | datetime | None = None) -> float:
         return _as_epoch(value) if value is not None else float(self._clock())
 
-    # -- queue operations ----------------------------------------------------
-
     def enqueue(
         self,
         role: str,
@@ -167,11 +149,7 @@ class JobStore:
         job_id: str | None = None,
         now: float | int | datetime | None = None,
     ) -> dict[str, Any]:
-        """Insert a queued job; a repeated enqueue leaves the existing row alone.
-
-        The stable id makes this an idempotent upsert: callers may safely retry
-        after a crash without creating a second job for the same work identity.
-        """
+        """Insert a queued job; a repeated enqueue leaves the existing row alone."""
         job_id = job_id or derive_job_id(role, ticket, pr, base_sha, prompt_hash)
         current = self._now(now)
         role = str(role or "").strip().lower()
@@ -183,29 +161,42 @@ class JobStore:
         pr_value = int(pr) if pr not in (None, "") else None
         if pr_value is not None and pr_value < 0:
             raise ValueError("pr 不能为负数")
+        identity = (role, ticket, pr_value, str(base_sha or ""), str(prompt_hash or ""))
         with self._write() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO jobs (
-                    job_id, role, ticket, pr, base_sha, head_sha, prompt_hash,
-                    state, attempt, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
-                """,
-                (
-                    job_id,
-                    role,
-                    ticket,
-                    pr_value,
-                    str(base_sha or ""),
-                    str(head_sha or ""),
-                    str(prompt_hash or ""),
-                    current,
-                    current,
-                ),
-            )
-            row = connection.execute(
+            existing = connection.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
+            if existing is not None:
+                stored = tuple(
+                    existing[field]
+                    for field in ("role", "ticket", "pr", "base_sha", "prompt_hash")
+                )
+                if stored != identity:
+                    raise ValueError(f"job_id {job_id} 已存在且身份不同")
+                row = existing
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO jobs (
+                        job_id, role, ticket, pr, base_sha, head_sha, prompt_hash,
+                        state, attempt, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        role,
+                        ticket,
+                        pr_value,
+                        identity[3],
+                        str(head_sha or ""),
+                        identity[4],
+                        current,
+                        current,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
         if row is None:  # pragma: no cover - the INSERT above guarantees a row
             raise RuntimeError(f"job 写入后无法回读：{job_id}")
         return dict(row)
@@ -219,12 +210,9 @@ class JobStore:
     ) -> dict[str, Any] | None:
         """Atomically lease the oldest claimable job, or return ``None``.
 
-        A job is claimable when it is ``queued`` or when its lease has expired
-        (an expired worker is presumed dead).  ``stale`` jobs were reaped from an
-        expired lease and are therefore claimable again; ``attempt`` records how
-        many times the job has been leased.  ``BEGIN IMMEDIATE`` plus the
-        state/lease predicate makes the read-update-read sequence a single
-        writer critical section, so concurrent claimers cannot both win.
+        ``queued`` and expired (or reaped ``stale``) jobs are claimable;
+        ``BEGIN IMMEDIATE`` makes the read-update-read sequence a single writer
+        critical section, so concurrent claimers cannot both win.
         """
         owner = str(owner or "").strip()
         if not owner:
@@ -235,10 +223,8 @@ class JobStore:
         current = self._now(now)
         deadline = current + ttl_value
         expired = ", ".join(f"'{state}'" for state in ACTIVE_STATES + ("stale",))
-        claimable = (
-            f"state = 'queued' OR (state IN ({expired}) "
-            "AND (lease_until IS NULL OR lease_until <= ?))"
-        )
+        claimable = (f"state = 'queued' OR (state IN ({expired}) "
+                     "AND (lease_until IS NULL OR lease_until <= ?))")
         with self._write() as connection:
             row = connection.execute(
                 f"SELECT job_id FROM jobs WHERE {claimable} "
@@ -298,22 +284,43 @@ class JobStore:
         state: str,
         error: str = "",
         *,
+        owner: str | None = None,
+        attempt: int | None = None,
         now: float | int | datetime | None = None,
     ) -> bool:
-        """Move a job to a terminal state and release its lease."""
+        """Move a job to a terminal state and release its lease.
+
+        Leased jobs require the current ``owner`` (and optional ``attempt``);
+        omitting the owner only cancels a still-queued job.
+        """
         if state not in TERMINAL_STATES:
             raise ValueError(f"finish 只接受 {TERMINAL_STATES}，收到 {state!r}")
+        if owner is not None:
+            owner = str(owner).strip()
+            if not owner:
+                raise ValueError("owner 不能为空")
+        if attempt is not None and int(attempt) < 1:
+            raise ValueError("attempt 必须是正整数")
         current = self._now(now)
-        active = ", ".join(f"'{item}'" for item in ("queued",) + ACTIVE_STATES)
+        if owner is None:
+            where = "job_id = ? AND state = 'queued'"
+            parameters: list[Any] = [str(job_id)]
+        else:
+            active = ", ".join(f"'{item}'" for item in ACTIVE_STATES)
+            where = f"job_id = ? AND lease_owner = ? AND state IN ({active})"
+            parameters = [str(job_id), owner]
+            if attempt is not None:
+                where += " AND attempt = ?"
+                parameters.append(int(attempt))
         with self._write() as connection:
             updated = connection.execute(
                 f"""
                 UPDATE jobs
                 SET state = ?, error = ?, updated_at = ?,
-                    lease_owner = NULL, lease_until = NULL
-                WHERE job_id = ? AND state IN ({active})
+                    lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL
+                WHERE {where}
                 """,
-                (state, str(error or ""), current, str(job_id)),
+                (state, str(error or ""), current, *parameters),
             )
             return updated.rowcount == 1
 
@@ -356,8 +363,6 @@ class JobStore:
             ).fetchall()
         return [dict(row) for row in reaped]
 
-    # -- reads ---------------------------------------------------------------
-
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         """Return one job, or ``None`` when the id is unknown."""
         with self._read() as connection:
@@ -391,7 +396,5 @@ class JobStore:
         return [dict(row) for row in rows]
 
 
-__all__ = [
-    "ACTIVE_STATES", "DEFAULT_BUSY_TIMEOUT_MS", "JOB_STATES", "JOBS_DB",
-    "JOBS_ROOT", "JobStore", "TERMINAL_STATES", "derive_job_id",
-]
+__all__ = ["ACTIVE_STATES", "DEFAULT_BUSY_TIMEOUT_MS", "JOB_STATES", "JOBS_DB",
+           "JOBS_ROOT", "JobStore", "TERMINAL_STATES", "derive_job_id"]
