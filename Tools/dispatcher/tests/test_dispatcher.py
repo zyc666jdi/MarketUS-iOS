@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -405,11 +405,13 @@ class RunParallelLockTests(IsolatedStateTestCase):
             for line in self._timeline_path().read_text(encoding="utf-8").splitlines()
         ]
 
-    def test_background_repair_failure_closes_deferred_loop(self):
+    def test_background_repair_failure_keeps_parent_loop_stale(self):
         code, _, popen = self._run([numbered_ai_pr(82)], [])
         self.assertEqual(code, 0)
         events = self._events()
-        self.assertFalse(any(event["event"] == "loop_end" for event in events))
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "stale")
+        self.assertIn("not done at parent exit", events[-1]["details"]["reason"])
         self.assertFalse(
             any(
                 event["event"] == "step_end" and event["step"] == "repair"
@@ -420,6 +422,7 @@ class RunParallelLockTests(IsolatedStateTestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertTrue(state["parent_done"])
         self.assertFalse(state["child_done"])
+        self.assertTrue(state["closed"])
 
         child_env = popen.call_args.kwargs["env"]
         self.assertEqual(child_env[dispatcher.LOOP_ENV_STEP], "repair")
@@ -437,11 +440,13 @@ class RunParallelLockTests(IsolatedStateTestCase):
         )
         self.assertEqual(repair_end["status"], "failed")
         self.assertEqual(repair_end["details"]["error"], "repair exit=1")
-        self.assertEqual(events[-1]["event"], "loop_end")
-        self.assertEqual(events[-1]["status"], "failed")
+        self.assertEqual(events[-1]["event"], "step_end")
+        self.assertEqual(len([event for event in events if event["event"] == "loop_end"]), 1)
         summary = dispatcher.summarize_loop(self._timeline_path())
-        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["status"], "stale")
         self.assertEqual(summary["steps"]["repair"], "failed")
+        self.assertEqual(summary["events_after_end"], 1)
+        self.assertIn("not done at parent exit", summary["reason"])
 
     def test_lock_busy_child_marks_repair_skipped_instead_of_failed(self):
         code, _, _ = self._run([numbered_ai_pr(82)], [])
@@ -462,12 +467,15 @@ class RunParallelLockTests(IsolatedStateTestCase):
         )
         self.assertEqual(repair_end["status"], "skipped")
         self.assertNotIn("error", repair_end["details"])
-        self.assertEqual(events[-1]["event"], "loop_end")
-        self.assertEqual(events[-1]["status"], "skipped")
-        self.assertNotIn("error", events[-1]["details"])
+        loop_ends = [event for event in events if event["event"] == "loop_end"]
+        self.assertEqual(len(loop_ends), 1)
+        self.assertEqual(loop_ends[0]["status"], "stale")
+        self.assertNotIn("error", loop_ends[0]["details"])
+        self.assertEqual(events[-1]["event"], "step_end")
         summary = dispatcher.summarize_loop(self._timeline_path())
-        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(summary["status"], "stale")
         self.assertEqual(summary["steps"]["repair"], "skipped")
+        self.assertEqual(summary["events_after_end"], 1)
 
     def test_loop_state_failure_still_spawns_repair(self):
         loop_id = "20260101T000000-feedface"
@@ -2727,6 +2735,47 @@ class LoopTraceTests(unittest.TestCase):
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 
+    @staticmethod
+    def _iso(moment: datetime) -> str:
+        return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _write_open_timeline(
+        self,
+        loop_id: str,
+        *,
+        started_at: datetime,
+        last_event_at: datetime | None = None,
+        with_start: bool = True,
+    ) -> Path:
+        path = self.root / loop_id / "timeline.jsonl"
+        path.parent.mkdir(parents=True)
+        events = []
+        if with_start:
+            events.append(
+                {"ts": self._iso(started_at), "event": "loop_start", "step": ""}
+            )
+        events.append(
+            {"ts": self._iso(started_at), "event": "step_start", "step": "dispatch"}
+        )
+        if last_event_at is not None:
+            events.append(
+                {"ts": self._iso(last_event_at), "event": "step_start", "step": "watch"}
+            )
+        lines = [
+            json.dumps(
+                {
+                    "loop_id": loop_id,
+                    "status": "ok",
+                    "duration_ms": 0,
+                    "details": {},
+                    **event,
+                }
+            )
+            for event in events
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
     def test_make_loop_id_is_sortable_and_unique(self):
         with mock.patch.object(dispatcher, "datetime") as clock:
             clock.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -2811,7 +2860,9 @@ class LoopTraceTests(unittest.TestCase):
         parsed = dispatcher._parse_timestamp("2026-01-01T00:00:00")
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.tzinfo, timezone.utc)
-        summary = dispatcher.summarize_loop(path)
+        summary = dispatcher.summarize_loop(
+            path, now=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
         self.assertEqual(summary["status"], "running")
         self.assertGreaterEqual(summary["duration_ms"], 0)
 
@@ -2926,20 +2977,200 @@ class LoopTraceTests(unittest.TestCase):
         self.assertEqual(events[-1]["status"], "failed")
         self.assertEqual(events[-1]["details"]["error"], "repair exit=1")
 
-    def test_parent_finishes_before_child_lets_child_close_loop(self):
+    def test_parent_finishes_before_child_writes_stale_loop_end(self):
         trace = self._trace()
         trace.emit("loop_start")
         dispatcher.defer_loop(trace, "repair", time.time())
         dispatcher.finish_deferred_loop(trace)
-        self.assertFalse(
-            any(event["event"] == "loop_end" for event in self._events(trace))
+
+        events = self._events(trace)
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "stale")
+        self.assertIn(
+            "deferred repair child not done at parent exit",
+            events[-1]["details"]["reason"],
         )
+        state_path = trace.path.parent / dispatcher.LOOP_STATE_NAME
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["parent_done"])
+        self.assertTrue(state["closed"])
+        self.assertFalse(state["child_done"])
+
         dispatcher.finish_deferred_child(trace, 0)
         events = self._events(trace)
-        self.assertEqual(events[-2]["event"], "step_end")
-        self.assertEqual(events[-2]["status"], "ok")
-        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["event"], "step_end")
         self.assertEqual(events[-1]["status"], "ok")
+        self.assertEqual(
+            len([event for event in events if event["event"] == "loop_end"]), 1
+        )
+        summary = dispatcher.summarize_loop(trace.path)
+        self.assertEqual(summary["status"], "stale")
+        self.assertEqual(summary["steps"]["repair"], "ok")
+        self.assertEqual(summary["events_after_end"], 1)
+        self.assertIn("not done at parent exit", summary["reason"])
+
+    def test_parent_exit_without_child_records_stale_report(self):
+        trace = self._trace()
+        trace.emit("loop_start")
+        dispatcher.defer_loop(trace, "repair", time.time())
+        trace.finish_or_defer()
+
+        events = self._events(trace)
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "stale")
+        self.assertIsInstance(events[-1]["duration_ms"], int)
+        self.assertGreaterEqual(events[-1]["duration_ms"], 0)
+
+    def test_missing_or_corrupt_loop_state_still_closes_stale(self):
+        for corruption, suffix in (("missing", "aaaaaaaa"), ("corrupt", "bbbbbbbb")):
+            with self.subTest(corruption=corruption):
+                trace = self._trace(f"20260101T000000-{suffix}")
+                trace.emit("loop_start")
+                dispatcher.defer_loop(trace, "repair", time.time())
+                state_path = trace.path.parent / dispatcher.LOOP_STATE_NAME
+                if corruption == "missing":
+                    state_path.unlink()
+                else:
+                    state_path.write_text("{broken", encoding="utf-8")
+
+                trace.finish_or_defer()
+
+                events = self._events(trace)
+                self.assertEqual(events[-1]["event"], "loop_end")
+                self.assertEqual(events[-1]["status"], "stale")
+                self.assertIn(
+                    "deferred repair child not done at parent exit",
+                    events[-1]["details"]["reason"],
+                )
+                self.assertFalse(trace.state_failed)
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertTrue(state["closed"])
+
+    def test_normal_loop_end_statuses_are_unchanged(self):
+        ok_trace = self._trace("20260101T000000-aaaaaaaa")
+        ok_trace.emit("loop_start")
+        ok_trace.finish()
+        self.assertEqual(self._events(ok_trace)[-1]["status"], "ok")
+
+        failed_trace = self._trace("20260101T000000-bbbbbbbb")
+        failed_trace.emit("loop_start")
+        failed_trace.fail(RuntimeError("boom"))
+        failed_trace.finish()
+        self.assertEqual(self._events(failed_trace)[-1]["status"], "failed")
+
+    def test_no_loop_end_becomes_stale_after_threshold(self):
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        path = self._write_open_timeline(
+            "20260102T000000-aaaaaaaa", started_at=now - timedelta(hours=3)
+        )
+        summary = dispatcher.summarize_loop(path, now=now)
+        self.assertEqual(summary["status"], "stale")
+        self.assertEqual(summary["duration_ms"], 3 * 60 * 60 * 1000)
+        self.assertIn("no loop_end", summary["reason"])
+
+    def test_no_loop_end_below_threshold_stays_running(self):
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        path = self._write_open_timeline(
+            "20260102T000000-bbbbbbbb", started_at=now - timedelta(hours=1)
+        )
+        summary = dispatcher.summarize_loop(path, now=now)
+        self.assertEqual(summary["status"], "running")
+        self.assertEqual(summary["duration_ms"], 60 * 60 * 1000)
+
+    def test_stale_threshold_is_configurable_and_exact_boundary_is_running(self):
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        path = self._write_open_timeline(
+            "20260102T000000-cccccccc", started_at=now - timedelta(hours=2)
+        )
+        # Injected threshold: exactly at the boundary stays running, one
+        # second over the boundary turns stale.
+        self.assertEqual(
+            dispatcher.summarize_loop(path, now=now, stale_seconds=7200)["status"],
+            "running",
+        )
+        self.assertEqual(
+            dispatcher.summarize_loop(path, now=now, stale_seconds=7199)["status"],
+            "stale",
+        )
+        with mock.patch.dict(
+            os.environ, {dispatcher.LOOP_STALE_SECONDS_ENV: ""}, clear=False
+        ):
+            self.assertEqual(dispatcher.summarize_loop(path, now=now)["status"], "running")
+        with mock.patch.dict(
+            os.environ, {dispatcher.LOOP_STALE_SECONDS_ENV: "60"}, clear=False
+        ):
+            self.assertEqual(dispatcher.summarize_loop(path, now=now)["status"], "stale")
+        with mock.patch.dict(
+            os.environ, {dispatcher.LOOP_STALE_SECONDS_ENV: "not-a-number"}, clear=False
+        ):
+            self.assertEqual(dispatcher.summarize_loop(path, now=now)["status"], "running")
+
+    def test_no_loop_start_uses_earliest_event_for_stale_age(self):
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        # No loop_start and two timestamps: a recent child event must not hide
+        # the 22h-old first event.
+        stale = self._write_open_timeline(
+            "20260102T000000-dddddddd",
+            started_at=now - timedelta(hours=22),
+            last_event_at=now - timedelta(hours=1),
+            with_start=False,
+        )
+        summary = dispatcher.summarize_loop(stale, now=now)
+        self.assertEqual(summary["status"], "stale")
+        self.assertEqual(summary["duration_ms"], 22 * 60 * 60 * 1000)
+
+        # A genuinely fresh legacy timeline still stays running.
+        running = self._write_open_timeline(
+            "20260102T000000-ddddddde",
+            started_at=now - timedelta(hours=1),
+            last_event_at=now - timedelta(minutes=5),
+            with_start=False,
+        )
+        summary = dispatcher.summarize_loop(running, now=now)
+        self.assertEqual(summary["status"], "running")
+        self.assertEqual(summary["duration_ms"], 60 * 60 * 1000)
+
+    def test_loop_list_renders_stale_and_suppresses_running(self):
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        # Regression: a loop stuck for 22h must not be reported as running.
+        self._write_open_timeline(
+            "20260102T000000-eeeeeeee", started_at=now - timedelta(hours=22)
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "_loop_now", return_value=now),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.cmd_loop_list(argparse.Namespace(limit=10))
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("20260102T000000-eeeeeeee", text)
+        self.assertIn("stale", text)
+        self.assertNotIn(" running ", text)
+        self.assertIn("1320m0s", text)
+
+    def test_loop_show_renders_stale_reason_and_events_after_end(self):
+        now = datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc)
+        trace = self._trace("20260101T000000-ffffffff")
+        trace.emit("loop_start")
+        dispatcher.defer_loop(trace, "repair", time.time())
+        dispatcher.finish_deferred_loop(trace)
+        dispatcher.finish_deferred_child(trace, 1, "repair exit=1")
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "_loop_now", return_value=now),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.cmd_loop_show(
+                argparse.Namespace(loop_id="20260101T000000-ffffffff")
+            )
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("status   stale", text)
+        self.assertIn("reason   deferred repair child not done at parent exit", text)
+        self.assertIn("note     events after loop_end: 1 (ignored for status)", text)
+        self.assertNotIn("status   running", text)
 
     def test_unwritable_loop_state_is_best_effort_and_marks_loop_failed(self):
         trace = self._trace()
