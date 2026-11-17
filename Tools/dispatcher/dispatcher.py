@@ -121,6 +121,10 @@ OPEN_PR_LIMIT = 200
 # down to zero or one PR; the limit is the fallback when the cursor is absent
 # or corrupt.
 POSTMERGE_PR_LIMIT = 10
+# GitHub can only order merged PRs by updatedAt, so the cursor path also bounds
+# the search by merge date and keeps a wider page. Otherwise pre-cursor PRs
+# updated after a merge could fill the window and starve the fresh merge.
+POSTMERGE_RECONCILE_LIMIT = 100
 POSTMERGE_CURSOR_NAME = "postmerge-cursor.json"
 
 # Autopilot Planner：只在没有 ready / 进行中工作时选题，永远只读运行。
@@ -2386,7 +2390,24 @@ def _postmerge_sort_key(pr: dict[str, Any]) -> tuple[bool, datetime, int]:
     )
 
 
+def postmerge_search_query(cursor: tuple[datetime, int] | None) -> str:
+    """Bound the updatedAt-ordered window by the cursor's merge date.
+
+    GitHub cannot sort merged PRs by mergedAt. Without the ``merged:>=`` bound,
+    PRs merged before the cursor but updated afterwards can fill the whole
+    window and starve a fresh merge forever. Search only supports date
+    precision, so same-day merges stay in the window and are filtered exactly
+    by ``postmerge_pr_is_new`` below.
+    """
+    query = "sort:updated-desc"
+    if cursor is None:
+        return query
+    return f"merged:>={cursor[0].date().isoformat()} {query}"
+
+
 def cmd_postmerge(args: argparse.Namespace) -> int:
+    cursor = _read_postmerge_cursor()
+    limit = POSTMERGE_RECONCILE_LIMIT if cursor is not None else POSTMERGE_PR_LIMIT
     prs = gh_json(
         [
             "pr",
@@ -2394,16 +2415,15 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
             "--state",
             "merged",
             "--limit",
-            str(POSTMERGE_PR_LIMIT),
+            str(limit),
             "--search",
-            "sort:updated-desc",
+            postmerge_search_query(cursor),
             "--json",
             "number,title,body,headRefName,url,labels,mergedAt",
         ]
     )
     if not isinstance(prs, list):
         prs = []
-    cursor = _read_postmerge_cursor()
     changed = 0
     skipped = 0
     for pr in sorted((item for item in prs if isinstance(item, dict)), key=_postmerge_sort_key):
@@ -2418,7 +2438,14 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         try:
             issue = issue_detail(issue_number)
         except SystemExit:
-            continue
+            # Merge order is ascending: stop here so a later success cannot
+            # move the cursor past this PR. Everything before it has already
+            # advanced; the next run retries from this PR.
+            print(
+                f"postmerge: 无法读取 issue #{issue_number}（PR #{pr['number']}），"
+                "停止推进游标，下一轮重试"
+            )
+            break
         labels = labels_of(issue)
         done = "status:done" in labels
         if done:

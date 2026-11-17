@@ -1630,12 +1630,17 @@ class PostmergeCursorTests(IsolatedStateTestCase):
         issue_labels: tuple[str, ...] = ("status:done",),
         dry_run: bool = False,
         gh_error: bool = False,
+        fail_numbers: set[int] | None = None,
+        list_side_effect=None,
     ):
         if cursor is not None:
             dispatcher._write_postmerge_cursor(cursor[0], cursor[1])
         labels = set(issue_labels)
+        failing = set(fail_numbers or ())
 
         def fake_detail(number):
+            if number in failing:
+                raise SystemExit(f"issue #{number} failed")
             return {"number": number, "labels": [{"name": name} for name in labels]}
 
         calls = []
@@ -1646,9 +1651,10 @@ class PostmergeCursorTests(IsolatedStateTestCase):
                 raise SystemExit("gh failed")
             return subprocess.CompletedProcess(args, 0, "", "")
 
+        list_handler = list_side_effect or (lambda _args: prs)
         with tempfile.TemporaryDirectory() as tmp:
             with (
-                mock.patch.object(dispatcher, "gh_json", return_value=prs) as gh_json,
+                mock.patch.object(dispatcher, "gh_json", side_effect=list_handler) as gh_json,
                 mock.patch.object(dispatcher, "issue_detail", side_effect=fake_detail) as detail,
                 mock.patch.object(dispatcher, "issue_comment_bodies", return_value=[]) as comments,
                 mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
@@ -1669,7 +1675,7 @@ class PostmergeCursorTests(IsolatedStateTestCase):
         args = gh_json.call_args.args[0]
         self.assertEqual(args[:4], ["pr", "list", "--state", "merged"])
         self.assertEqual(args[args.index("--limit") + 1], str(dispatcher.POSTMERGE_PR_LIMIT))
-        self.assertIn("sort:updated-desc", args)
+        self.assertEqual(args[args.index("--search") + 1], "sort:updated-desc")
         fields = args[args.index("--json") + 1]
         self.assertIn("mergedAt", fields)
 
@@ -1724,6 +1730,84 @@ class PostmergeCursorTests(IsolatedStateTestCase):
         self.assertEqual(
             self._cursor(),
             {"lastMergedAt": "2026-01-05T00:00:00Z", "lastPr": 105},
+        )
+
+    def test_issue_detail_failure_stops_before_failed_pr_and_retries_next_run(self):
+        older = self._pr(701, "2026-04-01T00:00:00Z", issue=700)
+        newer = self._pr(702, "2026-04-02T00:00:00Z", issue=701)
+        seed = {"lastMergedAt": "2026-03-31T00:00:00Z", "lastPr": 699}
+        code, _, detail, _, _ = self._postmerge(
+            [older, newer],
+            cursor=(seed["lastMergedAt"], seed["lastPr"]),
+            fail_numbers={700},
+        )
+        self.assertEqual(code, 0)
+        # The newer PR must not be processed after the older one failed.
+        self.assertEqual([call.args[0] for call in detail.call_args_list], [700])
+        self.assertEqual(self._cursor(), seed)
+
+        # The failed PR is still at the window boundary, so the next run
+        # retries it and only then catches up with the newer PR.
+        code, _, retry_detail, _, _ = self._postmerge([older, newer])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call.args[0] for call in retry_detail.call_args_list], [700, 701]
+        )
+        self.assertEqual(
+            self._cursor(),
+            {"lastMergedAt": "2026-04-02T00:00:00Z", "lastPr": 702},
+        )
+
+    def test_successful_prs_before_failure_still_advance_cursor(self):
+        first = self._pr(801, "2026-05-01T00:00:00Z", issue=800)
+        failed = self._pr(802, "2026-05-02T00:00:00Z", issue=801)
+        newest = self._pr(803, "2026-05-03T00:00:00Z", issue=802)
+        code, _, detail, _, _ = self._postmerge(
+            [first, failed, newest],
+            cursor=("2026-04-30T00:00:00Z", 799),
+            fail_numbers={801},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0] for call in detail.call_args_list], [800, 801])
+        # first succeeded, then the cursor stopped exactly before the failure;
+        # the newest PR was not processed and will be retried next run.
+        self.assertEqual(
+            self._cursor(),
+            {"lastMergedAt": "2026-05-01T00:00:00Z", "lastPr": 801},
+        )
+
+    def test_cursor_window_is_merge_date_bounded(self):
+        new_pr = self._pr(902, "2026-06-02T00:00:00Z", issue=901)
+        stale = [
+            self._pr(number, "2026-05-01T00:00:00Z", issue=number - 1)
+            for number in range(890, 900)
+        ]
+
+        def by_query(args):
+            search = args[args.index("--search") + 1]
+            # Simulate the GitHub search filter: without merged:>=, a burst of
+            # pre-cursor updates fills the window and hides the fresh merge.
+            return [new_pr] if "merged:>=2026-06-01" in search else stale
+
+        code, _, detail, gh_json, _ = self._postmerge(
+            [],
+            cursor=("2026-06-01T00:00:00Z", 900),
+            list_side_effect=by_query,
+        )
+        self.assertEqual(code, 0)
+        detail.assert_called_once_with(901)
+        self.assertEqual(
+            self._cursor(),
+            {"lastMergedAt": "2026-06-02T00:00:00Z", "lastPr": 902},
+        )
+        args = gh_json.call_args.args[0]
+        self.assertEqual(
+            args[args.index("--limit") + 1],
+            str(dispatcher.POSTMERGE_RECONCILE_LIMIT),
+        )
+        self.assertEqual(
+            args[args.index("--search") + 1],
+            "merged:>=2026-06-01 sort:updated-desc",
         )
 
     def test_missing_cursor_falls_back_to_recent_window_and_seeds_cursor(self):
