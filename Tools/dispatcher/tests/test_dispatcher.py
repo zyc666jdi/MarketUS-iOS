@@ -649,6 +649,50 @@ P2_REVIEW = """
 """
 
 
+def structured_json(payload: dict) -> str:
+    return "```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```\n"
+
+
+def structured_finding(severity: str = "P1", **overrides) -> dict:
+    finding = {
+        "severity": severity,
+        "file": "Tools/dispatcher/dispatcher.py",
+        "line": 10,
+        "category": "correctness",
+        "title": f"{severity} blocker",
+        "evidence": "test evidence",
+        "impact": "regression",
+        "suggestion": "fix it",
+        "confidence": 0.9,
+    }
+    finding.update(overrides)
+    return finding
+
+
+STRUCTURED_APPROVE = {
+    "status": "pass",
+    "risk": "low",
+    "findings": [],
+    "checks": {"tests": "passed", "lint": "passed", "ci": "passed"},
+}
+
+STRUCTURED_P1 = {
+    "status": "blocked",
+    "risk": "high",
+    "findings": [structured_finding("P1")],
+    "checks": {"tests": "passed", "lint": "passed", "ci": "passed"},
+}
+
+STRUCTURED_P2 = {
+    "status": "needs_attention",
+    "risk": "medium",
+    "findings": [structured_finding("P2", title="P2 suggestion")],
+    "checks": {"tests": "passed", "lint": "passed", "ci": "passed"},
+}
+
+STRUCTURED_INVALID_JSON = "```json\n{not valid json}\n```\n"
+
+
 class ReviewLabelTransitionTests(IsolatedStateTestCase):
     """Review exits must leave exactly one status label and honor P1 policy."""
 
@@ -1100,6 +1144,147 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(final, {"status:awaiting-human"})
 
+    def test_structured_json_approve_overrides_markdown_request_changes(self):
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "REQUEST_CHANGES",
+            structured_json(STRUCTURED_APPROVE),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+
+    def test_structured_json_p1_finding_marks_blocked(self):
+        comment_bodies: list[str] = []
+        code, final, pr_edits = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            structured_json(STRUCTURED_P1),
+            comment_bodies=comment_bodies,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        self.assertEqual(pr_edits, [])
+        self.assertTrue(
+            any("verdict=REQUEST_CHANGES p1=1" in body for body in comment_bodies)
+        )
+        self.assertTrue(any("P1 blocker" in body for body in comment_bodies))
+
+    def test_invalid_structured_json_falls_back_to_markdown(self):
+        with mock.patch.object(
+            dispatcher, "write_structured_review_result"
+        ) as write_result:
+            code, final, _ = self._review(
+                {"status:in-progress"},
+                "REQUEST_CHANGES",
+                STRUCTURED_INVALID_JSON + P1_REVIEW,
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+        write_result.assert_not_called()
+
+    def test_structured_result_json_is_written_into_bundle_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "review-38-abc123"
+            bundle.mkdir()
+            (bundle / "meta.json").write_text('{"pr": 38}\n', encoding="utf-8")
+            capture: dict = {}
+            code, final, _ = self._review(
+                {"status:in-progress"},
+                "APPROVE",
+                structured_json(STRUCTURED_APPROVE),
+                bundle=bundle,
+                capture=capture,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(final, {"status:awaiting-human"})
+            result_path = bundle / "result.json"
+            self.assertTrue(result_path.is_file())
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["verdict"], "APPROVE")
+            self.assertEqual(result["risk"], "low")
+            self.assertEqual(result["findings"], [])
+            self.assertEqual(result["checks"]["tests"], "passed")
+            capture["cleanup"].assert_called_once_with(bundle)
+
+    def test_structured_json_p2_only_is_non_blocking(self):
+        code, final, pr_edits = self._review(
+            {"status:in-progress"},
+            "REQUEST_CHANGES",
+            structured_json(STRUCTURED_P2),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        self.assertEqual(len(pr_edits), 1)
+        self.assertIn("merge:requested", pr_edits[0])
+
+    def test_structured_error_status_without_findings_blocks(self):
+        payload = {**STRUCTURED_APPROVE, "status": "error"}
+        code, final, pr_edits = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            structured_json(payload),
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        self.assertEqual(pr_edits, [])
+
+    def test_structured_blocked_status_without_findings_blocks(self):
+        payload = {**STRUCTURED_APPROVE, "status": "blocked"}
+        code, final, pr_edits = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            structured_json(payload),
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        self.assertEqual(pr_edits, [])
+
+    def test_structured_needs_attention_without_findings_blocks(self):
+        payload = {**STRUCTURED_APPROVE, "status": "needs_attention"}
+        code, final, pr_edits = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            structured_json(payload),
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        self.assertEqual(pr_edits, [])
+
+    def test_quoted_pass_json_does_not_override_final_markdown_blockers(self):
+        review_body = (
+            structured_json(STRUCTURED_APPROVE)
+            + "\n## Verdict: REQUEST_CHANGES\n"
+            + P1_REVIEW
+        )
+        with mock.patch.object(
+            dispatcher, "write_structured_review_result"
+        ) as write_result:
+            code, final, pr_edits = self._review(
+                {"status:in-progress"},
+                "REQUEST_CHANGES",
+                review_body,
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+        self.assertEqual(pr_edits, [])
+        write_result.assert_not_called()
+
+    def test_incomplete_structured_json_falls_back_to_markdown(self):
+        payload = {**STRUCTURED_APPROVE}
+        del payload["risk"]
+        with mock.patch.object(
+            dispatcher, "write_structured_review_result"
+        ) as write_result:
+            code, final, _ = self._review(
+                {"status:in-progress"},
+                "REQUEST_CHANGES",
+                structured_json(payload) + P1_REVIEW,
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+        write_result.assert_not_called()
+
 
 class P1BlockingPolicyTests(unittest.TestCase):
     def test_p1_section_is_the_only_blocking_section(self):
@@ -1136,6 +1321,225 @@ class P1BlockingPolicyTests(unittest.TestCase):
         self.assertEqual(dispatcher.p1_request_changes_rounds(pr), 1)
 
 
+class StructuredReviewParserTests(unittest.TestCase):
+    """The final fenced JSON contract is authoritative over markdown."""
+
+    def test_valid_approve_payload_returns_approve(self):
+        review = dispatcher.parse_structured_review(
+            structured_json(STRUCTURED_APPROVE)
+        )
+        self.assertIsNotNone(review)
+        self.assertEqual(review["status"], "pass")
+        self.assertEqual(review["verdict"], "APPROVE")
+        self.assertEqual(review["blockers"], [])
+
+    def test_p1_finding_returns_request_changes_and_blocker(self):
+        review = dispatcher.parse_structured_review(structured_json(STRUCTURED_P1))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+        self.assertEqual(
+            review["blockers"],
+            ["`Tools/dispatcher/dispatcher.py:10` — P1 blocker"],
+        )
+
+    def test_p0_finding_returns_request_changes(self):
+        payload = {
+            **STRUCTURED_P1,
+            "findings": [structured_finding("P0", title="P0 blocker")],
+        }
+        review = dispatcher.parse_structured_review(structured_json(payload))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+        self.assertEqual(
+            review["blockers"],
+            ["`Tools/dispatcher/dispatcher.py:10` — P0 blocker"],
+        )
+
+    def test_needs_attention_with_p1_returns_request_changes(self):
+        payload = {**STRUCTURED_P1, "status": "needs_attention"}
+        review = dispatcher.parse_structured_review(structured_json(payload))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+
+    def test_p2_only_has_no_blockers(self):
+        review = dispatcher.parse_structured_review(structured_json(STRUCTURED_P2))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["status"], "needs_attention")
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+        self.assertEqual(review["blockers"], [])
+        self.assertFalse(review["blocked"])
+
+    def test_error_status_without_findings_returns_request_changes(self):
+        payload = {**STRUCTURED_APPROVE, "status": "error"}
+        review = dispatcher.parse_structured_review(structured_json(payload))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+        self.assertEqual(review["blockers"], [])
+        self.assertTrue(review["blocked"])
+
+    def test_blocked_status_without_findings_returns_request_changes(self):
+        payload = {**STRUCTURED_APPROVE, "status": "blocked"}
+        review = dispatcher.parse_structured_review(structured_json(payload))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+        self.assertEqual(review["blockers"], [])
+        self.assertTrue(review["blocked"])
+
+    def test_needs_attention_without_findings_returns_request_changes(self):
+        payload = {**STRUCTURED_APPROVE, "status": "needs_attention"}
+        review = dispatcher.parse_structured_review(structured_json(payload))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+        self.assertEqual(review["blockers"], [])
+
+    def test_pass_status_with_p1_still_requests_changes(self):
+        payload = {
+            **STRUCTURED_APPROVE,
+            "findings": [structured_finding("P1")],
+        }
+        review = dispatcher.parse_structured_review(structured_json(payload))
+        self.assertIsNotNone(review)
+        self.assertEqual(review["verdict"], "REQUEST_CHANGES")
+
+    def test_confidence_and_full_finding_fields_are_accepted(self):
+        payload = {
+            **STRUCTURED_P2,
+            "findings": [
+                structured_finding("P2", confidence=0.42, category="testing")
+            ],
+        }
+        review = dispatcher.parse_structured_review(structured_json(payload))
+        self.assertIsNotNone(review)
+        finding = review["findings"][0]
+        self.assertEqual(finding["severity"], "P2")
+        self.assertEqual(finding["confidence"], 0.42)
+        self.assertEqual(finding["category"], "testing")
+        self.assertEqual(finding["file"], "Tools/dispatcher/dispatcher.py")
+        self.assertEqual(finding["line"], 10)
+        self.assertEqual(finding["title"], "P2 blocker")
+        self.assertEqual(finding["evidence"], "test evidence")
+        self.assertEqual(finding["impact"], "regression")
+        self.assertEqual(finding["suggestion"], "fix it")
+
+    def test_confidence_boundaries_are_accepted(self):
+        for confidence in (0, 0.5, 1):
+            finding = structured_finding("P2", confidence=confidence)
+            payload = {**STRUCTURED_P2, "findings": [finding]}
+            with self.subTest(confidence=confidence):
+                review = dispatcher.parse_structured_review(
+                    structured_json(payload)
+                )
+                self.assertIsNotNone(review)
+                self.assertEqual(review["findings"][0]["confidence"], confidence)
+
+    def test_invalid_json_returns_none(self):
+        self.assertIsNone(
+            dispatcher.parse_structured_review(STRUCTURED_INVALID_JSON)
+        )
+
+    def test_invalid_severity_returns_none(self):
+        payload = {
+            **STRUCTURED_P1,
+            "findings": [structured_finding("P9")],
+        }
+        self.assertIsNone(dispatcher.parse_structured_review(structured_json(payload)))
+
+    def test_invalid_status_returns_none(self):
+        payload = {**STRUCTURED_APPROVE, "status": "ok"}
+        self.assertIsNone(dispatcher.parse_structured_review(structured_json(payload)))
+
+    def test_missing_risk_returns_none(self):
+        payload = {**STRUCTURED_APPROVE}
+        del payload["risk"]
+        self.assertIsNone(dispatcher.parse_structured_review(structured_json(payload)))
+
+    def test_invalid_risk_returns_none(self):
+        payload = {**STRUCTURED_APPROVE, "risk": "unknown"}
+        self.assertIsNone(dispatcher.parse_structured_review(structured_json(payload)))
+
+    def test_missing_or_incomplete_checks_returns_none(self):
+        missing = {**STRUCTURED_APPROVE}
+        del missing["checks"]
+        cases = (
+            missing,
+            {**STRUCTURED_APPROVE, "checks": None},
+            {**STRUCTURED_APPROVE, "checks": {"tests": "passed", "lint": "passed"}},
+            {
+                **STRUCTURED_APPROVE,
+                "checks": {"tests": "passed", "lint": "passed", "ci": ""},
+            },
+            {
+                **STRUCTURED_APPROVE,
+                "checks": {"tests": "passed", "lint": "passed", "ci": 1},
+            },
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.assertIsNone(
+                    dispatcher.parse_structured_review(structured_json(payload))
+                )
+
+    def test_missing_confidence_returns_none(self):
+        finding = structured_finding("P2")
+        del finding["confidence"]
+        payload = {**STRUCTURED_P2, "findings": [finding]}
+        self.assertIsNone(dispatcher.parse_structured_review(structured_json(payload)))
+
+    def test_confidence_must_be_a_number_in_range(self):
+        for confidence in (-0.1, 1.1, "0.9", True, None):
+            finding = structured_finding("P2", confidence=confidence)
+            payload = {**STRUCTURED_P2, "findings": [finding]}
+            with self.subTest(confidence=confidence):
+                self.assertIsNone(
+                    dispatcher.parse_structured_review(structured_json(payload))
+                )
+
+    def test_missing_finding_text_field_returns_none(self):
+        for name in (
+            "file",
+            "category",
+            "title",
+            "evidence",
+            "impact",
+            "suggestion",
+        ):
+            finding = structured_finding("P2")
+            del finding[name]
+            payload = {**STRUCTURED_P2, "findings": [finding]}
+            with self.subTest(field=name):
+                self.assertIsNone(
+                    dispatcher.parse_structured_review(structured_json(payload))
+                )
+
+    def test_invalid_line_returns_none(self):
+        for line in (0, -1, "10", True, None):
+            finding = structured_finding("P2", line=line)
+            payload = {**STRUCTURED_P2, "findings": [finding]}
+            with self.subTest(line=line):
+                self.assertIsNone(
+                    dispatcher.parse_structured_review(structured_json(payload))
+                )
+
+    def test_json_before_trailing_markdown_is_ignored(self):
+        text = structured_json(STRUCTURED_APPROVE) + "\n## Verdict: REQUEST_CHANGES\n"
+        self.assertIsNone(dispatcher.parse_structured_review(text))
+
+    def test_final_invalid_json_does_not_fall_back_to_earlier_pass(self):
+        invalid = {**STRUCTURED_APPROVE, "risk": "unknown"}
+        text = structured_json(STRUCTURED_APPROVE) + structured_json(invalid)
+        self.assertIsNone(dispatcher.parse_structured_review(text))
+
+    def test_codex_sentinel_after_contract_is_not_authoritative(self):
+        sentinel = {
+            "marketus_review": True,
+            "verdict": "APPROVE",
+            "summary": "ok",
+            "findings": [],
+        }
+        text = structured_json(STRUCTURED_P1) + "\n" + structured_json(sentinel)
+        self.assertIsNone(dispatcher.parse_structured_review(text))
+
+
 class ReviewPolicyTests(unittest.TestCase):
     def test_policy_keeps_scope_safety_and_evidence_rules(self):
         for required in (
@@ -1164,6 +1568,24 @@ class ReviewPolicyTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, dispatcher.CODEX_REVIEW_CONTRACT)
+
+    def test_policy_requires_final_structured_json_contract(self):
+        for required in (
+            "status",
+            "needs_attention",
+            "blocked",
+            "error",
+            "risk",
+            "findings",
+            "severity",
+            "confidence",
+            "checks",
+            "```json",
+            "最后内容",
+            "fallback",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, dispatcher.REVIEW_POLICY)
 
 
 class ReviewBundleTests(unittest.TestCase):
