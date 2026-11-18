@@ -1623,14 +1623,24 @@ def parse_verdict(text: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
-# Structured Reviewer contract. The JSON block is authoritative; the markdown
-# verdict remains the fallback when the block is missing or invalid.
+# Structured Reviewer contract. The final fenced JSON block is authoritative;
+# the markdown verdict remains the fallback when the block is missing/invalid.
 STRUCTURED_REVIEW_STATUSES = frozenset(
     {"pass", "needs_attention", "blocked", "error"}
 )
+STRUCTURED_REVIEW_BLOCKED_STATUSES = frozenset({"blocked", "error"})
 STRUCTURED_REVIEW_SEVERITIES = frozenset({"P0", "P1", "P2", "P3"})
 STRUCTURED_REVIEW_BLOCKING_SEVERITIES = frozenset({"P0", "P1"})
-STRUCTURED_REVIEW_ATTENTION_STATUSES = frozenset({"blocked", "needs_attention"})
+STRUCTURED_REVIEW_RISKS = frozenset({"low", "medium", "high", "critical"})
+STRUCTURED_REVIEW_CHECKS = ("tests", "lint", "ci")
+STRUCTURED_REVIEW_FINDING_TEXT_FIELDS = (
+    "file",
+    "category",
+    "title",
+    "evidence",
+    "impact",
+    "suggestion",
+)
 STRUCTURED_REVIEW_FENCE = re.compile(
     r"```json[ \t]*(?:\r?\n)?(.*?)```", re.DOTALL | re.IGNORECASE
 )
@@ -1650,67 +1660,97 @@ def structured_finding_blocker(finding: Mapping[str, Any]) -> str:
     return title
 
 
-def parse_structured_review(text: str) -> dict[str, Any] | None:
-    """Parse the last valid fenced structured Review JSON block.
+def structured_checks_is_valid(checks: Any) -> bool:
+    """Validate the required ``checks`` object (`tests` / `lint` / `ci`)."""
+    if not isinstance(checks, dict):
+        return False
+    for name in STRUCTURED_REVIEW_CHECKS:
+        value = checks.get(name)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    return True
 
-    The block must contain an allowed ``status`` and a ``findings`` array whose
-    entries all carry an allowed ``severity``. Later/invalid blocks are skipped
-    so a codex sentinel or a quoted example cannot shadow an earlier valid
-    contract. Returns the payload plus derived ``verdict`` and ``blockers``, or
-    ``None`` when no valid block exists.
+
+def structured_finding_is_valid(finding: Any) -> bool:
+    """Validate one finding against the required contract fields and ranges."""
+    if not isinstance(finding, dict):
+        return False
+    severity = finding.get("severity")
+    if not isinstance(severity, str) or severity not in STRUCTURED_REVIEW_SEVERITIES:
+        return False
+    for name in STRUCTURED_REVIEW_FINDING_TEXT_FIELDS:
+        value = finding.get(name)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    line = finding.get("line")
+    if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+        return False
+    confidence = finding.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return False
+    return 0.0 <= float(confidence) <= 1.0
+
+
+def parse_structured_review(text: str) -> dict[str, Any] | None:
+    """Parse the final fenced structured Review JSON block.
+
+    Only the last ``json`` fence is eligible, and nothing but whitespace may
+    follow its closing fence: a quoted or earlier example is never
+    authoritative. The payload must carry an allowed ``status``/``risk``,
+    complete ``checks`` and schema-complete findings. Returns the payload plus
+    derived ``verdict``, ``blockers`` and ``blocked``, or ``None``.
     """
     if not isinstance(text, str):
         return None
-    for match in reversed(list(STRUCTURED_REVIEW_FENCE.finditer(text))):
-        try:
-            payload = json.loads(match.group(1).strip())
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        status = payload.get("status")
-        if not isinstance(status, str) or status not in STRUCTURED_REVIEW_STATUSES:
-            continue
-        raw_findings = payload.get("findings")
-        if not isinstance(raw_findings, list):
-            continue
-        findings: list[dict[str, Any]] = []
-        valid = True
-        for raw in raw_findings:
-            if not isinstance(raw, dict):
-                valid = False
-                break
-            severity = raw.get("severity")
-            if (
-                not isinstance(severity, str)
-                or severity not in STRUCTURED_REVIEW_SEVERITIES
-            ):
-                valid = False
-                break
-            findings.append(dict(raw))
-        if not valid:
-            continue
+    matches = list(STRUCTURED_REVIEW_FENCE.finditer(text))
+    if not matches:
+        return None
+    match = matches[-1]
+    if text[match.end():].strip():
+        return None
+    try:
+        payload = json.loads(match.group(1).strip())
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("status")
+    risk = payload.get("risk")
+    if not isinstance(status, str) or status not in STRUCTURED_REVIEW_STATUSES:
+        return None
+    if not isinstance(risk, str) or risk not in STRUCTURED_REVIEW_RISKS:
+        return None
+    if not structured_checks_is_valid(payload.get("checks")):
+        return None
+    raw_findings = payload.get("findings")
+    if not isinstance(raw_findings, list):
+        return None
+    findings = [dict(raw) for raw in raw_findings if isinstance(raw, dict)]
+    if len(findings) != len(raw_findings) or not all(
+        structured_finding_is_valid(finding) for finding in findings
+    ):
+        return None
 
-        blockers = [
-            structured_finding_blocker(finding)
-            for finding in findings
-            if finding["severity"] in STRUCTURED_REVIEW_BLOCKING_SEVERITIES
-        ]
-        has_p1 = any(finding["severity"] == "P1" for finding in findings)
-        if blockers or (
-            status in STRUCTURED_REVIEW_ATTENTION_STATUSES and has_p1
-        ):
-            verdict = "REQUEST_CHANGES"
-        else:
-            verdict = "APPROVE"
-        return {
-            **payload,
-            "status": status,
-            "findings": findings,
-            "verdict": verdict,
-            "blockers": blockers,
-        }
-    return None
+    blockers = [
+        structured_finding_blocker(finding)
+        for finding in findings
+        if finding["severity"] in STRUCTURED_REVIEW_BLOCKING_SEVERITIES
+    ]
+    # Only a clean pass may approve; blocked/error/needs_attention never do.
+    verdict = (
+        "APPROVE"
+        if status == "pass" and not blockers
+        else "REQUEST_CHANGES"
+    )
+    return {
+        **payload,
+        "status": status,
+        "risk": risk,
+        "findings": findings,
+        "verdict": verdict,
+        "blockers": blockers,
+        "blocked": status in STRUCTURED_REVIEW_BLOCKED_STATUSES,
+    }
 
 
 P1_MARKER = re.compile(r"\bP1\b", re.IGNORECASE)
@@ -2229,9 +2269,11 @@ P2/P3（不得单独 REQUEST_CHANGES）：测试覆盖、PR 描述、文档、�
 ```
 
 - `status` 只能是 `pass` | `needs_attention` | `blocked` | `error`。
-- `findings` 必须是数组；每项 `severity` 只能是 `P0` | `P1` | `P2` | `P3`，无发现写 `[]`。
+- `risk` 只能是 `low` | `medium` | `high` | `critical`；`checks` 必须包含 `tests` / `lint` / `ci`。
+- `findings` 必须是数组；每项字段必填，`severity` 只能是 `P0` | `P1` | `P2` | `P3`，`confidence` 必须是 0–1 的数字；无发现写 `[]`。
+- 只有 `status=pass` 且无 P0/P1 才能 APPROVE；`error` / `blocked` 一律 REQUEST_CHANGES 并阻断；`needs_attention` 不得 APPROVE。
 - P0/P1 finding 是 blocker；P2/P3 不得单独阻断。
-- 该 JSON 块必须是全文最后内容，之后不得再输出任何文本或 JSON。
+- 该 JSON 块必须是全文最后内容，之后不得再输出任何文本或 JSON；不完整的 JSON 视为无效并回退 markdown。
 - 上面的 markdown `## Verdict` 仍必须保留，作为 JSON 缺失或无效时的 fallback。
 """
 
@@ -3274,12 +3316,35 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
         )
 
     p1_flag = 1 if blockers else 0
+    structured_status = (
+        structured_review["status"] if structured_review is not None else None
+    )
+    structured_blocked = bool(
+        structured_review is not None
+        and (
+            structured_review["blocked"]
+            or (
+                structured_status == "needs_attention"
+                and not structured_review["findings"]
+            )
+        )
+    )
     body = (
         f"{text}\n\n---\n\n{test_evidence}\n\n"
         f"<!-- {marker} verdict={verdict} p1={p1_flag} -->\n"
         f"评审日志：`.agent/runs/review-{args.pr}/`\n"
     )
     comment_pr(args.pr, body)
+
+    if structured_blocked:
+        # blocked/error (and an empty needs_attention) must never reach the
+        # advisory merge path, even when findings carry no P1 blocker.
+        set_status(issue_number, "status:blocked")
+        print(
+            f"⛔ 结构化评审 status={structured_status} — "
+            "无 P1 也不得按 APPROVE 处理，已标记 blocked"
+        )
+        return 1
 
     if verdict == "APPROVE":
         gh(["pr", "edit", str(args.pr), "--add-label", "merge:requested"])
