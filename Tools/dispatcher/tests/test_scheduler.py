@@ -41,8 +41,8 @@ def make_issue(number, status=None, *, extra_labels=(), state="OPEN"):
     }
 
 
-def make_pr(number, ticket=None, *, base_sha="base", state="OPEN", draft=False,
-            branch=None, body=None):
+def make_pr(number, ticket=None, *, base_sha="base", head_sha=None, state="OPEN",
+            draft=False, branch=None, body=None):
     if branch is None:
         branch = f"ai/{ticket}-test" if ticket is not None else f"ai/{number}-test"
     if body is None:
@@ -52,7 +52,7 @@ def make_pr(number, ticket=None, *, base_sha="base", state="OPEN", draft=False,
         "title": f"pr {number}",
         "body": body,
         "headRefName": branch,
-        "headRefOid": f"head{number}",
+        "headRefOid": head_sha or f"head{number}",
         "baseRefOid": base_sha,
         "state": state,
         "isDraft": draft,
@@ -70,6 +70,7 @@ class PlanJobTests(unittest.TestCase):
         self.assertEqual(job.ticket, 11)
         self.assertIsNone(job.pr)
         self.assertEqual(job.base_sha, "")
+        self.assertEqual(job.head_sha, "")
         self.assertEqual(job.prompt_hash, PROMPT_HASHES["implementer"])
         self.assertEqual(job.source_status, "status:ready")
         self.assertEqual(
@@ -90,11 +91,12 @@ class PlanJobTests(unittest.TestCase):
         self.assertEqual(job.role, "reviewer")
         self.assertEqual(job.pr, 120)
         self.assertEqual(job.base_sha, "base-12")
+        self.assertEqual(job.head_sha, "head120")
         self.assertEqual(job.prompt_hash, PROMPT_HASHES["reviewer"])
         self.assertEqual(
             job.job_id,
             job_store.derive_job_id(
-                "reviewer", 12, 120, "base-12", PROMPT_HASHES["reviewer"]
+                "reviewer", 12, 120, "head120", PROMPT_HASHES["reviewer"]
             ),
         )
 
@@ -109,11 +111,12 @@ class PlanJobTests(unittest.TestCase):
         self.assertEqual(job.role, "repair")
         self.assertEqual(job.pr, 130)
         self.assertEqual(job.base_sha, "base-13")
+        self.assertEqual(job.head_sha, "head130")
         self.assertEqual(job.prompt_hash, PROMPT_HASHES["implementer"])
         self.assertEqual(
             job.job_id,
             job_store.derive_job_id(
-                "repair", 13, 130, "base-13", PROMPT_HASHES["implementer"]
+                "repair", 13, 130, "head130", PROMPT_HASHES["implementer"]
             ),
         )
 
@@ -191,6 +194,23 @@ class PlanJobTests(unittest.TestCase):
         )[0]
         self.assertNotEqual(first.job_id, second.job_id)
 
+    def test_head_ref_oid_is_consumed_even_without_base_ref_oid(self):
+        pr = make_pr(290, 29, head_sha="head-only")
+        del pr["baseRefOid"]
+        job = scheduler.plan_jobs(
+            [make_issue(29, "status:in-review")],
+            [pr],
+            prompt_hashes=PROMPT_HASHES,
+        )[0]
+        self.assertEqual(job.base_sha, "")
+        self.assertEqual(job.head_sha, "head-only")
+        self.assertEqual(
+            job.job_id,
+            job_store.derive_job_id(
+                "reviewer", 29, 290, "head-only", PROMPT_HASHES["reviewer"]
+            ),
+        )
+
 
 class ShadowTickTests(unittest.TestCase):
     def setUp(self):
@@ -227,10 +247,16 @@ class ShadowTickTests(unittest.TestCase):
         self.assertEqual(set(rows), {31, 32, 33})
         self.assertEqual(rows[31]["role"], "implementer")
         self.assertIsNone(rows[31]["pr"])
+        self.assertEqual(rows[31]["base_sha"], "")
+        self.assertEqual(rows[31]["head_sha"], "")
         self.assertEqual(rows[32]["role"], "reviewer")
         self.assertEqual(rows[32]["pr"], 320)
+        self.assertEqual(rows[32]["base_sha"], "base-32")
+        self.assertEqual(rows[32]["head_sha"], "head320")
         self.assertEqual(rows[33]["role"], "repair")
         self.assertEqual(rows[33]["pr"], 330)
+        self.assertEqual(rows[33]["base_sha"], "base-33")
+        self.assertEqual(rows[33]["head_sha"], "head330")
         for row in rows.values():
             self.assertEqual(row["state"], "queued")
             self.assertEqual(row["attempt"], 0)
@@ -260,6 +286,78 @@ class ShadowTickTests(unittest.TestCase):
         self.assertEqual(second["diff"]["created"], [])
         self.assertEqual(len(second["diff"]["unchanged"]), 3)
         self.assertEqual(rows_after_first, rows_after_second)
+
+    def test_head_change_with_same_base_creates_a_second_job(self):
+        issue = make_issue(43, "status:in-review")
+        first_pr = make_pr(430, 43, base_sha="base-430", head_sha="head-a")
+        second_pr = make_pr(430, 43, base_sha="base-430", head_sha="head-b")
+
+        first_job = scheduler.plan_jobs(
+            [issue], [first_pr], prompt_hashes=PROMPT_HASHES
+        )[0]
+        second_job = scheduler.plan_jobs(
+            [issue], [second_pr], prompt_hashes=PROMPT_HASHES
+        )[0]
+        self.assertNotEqual(first_job.job_id, second_job.job_id)
+
+        first_tick = scheduler.shadow_tick(
+            self.store, [issue], [first_pr], prompt_hashes=PROMPT_HASHES
+        )
+        second_tick = scheduler.shadow_tick(
+            self.store, [issue], [second_pr], prompt_hashes=PROMPT_HASHES
+        )
+        rows = self.store.list_jobs()
+
+        self.assertEqual(first_tick["created"], 1)
+        self.assertEqual(second_tick["created"], 1)
+        self.assertEqual(second_tick["skipped"], 0)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["head_sha"] for row in rows}, {"head-a", "head-b"})
+        self.assertEqual({row["base_sha"] for row in rows}, {"base-430"})
+
+    def test_same_head_twice_keeps_one_job(self):
+        issue = make_issue(44, "status:in-review")
+        pr = make_pr(440, 44, base_sha="base-440", head_sha="head-same")
+        first = scheduler.shadow_tick(
+            self.store, [issue], [pr], prompt_hashes=PROMPT_HASHES
+        )
+        second = scheduler.shadow_tick(
+            self.store, [issue], [pr], prompt_hashes=PROMPT_HASHES
+        )
+        rows = self.store.list_jobs()
+        self.assertEqual(first["created"], 1)
+        self.assertEqual(second["created"], 0)
+        self.assertEqual(second["skipped"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["head_sha"], "head-same")
+
+    def test_base_change_with_same_head_creates_no_new_job(self):
+        issue = make_issue(45, "status:in-review")
+        first_pr = make_pr(450, 45, base_sha="base-old", head_sha="head-stable")
+        second_pr = make_pr(450, 45, base_sha="base-new", head_sha="head-stable")
+
+        first_job = scheduler.plan_jobs(
+            [issue], [first_pr], prompt_hashes=PROMPT_HASHES
+        )[0]
+        second_job = scheduler.plan_jobs(
+            [issue], [second_pr], prompt_hashes=PROMPT_HASHES
+        )[0]
+        self.assertEqual(first_job.job_id, second_job.job_id)
+
+        first_tick = scheduler.shadow_tick(
+            self.store, [issue], [first_pr], prompt_hashes=PROMPT_HASHES
+        )
+        second_tick = scheduler.shadow_tick(
+            self.store, [issue], [second_pr], prompt_hashes=PROMPT_HASHES
+        )
+        rows = self.store.list_jobs()
+
+        self.assertEqual(first_tick["created"], 1)
+        self.assertEqual(second_tick["created"], 0)
+        self.assertEqual(second_tick["skipped"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["head_sha"], "head-stable")
+        self.assertEqual(rows[0]["base_sha"], "base-old")
 
     def test_missing_pr_is_reported_without_enqueueing(self):
         issues = [
@@ -332,6 +430,7 @@ class ShadowTickTests(unittest.TestCase):
             desired.ticket,
             desired.pr,
             desired.base_sha,
+            head_sha=desired.head_sha,
             prompt_hash=desired.prompt_hash,
             job_id=desired.job_id,
         )

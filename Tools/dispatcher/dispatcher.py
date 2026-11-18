@@ -4928,6 +4928,7 @@ def _print_scheduler_shadow(result: dict[str, Any]) -> None:
             print(
                 f"  {job['job_id']}  {job['role']:<11} ticket={job['ticket']} "
                 f"pr={pr} base_sha={job['base_sha'] or '-'} "
+                f"head_sha={job['head_sha'] or '-'} "
                 f"prompt_hash={job['prompt_hash'] or '-'}"
             )
     else:

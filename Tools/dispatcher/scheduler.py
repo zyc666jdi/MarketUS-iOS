@@ -13,8 +13,9 @@ Job ids come from :func:`jobs.derive_job_id` and are stable by construction:
   the moving ``origin/main`` SHA at plan time would mint a new job on every
   upstream commit and break "repeated ticks do not duplicate work".
 * ``status:in-review`` yields a ``reviewer`` job and ``status:in-progress``
-  yields a ``repair`` job.  Both bind the linked PR number and the PR's
-  ``baseRefOid`` (the base SHA is immutable for a given review target).
+  yields a ``repair`` job.  Both bind the linked PR number and ``headRefOid``:
+  a new head is new work, while a base retarget alone is not.  ``baseRefOid``
+  is stored as row metadata; the store's fourth identity slot receives the head.
 * The prompt hash binds the role prompt file content.  Editing a prompt
   deliberately creates a new job identity so an old row cannot silently run
   with a stale prompt.
@@ -80,6 +81,7 @@ class DesiredJob:
     ticket: int
     pr: int | None
     base_sha: str
+    head_sha: str
     prompt_hash: str
     source_status: str
 
@@ -90,6 +92,7 @@ class DesiredJob:
             "ticket": self.ticket,
             "pr": self.pr,
             "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
             "prompt_hash": self.prompt_hash,
             "source_status": self.source_status,
         }
@@ -146,11 +149,23 @@ def _pr_ticket(pr: Mapping[str, Any]) -> int | None:
     return None
 
 
-def _pr_base_sha(pr: Mapping[str, Any] | None) -> str:
+def _pr_sha(pr: Mapping[str, Any] | None, key: str, fallback: str) -> str:
     if not pr:
         return ""
-    value = pr.get("baseRefOid") or pr.get("base_sha") or ""
-    return str(value).strip()
+    return str(pr.get(key) or pr.get(fallback) or "").strip()
+
+
+def _pr_base_sha(pr: Mapping[str, Any] | None) -> str:
+    return _pr_sha(pr, "baseRefOid", "base_sha")
+
+
+def _pr_head_sha(pr: Mapping[str, Any] | None) -> str:
+    return _pr_sha(pr, "headRefOid", "head_sha")
+
+
+def _identity_sha(role: str, head_sha: str) -> str:
+    """Commit bound into the job id: head for reviewer/repair, empty otherwise."""
+    return "" if role == "implementer" else head_sha
 
 
 def _prs_by_ticket(prs: Iterable[Mapping[str, Any]]) -> dict[int, Mapping[str, Any]]:
@@ -219,16 +234,15 @@ def _planned(
                 missing_pr.append({"ticket": ticket, "status": status})
                 continue
         base_sha = "" if role == "implementer" else _pr_base_sha(pr)
+        head_sha = "" if role == "implementer" else _pr_head_sha(pr)
         prompt_hash = hashes.get(role, "")
+        identity = _identity_sha(role, head_sha)
         planned.append(
             DesiredJob(
-                job_id=derive_job_id(role, ticket, pr_number, base_sha, prompt_hash),
-                role=role,
-                ticket=ticket,
-                pr=pr_number,
-                base_sha=base_sha,
-                prompt_hash=prompt_hash,
-                source_status=status,
+                job_id=derive_job_id(role, ticket, pr_number, identity, prompt_hash),
+                role=role, ticket=ticket, pr=pr_number,
+                base_sha=base_sha, head_sha=head_sha,
+                prompt_hash=prompt_hash, source_status=status,
             )
         )
 
@@ -300,6 +314,7 @@ def shadow_tick(
                 job.ticket,
                 job.pr,
                 job.base_sha,
+                head_sha=job.head_sha,
                 prompt_hash=job.prompt_hash,
                 job_id=job.job_id,
             )
@@ -355,9 +370,7 @@ def _gh_json(args: list[str]) -> Any:
     except OSError as error:
         raise SchedulerError(f"无法执行 gh：{error}") from error
     if result.returncode != 0:
-        raise SchedulerError(
-            f"gh {' '.join(args)} failed: {result.stderr.strip()}"
-        )
+        raise SchedulerError(f"gh {' '.join(args)} failed: {result.stderr.strip()}")
     try:
         return json.loads(result.stdout or "[]")
     except json.JSONDecodeError as error:
@@ -379,17 +392,3 @@ def read_issues() -> list[dict[str, Any]]:
 def read_prs() -> list[dict[str, Any]]:
     """Read open PRs through ``gh pr list`` (read-only)."""
     return _read_list("pr", GH_PR_FIELDS, GH_PR_LIMIT)
-
-
-__all__ = [
-    "ACTIVE_JOB_STATES",
-    "DesiredJob",
-    "PROMPT_PATHS",
-    "ROLE_ORDER",
-    "STATUS_ROLES",
-    "SchedulerError",
-    "plan_jobs",
-    "read_issues",
-    "read_prs",
-    "shadow_tick",
-]
