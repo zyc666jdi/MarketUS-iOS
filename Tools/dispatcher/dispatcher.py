@@ -29,7 +29,7 @@ import time
 import uuid
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple, TextIO
 
 DISPATCHER_ROOT = Path(__file__).resolve().parent
@@ -91,6 +91,7 @@ ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url,state"
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
 RUN_ROOT = Path(".agent/runs")
+REVIEWS_ROOT = Path(".agent/reviews")
 JOB_ROOT = Path(".agent/jobs")
 JOBS_DB_PATH = JOBS_DB
 STATE_ROOT = Path(".agent/state")
@@ -1715,11 +1716,17 @@ def run_review_agent(
     ticket: int | None = None,
     pr: int | None = None,
     worktree: str | None = None,
+    cwd: str | Path | None = None,
+    env_overrides: dict[str, str] | None = None,
     details: dict[str, Any] | None = None,
 ) -> RunnerResult:
     """Run one role through its configured runner.
 
-    The return value is iterable as ``(text, returncode)`` for existing callers.
+    ``cwd`` changes the child's working directory (the reviewer runs inside the
+    Review Bundle). ``env_overrides`` are merged into the allowlisted runner
+    environment; the reviewer uses it to cap Git discovery at the bundle
+    boundary. The return value is iterable as ``(text, returncode)`` for
+    existing callers.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1770,16 +1777,17 @@ def run_review_agent(
     env = build_runner_env(
         agent_registry().defaults["env_allowlist"],
         os.environ,
-        overrides={"AGENT_RUN_ID": run_dir.name},
+        overrides={"AGENT_RUN_ID": run_dir.name, **(env_overrides or {})},
     )
     if command and command[0] == "dsh" and resolved.sandbox == "read-only":
         env["DSH_PERMISSION_MODE"] = "read-only"
     runner_prompt = resolved.runner.render_prompt(job_input)
+    run_cwd = str(cwd) if cwd is not None else os.getcwd()
 
     started = time.monotonic()
     try:
         returncode, stdout = run_agent_streaming(
-            command, runner_prompt, os.getcwd(), env, timeout_minutes * 60, run_dir,
+            command, runner_prompt, run_cwd, env, timeout_minutes * 60, run_dir,
             role=role, details=details, stdout_path=stdout_path,
         )
     except subprocess.TimeoutExpired:
@@ -2126,6 +2134,416 @@ CODEX_REVIEW_CONTRACT = """
 """
 
 
+REVIEW_BUNDLE_VERSION = 1
+REVIEW_BUNDLE_DIFF_HEADER = "diff --git "
+CODE_REVIEW_SUMMARY = """## docs/code-review.md 摘要
+
+- 两层门禁：自动门禁（lint/build/test/secret-scan）必须全绿；独立评审只读、无实现者上下文。
+- 评分维度：正确性 40%、测试有效性 20%、架构一致性 15%、安全与隐私 10%、可维护性 10%、UX/无障碍 5%。
+- P0：安全漏洞、数据丢失、密钥泄漏、越权、主路径崩溃 → 立即阻断并通知安全 owner。
+- P1：验收标准未满足、逻辑错误、缺少必要测试、并发缺陷 → 阻断，必须修复。
+- P2：可维护性、架构越层、性能隐患 → 建议修复或转 ticket。
+- P3：命名、注释、可选优化 → 不阻断。
+- APPROVE 前提：P0/P1 为 0，且 P2 已修复或已建后续 ticket。
+- Verdict 固定格式：`## Verdict` / `## Blockers (P1)` / `## Major (P2)` / `## Nits (P3)`。
+- 单次评审 diff ≤ 2000 行；超过则要求拆分。风格问题交给 linter，评审不讨论。
+"""
+
+_SECRET_PATTERNS = (
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
+        r"-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+    re.compile(r"(?i)\b(authorization\s*:\s*(?:bearer|token)\s+)[^\s,;]+"),
+    re.compile(
+        r"(?i)\b((?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*)"
+        r"(['\"]?)[^\s'\",;]{6,}\2"
+    ),
+)
+
+
+class ReviewBundleError(RuntimeError):
+    """A Review Bundle could not be created or verified."""
+
+
+def review_bundle_path(pr: int, head_sha: str) -> Path:
+    """Return the deterministic bundle directory for a PR head."""
+    return REVIEWS_ROOT / f"review-{pr}-{head_sha[:8]}"
+
+
+def review_bundle_env(bundle: Path) -> dict[str, str]:
+    """Keep Git from discovering the repository that contains the bundle.
+
+    The bundle lives under ``.agent/reviews`` inside the repository, so a
+    ceiling at the bundle's parent is what makes ``git`` fail from inside the
+    bundle. The reviewer receives no ``.git`` and no repository history.
+    """
+    return {"GIT_CEILING_DIRECTORIES": str(bundle.resolve().parent)}
+
+
+def review_bundle_prompt() -> str:
+    """Reviewer instructions that reference bundle-relative paths only."""
+    return (
+        "# Review Bundle（你的工作目录）\n\n"
+        "Dispatcher 已把本次评审的全部输入打包到当前工作目录；"
+        "Bundle 是唯一的代码与测试证据来源。只读取以下相对路径：\n\n"
+        "- `meta.json`：pr/ticket/base_sha/head_sha/merge_base/"
+        "changed_files/diff_stat\n"
+        "- `diff.patch`：PR 的完整 diff\n"
+        "- `files/<path>`：变更文件在 head 的完整内容；"
+        "`files/<path>.deleted` 表示该文件在 head 已删除\n"
+        "- `context/imports.md`：变更文件清单与按 basename 匹配到的相关测试文件\n"
+        "- `tests.json`：Dispatcher 独立测试的 status/command/output\n"
+        "- `policy.md`：REVIEW_POLICY + docs/code-review.md 摘要\n\n"
+        "不要读取 Bundle 之外的任何路径，不要运行 git 命令。\n"
+    )
+
+
+def _remove_review_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def cleanup_review_bundle(bundle: Path | None) -> None:
+    """Best-effort removal of a Review Bundle after the review run."""
+    if bundle is None:
+        return
+    try:
+        _remove_review_path(bundle)
+    except OSError as error:
+        print(f"⚠️ 无法清理 Review Bundle {bundle}：{error}")
+
+
+def _redact_review_text(text: str) -> tuple[str, bool]:
+    """Redact obvious credentials from test evidence."""
+    redacted = False
+    for pattern in _SECRET_PATTERNS:
+        if pattern.search(text) is None:
+            continue
+        redacted = True
+        if pattern.groups >= 1:
+            text = pattern.sub(lambda match: match.group(1) + "[REDACTED]", text)
+        else:
+            text = pattern.sub("[REDACTED]", text)
+    return text, redacted
+
+
+def _git_bundle_bytes(args: list[str]) -> bytes:
+    """Run a bounded read-only git command for the bundle."""
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=REVIEW_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReviewBundleError(f"git {args[0]} 无法执行：{error}") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ReviewBundleError(
+            f"git {args[0]} 失败：{detail or 'unknown error'}"
+        )
+    return completed.stdout
+
+
+def _review_merge_base(base_sha: str, head_sha: str) -> str:
+    """Return the merge base; fall back to ``base_sha`` if it is unavailable."""
+    if not base_sha:
+        return ""
+    try:
+        output = _git_bundle_bytes(
+            ["merge-base", base_sha, head_sha]
+        ).decode("utf-8", errors="replace").strip()
+    except ReviewBundleError:
+        return base_sha
+    return output.splitlines()[0] if output else base_sha
+
+
+def _diff_unquote(value: str) -> str:
+    value = value.strip()
+    if value.startswith('"'):
+        try:
+            parts = shlex.split(value)
+        except ValueError:
+            return value.strip('"')
+        if parts:
+            return parts[0]
+    return value
+
+
+def _diff_git_paths(line: str) -> tuple[str, str] | None:
+    """Return ``(old_path, new_path)`` from a ``diff --git`` header."""
+    rest = line[len(REVIEW_BUNDLE_DIFF_HEADER):]
+    if rest.startswith('"'):
+        try:
+            parts = shlex.split(rest)
+        except ValueError:
+            return None
+        if len(parts) != 2:
+            return None
+        old_path, new_path = parts
+    else:
+        match = re.match(r"(a/.+) (b/.+)$", rest)
+        if match is None:
+            return None
+        old_path, new_path = match.group(1), match.group(2)
+    if not old_path.startswith("a/") or not new_path.startswith("b/"):
+        return None
+    return old_path[2:], new_path[2:]
+
+
+def _parse_review_diff(diff: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Extract changed files and a diff stat from ``gh pr diff`` output."""
+    entries: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    in_hunk = False
+    insertions = 0
+    deletions = 0
+    for line in diff.splitlines():
+        if line.startswith(REVIEW_BUNDLE_DIFF_HEADER):
+            current = None
+            in_hunk = False
+            paths = _diff_git_paths(line)
+            if paths is not None:
+                old_path, new_path = paths
+                current = {
+                    "path": new_path,
+                    "old_path": old_path,
+                    "status": "modified",
+                }
+                entries.append(current)
+            continue
+        if current is None:
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            if line.startswith("new file mode"):
+                current["status"] = "added"
+            elif line.startswith("deleted file mode"):
+                current["status"] = "deleted"
+            elif line.startswith("rename from "):
+                current["old_path"] = _diff_unquote(line[len("rename from "):])
+                current["status"] = "renamed"
+            elif line.startswith("rename to "):
+                current["path"] = _diff_unquote(line[len("rename to "):])
+                current["status"] = "renamed"
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            insertions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+    changed_files = sorted({str(entry["path"]) for entry in entries})
+    diff_stat = {
+        "files": len(entries),
+        "insertions": insertions,
+        "deletions": deletions,
+        "changed_lines": insertions + deletions,
+        "summary": (
+            f"{len(entries)} files changed, {insertions} insertions(+), "
+            f"{deletions} deletions(-)"
+        ),
+    }
+    return entries, diff_stat
+
+
+def _safe_bundle_relpath(path: str) -> str:
+    """Reject absolute paths, traversal and ``.git`` path components."""
+    if not isinstance(path, str) or not path:
+        raise ReviewBundleError(f"无效的变更文件路径：{path!r}")
+    if "\x00" in path or "\\" in path:
+        raise ReviewBundleError(f"无效的变更文件路径：{path!r}")
+    pure = PurePosixPath(path)
+    if pure.is_absolute() or any(part in ("", ".", "..") for part in pure.parts):
+        raise ReviewBundleError(f"变更文件路径越界：{path!r}")
+    if any(part == ".git" for part in pure.parts):
+        raise ReviewBundleError(f"变更文件路径包含 .git：{path!r}")
+    return pure.as_posix()
+
+
+def _is_test_path(path: str) -> bool:
+    pure = PurePosixPath(path)
+    if pure.name.lower().endswith("tests.swift"):
+        return True
+    return any(part.lower() in {"test", "tests"} for part in pure.parts[:-1])
+
+
+def _test_match_key(path: str) -> str:
+    name = PurePosixPath(path).name
+    stem = name.rsplit(".", 1)[0]
+    if stem.startswith("test_"):
+        stem = stem[len("test_"):]
+    if stem.endswith("Tests"):
+        stem = stem[: -len("Tests")]
+    return stem.lower()
+
+
+def _related_test_files(head_sha: str, changed_paths: list[str]) -> list[str]:
+    """Find tests whose basename matches a changed file basename."""
+    keys = {_test_match_key(path) for path in changed_paths}
+    keys.discard("")
+    if not keys:
+        return []
+    tree = _git_bundle_bytes(
+        ["ls-tree", "-r", "-z", "--name-only", head_sha]
+    ).decode("utf-8", errors="replace")
+    related = {
+        path
+        for path in tree.split("\0")
+        if path and _is_test_path(path) and _test_match_key(path) in keys
+    }
+    return sorted(related)
+
+
+def prepare_review_bundle(
+    pr: int,
+    base_sha: str,
+    head_sha: str,
+    ticket: int | None,
+    diff: str,
+    test_result: ReviewTestResult,
+) -> Path:
+    """Build the isolated reviewer input bundle for one PR head.
+
+    Layout: ``.agent/reviews/review-<pr>-<head8>/`` containing ``meta.json``,
+    the exact ``diff.patch``, full changed files under ``files/``, a compact
+    ``context/imports.md``, ``tests.json`` and ``policy.md``. The bundle never
+    contains ``.git`` nor unchanged repository files. A stale bundle for the
+    same PR/head is removed first; any failure removes the partial bundle and
+    raises :class:`ReviewBundleError`.
+    """
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+        raise ReviewBundleError(f"无效的 PR 编号：{pr!r}")
+    if not isinstance(head_sha, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{4,40}", head_sha
+    ):
+        raise ReviewBundleError(f"无效的 head sha：{head_sha!r}")
+    if not isinstance(diff, str):
+        raise ReviewBundleError("diff 必须是字符串")
+
+    entries, diff_stat = _parse_review_diff(diff)
+    bundle = review_bundle_path(pr, head_sha)
+    try:
+        _remove_review_path(bundle)
+        bundle.mkdir(parents=True)
+    except OSError as error:
+        raise ReviewBundleError(f"无法创建 Review Bundle {bundle}：{error}") from error
+
+    try:
+        (bundle / "diff.patch").write_text(diff, encoding="utf-8")
+        changed_files: list[str] = []
+        deleted_files: list[str] = []
+        renamed_files: list[dict[str, str]] = []
+        for entry in entries:
+            rel = _safe_bundle_relpath(str(entry["path"]))
+            changed_files.append(rel)
+            target = bundle / "files" / Path(*PurePosixPath(rel).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if entry["status"] == "deleted":
+                deleted_files.append(rel)
+                marker = target.with_name(target.name + ".deleted")
+                marker.write_text(f"deleted at {head_sha}\n", encoding="utf-8")
+                continue
+            target.write_bytes(_git_bundle_bytes(["show", f"{head_sha}:{rel}"]))
+            if entry["status"] == "renamed":
+                old_path = _safe_bundle_relpath(str(entry["old_path"]))
+                if old_path != rel:
+                    renamed_files.append({"from": old_path, "to": rel})
+
+        changed_files = sorted(set(changed_files))
+        context_dir = bundle / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        related_tests = _related_test_files(head_sha, changed_files)
+        context_lines = [
+            "# Review Context — Imports",
+            "",
+            "## Changed files",
+            "",
+        ]
+        for entry in entries:
+            rel = _safe_bundle_relpath(str(entry["path"]))
+            detail = str(entry["status"])
+            if entry["status"] == "renamed":
+                old_path = _safe_bundle_relpath(str(entry["old_path"]))
+                if old_path != rel:
+                    detail += f", from `{old_path}`"
+            context_lines.append(f"- `{rel}` — {detail}")
+        context_lines += ["", "## Related test files", ""]
+        if related_tests:
+            context_lines += [f"- `{path}`" for path in related_tests]
+        else:
+            context_lines.append("_未按 basename 找到相关测试文件。_")
+        context_lines += [
+            "",
+            "_仅列出变更文件与 basename 匹配到的测试；Bundle 不包含完整仓库副本。_",
+            "",
+        ]
+        (context_dir / "imports.md").write_text(
+            "\n".join(context_lines), encoding="utf-8"
+        )
+
+        meta = {
+            "bundle_version": REVIEW_BUNDLE_VERSION,
+            "pr": pr,
+            "ticket": ticket,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "merge_base": _review_merge_base(base_sha, head_sha),
+            "changed_files": changed_files,
+            "deleted_files": sorted(deleted_files),
+            "renamed_files": renamed_files,
+            "diff_stat": diff_stat,
+        }
+        (bundle / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        test_status = str(test_result.status)
+        test_command, command_redacted = _redact_review_text(
+            str(test_result.command)
+        )
+        test_output, output_redacted = _redact_review_text(str(test_result.output))
+        tests = {
+            "status": test_status,
+            "command": test_command,
+            "output": test_output,
+            "redacted": command_redacted or output_redacted,
+        }
+        (bundle / "tests.json").write_text(
+            json.dumps(tests, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (bundle / "policy.md").write_text(
+            "# Review Policy\n\n## REVIEW_POLICY\n\n"
+            + REVIEW_POLICY
+            + "\n"
+            + CODE_REVIEW_SUMMARY
+            + "\n",
+            encoding="utf-8",
+        )
+
+        if (bundle / ".git").exists() or (bundle / ".git").is_symlink():
+            raise ReviewBundleError("Bundle 包含 .git，拒绝交给 Reviewer")
+        for path in bundle.rglob("*"):
+            if path.name == ".git":
+                raise ReviewBundleError(f"Bundle 包含 .git：{path}")
+        return bundle
+    except BaseException:
+        _remove_review_path(bundle)
+        raise
+
+
 
 # cmd_run treats this exit code as "another run holds this PR's lock", so it
 # can skip the PR and try the next one instead of ending the sweep.
@@ -2159,7 +2577,7 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
             "view",
             str(args.pr),
             "--json",
-            "number,title,body,headRefName,headRefOid,state,url,comments,isCrossRepository",
+            "number,title,body,headRefName,headRefOid,baseRefOid,state,url,comments,isCrossRepository",
         ]
     )
     if pr.get("state") != "OPEN":
@@ -2233,18 +2651,49 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     test_evidence = format_review_tests(test_result)
     prompt += f"\n\n---\n\n# Dispatcher 独立测试（read-only worktree）\n\n{test_evidence}\n"
 
-    run_dir = review_dir
-    run_result = run_review_agent(
-        prompt,
-        run_dir,
-        args.timeout,
-        role="reviewer",
-        job_id=f"review-{args.pr}",
-        ticket=issue_number,
-        pr=args.pr,
-        worktree=os.getcwd(),
-        details={"pr": args.pr},
-    )
+    bundle: Path | None = None
+    try:
+        try:
+            bundle = prepare_review_bundle(
+                args.pr,
+                str(pr.get("baseRefOid") or ""),
+                sha,
+                issue_number,
+                diff,
+                test_result,
+            )
+        except (ReviewBundleError, OSError) as error:
+            print(f"⛔ Review Bundle 构建失败：{error}")
+            comment_pr(
+                args.pr,
+                "## ⛔ Review Bundle 构建失败（环境问题）\n\n"
+                f"- PR: #{args.pr}\n"
+                f"- head: `{sha[:8]}`\n"
+                f"- diff: {diff_lines} 行\n"
+                f"- 独立测试: `{test_result.status}`\n"
+                f"- 原因：{error}\n\n"
+                "未运行 Reviewer，未生成 verdict；"
+                "issue 已标记 `status:blocked`。\n",
+            )
+            set_status(issue_number, "status:blocked")
+            return 1
+        prompt += f"\n\n---\n\n{review_bundle_prompt()}\n"
+        run_dir = review_dir
+        run_result = run_review_agent(
+            prompt,
+            run_dir,
+            args.timeout,
+            role="reviewer",
+            job_id=f"review-{args.pr}",
+            ticket=issue_number,
+            pr=args.pr,
+            worktree=str(bundle.resolve()),
+            cwd=str(bundle.resolve()),
+            env_overrides=review_bundle_env(bundle),
+            details={"pr": args.pr},
+        )
+    finally:
+        cleanup_review_bundle(bundle)
     text, code = run_result
     unified = run_result if isinstance(run_result, RunnerResult) else None
     if unified is not None and unified.verdict:
