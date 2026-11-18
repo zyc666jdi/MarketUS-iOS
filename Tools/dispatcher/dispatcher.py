@@ -37,6 +37,7 @@ DISPATCHER_ROOT = Path(__file__).resolve().parent
 if str(DISPATCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(DISPATCHER_ROOT))
 
+import scheduler  # noqa: E402
 from jobs import JOB_STATES, JOBS_DB, JobStore  # noqa: E402
 from reducer import Reducer, derive_job_id as derive_operation_id  # noqa: E402
 from runners.base import (  # noqa: E402
@@ -4907,6 +4908,62 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return cmd_jobs_show(args)
 
 
+def _diff_jobs_text(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "-"
+    return ", ".join(f"{item['job_id']}({item['state']})" for item in items)
+
+
+def _print_scheduler_shadow(result: dict[str, Any]) -> None:
+    """Render one shadow tick: desired jobs, counts, DB state and DB diff."""
+    print("scheduler shadow (enqueue only; no claim / execute / label / PR write)")
+    print(
+        f"desired={len(result['desired'])} created={result['created']} "
+        f"skipped={result['skipped']} missing_pr={result['missing_pr']}"
+    )
+    print("desired jobs:")
+    if result["desired"]:
+        for job in result["desired"]:
+            pr = job["pr"] if job["pr"] is not None else "-"
+            print(
+                f"  {job['job_id']}  {job['role']:<11} ticket={job['ticket']} "
+                f"pr={pr} base_sha={job['base_sha'] or '-'} "
+                f"prompt_hash={job['prompt_hash'] or '-'}"
+            )
+    else:
+        print("  -")
+    print("db state counts:")
+    for state in JOB_STATES:
+        print(f"  {state:<9} {result['db_counts'].get(state, 0)}")
+    diff = result["diff"]
+    print("diff vs existing DB:")
+    print(f"  created        {_diff_jobs_text(diff['created'])}")
+    print(f"  unchanged      {_diff_jobs_text(diff['unchanged'])}")
+    print(f"  state_mismatch {_diff_jobs_text(diff['state_mismatch'])}")
+    print(f"  orphaned       {_diff_jobs_text(diff['orphaned'])}")
+    missing = ", ".join(
+        f"#{item['ticket']}({item['status']})" for item in diff["missing_pr"]
+    ) or "-"
+    print(f"  missing_pr     {missing}")
+
+
+def cmd_scheduler(args: argparse.Namespace) -> int:
+    """Scheduler shadow: enqueue desired jobs once; never claim or execute."""
+    if getattr(args, "scheduler_command", None) != "shadow":
+        print("⛔ scheduler: 缺少子命令")
+        return 2
+    try:
+        result = scheduler.shadow_tick(_job_store())
+    except (OSError, sqlite3.Error, ValueError, scheduler.SchedulerError) as error:
+        print(f"⛔ scheduler shadow: {error}")
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    _print_scheduler_shadow(result)
+    return 0
+
+
 def cmd_observe(args: argparse.Namespace) -> int:
     """本地实时观测：launchd、agent、PR、最后日志。"""
     import time
@@ -5264,6 +5321,17 @@ def main() -> int:
     jobs_show_parser = jobs_subparsers.add_parser("show", help="显示一个 job")
     jobs_show_parser.add_argument("job_id")
 
+    scheduler_parser = subparsers.add_parser(
+        "scheduler", help="Scheduler shadow（只入队，不执行）"
+    )
+    scheduler_subparsers = scheduler_parser.add_subparsers(
+        dest="scheduler_command", required=True
+    )
+    shadow_parser = scheduler_subparsers.add_parser(
+        "shadow", help="生成 desired jobs 并幂等写入 jobs.db"
+    )
+    shadow_parser.add_argument("--json", action="store_true", help="输出 JSON")
+
     run_parser = subparsers.add_parser("run", help="单次巡检：postmerge → dispatch → review → planner")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--timeout", type=int, default=90)
@@ -5300,6 +5368,8 @@ def main() -> int:
         return cmd_loop(args)
     if args.command == "jobs":
         return cmd_jobs(args)
+    if args.command == "scheduler":
+        return cmd_scheduler(args)
     if args.command == "observe":
         return cmd_observe(args)
     if args.command == "observe":

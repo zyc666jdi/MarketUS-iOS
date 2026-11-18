@@ -1,0 +1,507 @@
+"""Phase 1c-ii tests: scheduler shadow planning, idempotent enqueue and CLI."""
+
+import argparse
+import contextlib
+import hashlib
+import inspect
+import io
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from copy import deepcopy
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[3]
+DISPATCHER_ROOT = ROOT / "Tools/dispatcher"
+if str(DISPATCHER_ROOT) not in sys.path:
+    sys.path.insert(0, str(DISPATCHER_ROOT))
+
+import dispatcher  # noqa: E402
+import jobs as job_store  # noqa: E402
+import scheduler  # noqa: E402
+
+PROMPT_HASHES = {
+    "implementer": "sha256:implementer-prompt",
+    "reviewer": "sha256:reviewer-prompt",
+    "repair": "sha256:implementer-prompt",
+}
+
+
+def make_issue(number, status=None, *, extra_labels=(), state="OPEN"):
+    labels = ([status] if status else []) + list(extra_labels)
+    return {
+        "number": number,
+        "title": f"ticket {number}",
+        "body": "",
+        "state": state,
+        "labels": [{"name": name} for name in labels],
+    }
+
+
+def make_pr(number, ticket=None, *, base_sha="base", state="OPEN", draft=False,
+            branch=None, body=None):
+    if branch is None:
+        branch = f"ai/{ticket}-test" if ticket is not None else f"ai/{number}-test"
+    if body is None:
+        body = f"Fixes #{ticket}" if ticket is not None else ""
+    return {
+        "number": number,
+        "title": f"pr {number}",
+        "body": body,
+        "headRefName": branch,
+        "headRefOid": f"head{number}",
+        "baseRefOid": base_sha,
+        "state": state,
+        "isDraft": draft,
+    }
+
+
+class PlanJobTests(unittest.TestCase):
+    def test_ready_issue_maps_to_implementer_without_pr(self):
+        planned = scheduler.plan_jobs(
+            [make_issue(11, "status:ready")], [], prompt_hashes=PROMPT_HASHES
+        )
+        self.assertEqual(len(planned), 1)
+        job = planned[0]
+        self.assertEqual(job.role, "implementer")
+        self.assertEqual(job.ticket, 11)
+        self.assertIsNone(job.pr)
+        self.assertEqual(job.base_sha, "")
+        self.assertEqual(job.prompt_hash, PROMPT_HASHES["implementer"])
+        self.assertEqual(job.source_status, "status:ready")
+        self.assertEqual(
+            job.job_id,
+            job_store.derive_job_id(
+                "implementer", 11, None, "", PROMPT_HASHES["implementer"]
+            ),
+        )
+
+    def test_in_review_issue_maps_to_reviewer_with_linked_pr(self):
+        planned = scheduler.plan_jobs(
+            [make_issue(12, "status:in-review")],
+            [make_pr(120, 12, base_sha="base-12")],
+            prompt_hashes=PROMPT_HASHES,
+        )
+        self.assertEqual(len(planned), 1)
+        job = planned[0]
+        self.assertEqual(job.role, "reviewer")
+        self.assertEqual(job.pr, 120)
+        self.assertEqual(job.base_sha, "base-12")
+        self.assertEqual(job.prompt_hash, PROMPT_HASHES["reviewer"])
+        self.assertEqual(
+            job.job_id,
+            job_store.derive_job_id(
+                "reviewer", 12, 120, "base-12", PROMPT_HASHES["reviewer"]
+            ),
+        )
+
+    def test_in_progress_issue_maps_to_repair_with_linked_pr(self):
+        planned = scheduler.plan_jobs(
+            [make_issue(13, "status:in-progress")],
+            [make_pr(130, 13, base_sha="base-13")],
+            prompt_hashes=PROMPT_HASHES,
+        )
+        self.assertEqual(len(planned), 1)
+        job = planned[0]
+        self.assertEqual(job.role, "repair")
+        self.assertEqual(job.pr, 130)
+        self.assertEqual(job.base_sha, "base-13")
+        self.assertEqual(job.prompt_hash, PROMPT_HASHES["implementer"])
+        self.assertEqual(
+            job.job_id,
+            job_store.derive_job_id(
+                "repair", 13, 130, "base-13", PROMPT_HASHES["implementer"]
+            ),
+        )
+
+    def test_status_precedence_is_deterministic(self):
+        planned = scheduler.plan_jobs(
+            [
+                make_issue(14, "status:in-review", extra_labels=["status:ready"]),
+                make_issue(15, "status:in-progress", extra_labels=["status:in-review"]),
+            ],
+            [make_pr(150, 15, base_sha="base-15")],
+            prompt_hashes=PROMPT_HASHES,
+        )
+        self.assertEqual([job.role for job in planned], ["implementer", "reviewer"])
+        self.assertEqual([job.ticket for job in planned], [14, 15])
+
+    def test_non_actionable_or_closed_issues_produce_no_jobs(self):
+        issues = [
+            make_issue(16, "status:claimed"),
+            make_issue(17, "status:awaiting-human"),
+            make_issue(18, "status:blocked"),
+            make_issue(19, "status:done"),
+            make_issue(20),
+            make_issue(21, "status:ready", state="CLOSED"),
+        ]
+        self.assertEqual(scheduler.plan_jobs(issues, [], prompt_hashes=PROMPT_HASHES), [])
+
+    def test_review_and_repair_without_a_pr_are_not_planned(self):
+        issues = [
+            make_issue(22, "status:in-review"),
+            make_issue(23, "status:in-progress"),
+        ]
+        self.assertEqual(scheduler.plan_jobs(issues, [], prompt_hashes=PROMPT_HASHES), [])
+
+    def test_pr_link_falls_back_to_body_and_ignores_drafts(self):
+        planned = scheduler.plan_jobs(
+            [make_issue(24, "status:in-review")],
+            [
+                make_pr(240, 99, draft=True),
+                make_pr(241, 24, branch="feature/review-fix", body="Closes #24"),
+            ],
+            prompt_hashes=PROMPT_HASHES,
+        )
+        self.assertEqual([job.pr for job in planned], [241])
+
+        draft_only = scheduler.plan_jobs(
+            [make_issue(25, "status:in-review")],
+            [make_pr(250, 25, draft=True)],
+            prompt_hashes=PROMPT_HASHES,
+        )
+        self.assertEqual(draft_only, [])
+
+    def test_newest_open_pr_wins_for_the_same_ticket(self):
+        planned = scheduler.plan_jobs(
+            [make_issue(26, "status:in-review")],
+            [make_pr(260, 26), make_pr(262, 26), make_pr(261, 26)],
+            prompt_hashes=PROMPT_HASHES,
+        )
+        self.assertEqual([job.pr for job in planned], [262])
+
+    def test_prompt_hash_defaults_to_the_role_prompt_content(self):
+        planned = scheduler.plan_jobs([make_issue(27, "status:ready")], [])
+        expected = "sha256:" + hashlib.sha256(
+            (ROOT / ".agent/prompts/implementer.md").read_bytes()
+        ).hexdigest()
+        self.assertEqual(planned[0].prompt_hash, expected)
+
+    def test_prompt_hash_participates_in_the_job_identity(self):
+        issue = make_issue(28, "status:in-review")
+        pr = make_pr(280, 28, base_sha="base-28")
+        first = scheduler.plan_jobs(
+            [issue], [pr], prompt_hashes={"reviewer": "sha256:one"}
+        )[0]
+        second = scheduler.plan_jobs(
+            [issue], [pr], prompt_hashes={"reviewer": "sha256:two"}
+        )[0]
+        self.assertNotEqual(first.job_id, second.job_id)
+
+
+class ShadowTickTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "jobs.db"
+        self.store = job_store.JobStore(self.db)
+
+    def issues_and_prs(self):
+        issues = [
+            make_issue(31, "status:ready"),
+            make_issue(32, "status:in-review"),
+            make_issue(33, "status:in-progress"),
+        ]
+        prs = [
+            make_pr(320, 32, base_sha="base-32"),
+            make_pr(330, 33, base_sha="base-33"),
+        ]
+        return issues, prs
+
+    def test_shadow_tick_enqueues_three_roles_as_queued(self):
+        issues, prs = self.issues_and_prs()
+        result = scheduler.shadow_tick(
+            self.store, issues, prs, prompt_hashes=PROMPT_HASHES
+        )
+
+        self.assertEqual(result["created"], 3)
+        self.assertEqual(result["skipped"], 0)
+        self.assertEqual(result["missing_pr"], 0)
+        self.assertEqual(len(result["desired"]), 3)
+        self.assertEqual(result["db_counts"]["queued"], 3)
+
+        rows = {int(row["ticket"]): row for row in self.store.list_jobs()}
+        self.assertEqual(set(rows), {31, 32, 33})
+        self.assertEqual(rows[31]["role"], "implementer")
+        self.assertIsNone(rows[31]["pr"])
+        self.assertEqual(rows[32]["role"], "reviewer")
+        self.assertEqual(rows[32]["pr"], 320)
+        self.assertEqual(rows[33]["role"], "repair")
+        self.assertEqual(rows[33]["pr"], 330)
+        for row in rows.values():
+            self.assertEqual(row["state"], "queued")
+            self.assertEqual(row["attempt"], 0)
+            self.assertIsNone(row["lease_owner"])
+            self.assertIsNone(row["lease_until"])
+            self.assertIsNone(row["heartbeat_at"])
+        self.assertEqual(len(result["diff"]["created"]), 3)
+        self.assertEqual(result["diff"]["unchanged"], [])
+
+    def test_second_shadow_tick_is_idempotent(self):
+        issues, prs = self.issues_and_prs()
+        first = scheduler.shadow_tick(
+            self.store, issues, prs, prompt_hashes=PROMPT_HASHES
+        )
+        rows_after_first = self.store.list_jobs()
+
+        second = scheduler.shadow_tick(
+            self.store, issues, prs, prompt_hashes=PROMPT_HASHES
+        )
+        rows_after_second = self.store.list_jobs()
+
+        self.assertEqual(first["created"], 3)
+        self.assertEqual(second["created"], 0)
+        self.assertEqual(second["skipped"], 3)
+        self.assertEqual(second["missing_pr"], 0)
+        self.assertEqual(second["db_counts"]["queued"], 3)
+        self.assertEqual(second["diff"]["created"], [])
+        self.assertEqual(len(second["diff"]["unchanged"]), 3)
+        self.assertEqual(rows_after_first, rows_after_second)
+
+    def test_missing_pr_is_reported_without_enqueueing(self):
+        issues = [
+            make_issue(34, "status:in-review"),
+            make_issue(35, "status:in-progress"),
+        ]
+        result = scheduler.shadow_tick(
+            self.store, issues, [], prompt_hashes=PROMPT_HASHES
+        )
+
+        self.assertEqual(result["desired"], [])
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["skipped"], 0)
+        self.assertEqual(result["missing_pr"], 2)
+        self.assertEqual(
+            result["diff"]["missing_pr"],
+            [
+                {"ticket": 34, "status": "status:in-review"},
+                {"ticket": 35, "status": "status:in-progress"},
+            ],
+        )
+        self.assertEqual(self.store.list_jobs(), [])
+
+    def test_ready_issue_still_enqueues_when_another_issue_has_no_pr(self):
+        issues = [
+            make_issue(36, "status:ready"),
+            make_issue(37, "status:in-review"),
+        ]
+        result = scheduler.shadow_tick(
+            self.store, issues, [], prompt_hashes=PROMPT_HASHES
+        )
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["desired"][0]["ticket"], 36)
+        self.assertEqual(result["missing_pr"], 1)
+
+    def test_shadow_tick_does_not_claim_execute_or_write_github(self):
+        issues, prs = self.issues_and_prs()
+        issues_before = deepcopy(issues)
+        prs_before = deepcopy(prs)
+        with (
+            mock.patch.object(job_store.JobStore, "claim") as claim,
+            mock.patch.object(job_store.JobStore, "heartbeat") as heartbeat,
+            mock.patch.object(job_store.JobStore, "finish") as finish,
+            mock.patch.object(scheduler.subprocess, "run") as run,
+        ):
+            result = scheduler.shadow_tick(
+                self.store, issues, prs, prompt_hashes=PROMPT_HASHES
+            )
+
+        self.assertEqual(result["created"], 3)
+        claim.assert_not_called()
+        heartbeat.assert_not_called()
+        finish.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(issues, issues_before)
+        self.assertEqual(prs, prs_before)
+        for row in self.store.list_jobs():
+            self.assertEqual(row["state"], "queued")
+            self.assertEqual(row["attempt"], 0)
+            self.assertIsNone(row["lease_owner"])
+
+    def test_diff_reports_state_mismatch_and_orphaned_jobs(self):
+        issue = make_issue(38, "status:in-review")
+        pr = make_pr(380, 38, base_sha="base-38")
+        desired = scheduler.plan_jobs(
+            [issue], [pr], prompt_hashes=PROMPT_HASHES
+        )[0]
+        self.store.enqueue(
+            desired.role,
+            desired.ticket,
+            desired.pr,
+            desired.base_sha,
+            prompt_hash=desired.prompt_hash,
+            job_id=desired.job_id,
+        )
+        self.store.claim("runner-a", 60)
+        self.assertTrue(self.store.finish(desired.job_id, "done", owner="runner-a"))
+        orphan = self.store.enqueue(
+            "implementer", 99, None, "", prompt_hash=PROMPT_HASHES["implementer"]
+        )
+
+        result = scheduler.shadow_tick(
+            self.store, [issue], [pr], prompt_hashes=PROMPT_HASHES
+        )
+
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(
+            result["diff"]["state_mismatch"],
+            [
+                {
+                    "job_id": desired.job_id,
+                    "role": "reviewer",
+                    "ticket": 38,
+                    "pr": 380,
+                    "state": "done",
+                    "desired_state": "queued",
+                }
+            ],
+        )
+        self.assertEqual(
+            [item["job_id"] for item in result["diff"]["orphaned"]],
+            [orphan["job_id"]],
+        )
+        self.assertEqual(result["db_counts"]["done"], 1)
+        self.assertEqual(result["db_counts"]["queued"], 1)
+
+    def test_shadow_tick_reads_gh_when_inputs_are_omitted(self):
+        issues = [make_issue(39, "status:ready")]
+        with (
+            mock.patch.object(scheduler, "read_issues", return_value=issues) as read_issues,
+            mock.patch.object(scheduler, "read_prs", return_value=[]) as read_prs,
+        ):
+            result = scheduler.shadow_tick(self.store, prompt_hashes=PROMPT_HASHES)
+        read_issues.assert_called_once_with()
+        read_prs.assert_called_once_with()
+        self.assertEqual(result["created"], 1)
+
+
+class ReadOnlyGhTests(unittest.TestCase):
+    def test_read_helpers_use_only_list_commands(self):
+        completed = subprocess.CompletedProcess([], 0, "[]", "")
+        with mock.patch.object(scheduler.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(scheduler.read_issues(), [])
+            self.assertEqual(scheduler.read_prs(), [])
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(calls[0][:3], ["gh", "issue", "list"])
+        self.assertEqual(calls[1][:3], ["gh", "pr", "list"])
+        for command in calls:
+            for write_command in ("edit", "create", "comment", "merge", "push"):
+                self.assertNotIn(write_command, command)
+
+    def test_read_helper_failure_raises_scheduler_error(self):
+        failed = subprocess.CompletedProcess([], 1, "", "boom")
+        with mock.patch.object(scheduler.subprocess, "run", return_value=failed):
+            with self.assertRaises(scheduler.SchedulerError):
+                scheduler.read_issues()
+
+
+class SchedulerCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "jobs.db"
+        self.issues = [
+            make_issue(41, "status:ready"),
+            make_issue(42, "status:in-review"),
+        ]
+        self.prs = [make_pr(420, 42, base_sha="base-42")]
+
+    def run_cli(self, *, json_output=False):
+        output = io.StringIO()
+        argv = ["dispatcher.py", "scheduler", "shadow"]
+        if json_output:
+            argv.append("--json")
+        with (
+            mock.patch.object(dispatcher, "JOBS_DB_PATH", self.db),
+            mock.patch.object(scheduler, "read_issues", return_value=self.issues),
+            mock.patch.object(scheduler, "read_prs", return_value=self.prs),
+            mock.patch.object(sys, "argv", argv),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.main()
+        return code, output.getvalue()
+
+    def test_cli_prints_desired_counts_and_db_state_counts(self):
+        code, text = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertIn("scheduler shadow", text)
+        self.assertIn("desired=2 created=2 skipped=0 missing_pr=0", text)
+        self.assertIn("implementer", text)
+        self.assertIn("reviewer", text)
+        self.assertIn("db state counts:", text)
+        self.assertRegex(text, r"queued\s+2")
+        self.assertIn("diff vs existing DB:", text)
+
+        rows = job_store.JobStore(self.db).list_jobs()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["role"] for row in rows}, {"implementer", "reviewer"})
+        self.assertTrue(all(row["state"] == "queued" for row in rows))
+
+        code, text = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertIn("desired=2 created=0 skipped=2 missing_pr=0", text)
+        self.assertEqual(len(job_store.JobStore(self.db).list_jobs()), 2)
+
+    def test_cli_json_is_machine_readable_and_idempotent(self):
+        code, text = self.run_cli(json_output=True)
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertEqual(payload["created"], 2)
+        self.assertEqual(payload["skipped"], 0)
+        self.assertEqual(payload["missing_pr"], 0)
+        self.assertEqual(payload["db_counts"]["queued"], 2)
+        self.assertEqual(
+            {job["role"] for job in payload["desired"]},
+            {"implementer", "reviewer"},
+        )
+        self.assertEqual(payload["diff"]["created"][0]["state"], "queued")
+
+        code, text = self.run_cli(json_output=True)
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertEqual(payload["created"], 0)
+        self.assertEqual(payload["skipped"], 2)
+
+    def test_cli_reports_gh_failure_without_traceback(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "JOBS_DB_PATH", self.db),
+            mock.patch.object(
+                scheduler,
+                "shadow_tick",
+                side_effect=scheduler.SchedulerError("gh boom"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.cmd_scheduler(
+                argparse.Namespace(scheduler_command="shadow", json=False)
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("scheduler shadow: gh boom", output.getvalue())
+
+    def test_parser_dispatches_scheduler_shadow(self):
+        with (
+            mock.patch.object(sys, "argv", ["dispatcher.py", "scheduler", "shadow", "--json"]),
+            mock.patch.object(dispatcher, "cmd_scheduler", return_value=0) as command,
+        ):
+            self.assertEqual(dispatcher.main(), 0)
+        command.assert_called_once()
+        args = command.call_args.args[0]
+        self.assertEqual(args.scheduler_command, "shadow")
+        self.assertTrue(args.json)
+
+    def test_shadow_is_not_wired_into_run(self):
+        self.assertNotIn(
+            "scheduler.shadow_tick", inspect.getsource(dispatcher._run_loop_phases)
+        )
+        self.assertNotIn(
+            "scheduler.shadow_tick", inspect.getsource(dispatcher.cmd_run)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
