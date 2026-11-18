@@ -24,7 +24,6 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
@@ -90,6 +89,7 @@ ISSUE_FIELDS = "number,title,body,labels,author,createdAt,url,state"
 
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 WORKTREE_ROOT = Path(".worktrees")
+REVIEWS_ROOT = Path(".agent/reviews")
 RUN_ROOT = Path(".agent/runs")
 JOB_ROOT = Path(".agent/jobs")
 JOBS_DB_PATH = JOBS_DB
@@ -1715,9 +1715,15 @@ def run_review_agent(
     ticket: int | None = None,
     pr: int | None = None,
     worktree: str | None = None,
+    cwd: str | None = None,
+    env_overrides: dict[str, str] | None = None,
     details: dict[str, Any] | None = None,
 ) -> RunnerResult:
     """Run one role through its configured runner.
+
+    ``cwd`` defaults to the dispatcher's working directory; reviewers pass their
+    snapshot. ``env_overrides`` are merged into the runner environment after the
+    allowlist (used to cap git discovery at the snapshot boundary).
 
     The return value is iterable as ``(text, returncode)`` for existing callers.
     """
@@ -1770,7 +1776,7 @@ def run_review_agent(
     env = build_runner_env(
         agent_registry().defaults["env_allowlist"],
         os.environ,
-        overrides={"AGENT_RUN_ID": run_dir.name},
+        overrides={"AGENT_RUN_ID": run_dir.name, **(env_overrides or {})},
     )
     if command and command[0] == "dsh" and resolved.sandbox == "read-only":
         env["DSH_PERMISSION_MODE"] = "read-only"
@@ -1779,7 +1785,7 @@ def run_review_agent(
     started = time.monotonic()
     try:
         returncode, stdout = run_agent_streaming(
-            command, runner_prompt, os.getcwd(), env, timeout_minutes * 60, run_dir,
+            command, runner_prompt, cwd or os.getcwd(), env, timeout_minutes * 60, run_dir,
             role=role, details=details, stdout_path=stdout_path,
         )
     except subprocess.TimeoutExpired:
@@ -1834,7 +1840,6 @@ REVIEW_TEST_TIMEOUT_ENV = "MARKETUS_REVIEW_TEST_TIMEOUT"
 REVIEW_TESTS_ENV = "MARKETUS_REVIEW_TESTS"
 REVIEW_TEST_KILL_GRACE_SECONDS = 5.0
 REVIEW_TEST_COMMAND = ("make", "test-dispatcher")
-REVIEW_GIT_TIMEOUT_SECONDS = 60
 REVIEW_COMMAND_TIMEOUT_EXIT = 124
 REVIEW_COMMAND_LAUNCH_EXIT = 127
 REVIEW_TEST_STATUSES = frozenset(
@@ -1976,31 +1981,157 @@ def run_bounded(
 
 
 def _run_review_test_command(
-    command: tuple[str, ...], worktree: Path, timeout_seconds: int
+    command: tuple[str, ...], snapshot: Path, timeout_seconds: int
 ) -> tuple[int | None, str, bool]:
-    """Run the test command in its own session.
+    """Run the test command in its own session with ``cwd=snapshot``.
 
     Returns ``(returncode, output, timed_out)``. ``returncode`` is ``None``
     when the command could not be started or timed out.
     """
     returncode, stdout, _, timed_out = _run_bounded_process(
         list(command),
-        cwd=str(worktree),
+        cwd=str(snapshot),
         timeout_seconds=timeout_seconds,
         merge_stderr=True,
     )
     return returncode, stdout, timed_out
 
 
-def run_review_tests(pr: int) -> ReviewTestResult:
-    """Run the dispatcher suite on a throwaway checkout of the PR head.
+class ReviewSnapshotError(RuntimeError):
+    """A reviewer snapshot could not be created or verified."""
 
-    The run can be skipped with ``MARKETUS_REVIEW_TESTS=0`` and is bounded by
-    ``MARKETUS_REVIEW_TEST_TIMEOUT`` (default 300s). Checkout commands are
-    bounded by ``REVIEW_GIT_TIMEOUT_SECONDS``. A timeout kills the whole
-    process group and is reported as an environment problem, not a code
-    failure. The PR branch is never modified: a detached worktree is used and
-    removed (including its temporary ref) afterwards.
+
+def review_snapshot_path(pr: int, head_sha: str) -> Path:
+    """Return the deterministic snapshot directory for a PR head."""
+    return REVIEWS_ROOT / f"review-{pr}-{head_sha[:8]}"
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _export_review_archive(head_sha: str, snapshot: Path) -> None:
+    """Stream ``git archive <head_sha>`` through tar into ``snapshot``."""
+    try:
+        archive = subprocess.Popen(
+            ["git", "archive", "--format=tar", head_sha],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise ReviewSnapshotError(f"git archive 无法启动：{error}") from error
+
+    extracted: subprocess.CompletedProcess[bytes] | None = None
+    launch_error: OSError | None = None
+    try:
+        try:
+            extracted = subprocess.run(
+                ["tar", "-x", "-C", str(snapshot)],
+                stdin=archive.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as error:
+            launch_error = error
+            archive.kill()
+        except BaseException:
+            archive.kill()
+            raise
+    finally:
+        if archive.stdout is not None:
+            archive.stdout.close()
+        stderr_bytes = archive.stderr.read() if archive.stderr is not None else b""
+        archive_returncode = archive.wait()
+    if launch_error is not None:
+        raise ReviewSnapshotError(f"tar 无法启动：{launch_error}") from launch_error
+    if archive_returncode != 0:
+        detail = stderr_bytes.decode("utf-8", errors="replace").strip()
+        raise ReviewSnapshotError(
+            f"git archive {head_sha[:8]} 失败：{detail or 'unknown error'}"
+        )
+    if extracted is None:
+        raise ReviewSnapshotError("tar 解包失败：unknown error")
+    if extracted.returncode != 0:
+        detail = extracted.stderr.decode("utf-8", errors="replace").strip()
+        raise ReviewSnapshotError(f"tar 解包失败：{detail or 'unknown error'}")
+
+
+def prepare_review_snapshot(pr: int, head_sha: str) -> Path:
+    """Export ``head_sha`` into an isolated reviewer snapshot.
+
+    The directory lives under ``.agent/reviews`` and contains the tracked tree
+    only: no ``.git`` metadata, so reviewers cannot inspect history. A stale
+    snapshot for the same PR/sha is removed first. Any failure removes the
+    partial directory and raises :class:`ReviewSnapshotError`.
+    """
+    if not isinstance(head_sha, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{4,40}", head_sha
+    ):
+        raise ReviewSnapshotError(f"invalid head sha: {head_sha!r}")
+    snapshot = review_snapshot_path(pr, head_sha)
+    try:
+        _remove_path(snapshot)
+        snapshot.mkdir(parents=True)
+    except OSError as error:
+        raise ReviewSnapshotError(f"无法创建快照 {snapshot}：{error}") from error
+    try:
+        _export_review_archive(head_sha, snapshot)
+        if (snapshot / ".git").exists() or (snapshot / ".git").is_symlink():
+            raise ReviewSnapshotError("快照包含 .git，拒绝交给 Reviewer")
+        return snapshot
+    except BaseException:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+
+
+def review_snapshot_env(snapshot: Path) -> dict[str, str]:
+    """Keep git from discovering the repository above the snapshot.
+
+    ``.agent/reviews`` is inside the repository, so Git's parent search would
+    otherwise expose the full history even without a nested ``.git``.
+    """
+    return {"GIT_CEILING_DIRECTORIES": str(snapshot.resolve().parent)}
+
+
+def cleanup_review_snapshot(snapshot: Path | None) -> None:
+    """Best-effort removal of a reviewer snapshot after the run."""
+    if snapshot is None:
+        return
+    try:
+        _remove_path(snapshot)
+    except OSError as error:
+        print(f"⚠️ 无法清理评审快照 {snapshot}：{error}")
+
+
+GIT_METADATA_FAILURE_MARKERS = (
+    "not a git repository",
+    "not a git work tree",
+    "does not appear to be a git repository",
+    "unable to read git",
+    "git: command not found",
+)
+
+
+def _needs_git_metadata(output: str) -> bool:
+    """Whether a failed command reported that git metadata was unavailable."""
+    lowered = output.lower()
+    return any(marker in lowered for marker in GIT_METADATA_FAILURE_MARKERS)
+
+
+def run_review_tests(snapshot: Path) -> ReviewTestResult:
+    """Run the dispatcher suite inside a reviewer snapshot.
+
+    The command executes with ``cwd=snapshot``; no checkout or worktree is
+    created. The run can be skipped with ``MARKETUS_REVIEW_TESTS=0`` and is
+    bounded by ``MARKETUS_REVIEW_TEST_TIMEOUT`` (default 300s). A timeout kills
+    the whole process group and is reported as an environment problem. A
+    non-zero exit caused by missing git metadata is also environment-only,
+    because the snapshot intentionally has no ``.git``. Only other positive
+    exit codes are code failures (P1).
     """
     command = tuple(REVIEW_TEST_COMMAND)
     command_text = " ".join(command)
@@ -2010,64 +2141,39 @@ def run_review_tests(pr: int) -> ReviewTestResult:
             command_text,
             f"skipped by config ({REVIEW_TESTS_ENV}=0)",
         )
+    snapshot_path = Path(snapshot)
+    if not snapshot_path.is_dir():
+        return ReviewTestResult(
+            "environment", command_text, f"review snapshot not found: {snapshot_path}"
+        )
     if shutil.which(command[0]) is None:
         return ReviewTestResult("environment", command_text, f"{command[0]} not found")
     timeout_seconds = review_test_timeout_seconds()
-    WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
-    worktree = Path(tempfile.mkdtemp(prefix=f"review-{pr}-", dir=str(WORKTREE_ROOT)))
-    worktree.rmdir()
-    ref = f"refs/dispatcher-review/pr-{pr}"
-    fetched = run_bounded(
-        ["git", "fetch", "--quiet", "origin", f"+refs/pull/{pr}/head:{ref}"],
-        timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
+    returncode, output, timed_out = _run_review_test_command(
+        command, snapshot_path, timeout_seconds
     )
-    if fetched.returncode != 0:
-        return ReviewTestResult(
-            "environment", "git fetch", fetched.stderr.strip() or "git fetch failed"
-        )
-    try:
-        added = run_bounded(
-            ["git", "worktree", "add", "--detach", str(worktree), ref],
-            timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
-        )
-        if added.returncode != 0:
+    output = output.strip()
+    if timed_out:
+        if output:
+            output += "\n"
+        output += f"timeout after {timeout_seconds}s; process group terminated"
+        return ReviewTestResult("timeout", command_text, output[-4000:])
+    if returncode is None:
+        return ReviewTestResult("environment", command_text, output[-4000:])
+    if returncode < 0:
+        output = f"{output}\nprocess terminated by signal {-returncode}".strip()
+        return ReviewTestResult("environment", command_text, output[-4000:])
+    if returncode != 0:
+        if _needs_git_metadata(output):
+            note = (
+                "快照不含 .git；测试命令需要 git 元数据，按环境问题处理"
+                "（不阻塞评审、不判定为 P1）。"
+            )
             return ReviewTestResult(
-                "environment",
-                "git worktree add",
-                added.stderr.strip() or "git worktree add failed",
+                "environment", command_text, f"{note}\n{output[-3800:]}"
             )
-        returncode, output, timed_out = _run_review_test_command(
-            command, worktree, timeout_seconds
-        )
-        output = output.strip()
-        if timed_out:
-            if output:
-                output += "\n"
-            output += f"timeout after {timeout_seconds}s; process group terminated"
-            return ReviewTestResult("timeout", command_text, output[-4000:])
-        if returncode is None:
-            return ReviewTestResult("environment", command_text, output[-4000:])
-        if returncode < 0:
-            output = f"{output}\nprocess terminated by signal {-returncode}".strip()
-            return ReviewTestResult("environment", command_text, output[-4000:])
-        if returncode != 0:
-            return ReviewTestResult("failed", command_text, output[-4000:])
-        return ReviewTestResult("passed", command_text, output[-4000:])
-    finally:
-        removed = run_bounded(
-            ["git", "worktree", "remove", "--force", str(worktree)],
-            timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
-        )
-        if removed.returncode != 0:
-            shutil.rmtree(worktree, ignore_errors=True)
-            run_bounded(
-                ["git", "worktree", "prune"],
-                timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
-            )
-        run_bounded(
-            ["git", "update-ref", "-d", ref],
-            timeout_seconds=REVIEW_GIT_TIMEOUT_SECONDS,
-        )
+        return ReviewTestResult("failed", command_text, output[-4000:])
+    return ReviewTestResult("passed", command_text, output[-4000:])
 
 
 def format_review_tests(result: ReviewTestResult) -> str:
@@ -2171,7 +2277,20 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
         print("⛔ 无法从分支名/PR body 解析 ticket 编号")
         return 1
 
-    sha = pr["headRefOid"]
+    sha = pr.get("headRefOid")
+    if not sha:
+        print(f"⛔ PR #{args.pr} 缺少 headRefOid，无法创建评审快照")
+        if args.execute:
+            comment_pr(
+                args.pr,
+                "## ⛔ Reviewer 快照创建失败（环境问题）\n\n"
+                "- PR 缺少 `headRefOid`，无法定位待评审的提交。\n"
+                "- 未运行 `make test-dispatcher` 与 Reviewer，未生成 verdict。\n"
+                "- issue 已标记 `status:blocked`；修复 PR 数据后重新触发 review。\n",
+            )
+            set_status(issue_number, "status:blocked")
+        return 1
+
     marker = f"dispatcher-review pr={args.pr} sha={sha}"
     for existing in pr.get("comments", []):
         if marker in (existing.get("body") or ""):
@@ -2221,6 +2340,8 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     if "status:in-progress" in labels:
         set_status(issue_number, "status:in-review")
 
+    snapshot: Path | None = None
+    reviewer_cwd = os.getcwd()
     if pr.get("isCrossRepository"):
         # AGENTS.md forbids checking out and executing fork code.
         test_result = ReviewTestResult(
@@ -2229,22 +2350,48 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
             "fork PR：按安全约束不检出运行",
         )
     else:
-        test_result = run_review_tests(args.pr)
-    test_evidence = format_review_tests(test_result)
-    prompt += f"\n\n---\n\n# Dispatcher 独立测试（read-only worktree）\n\n{test_evidence}\n"
+        try:
+            snapshot = prepare_review_snapshot(args.pr, sha)
+        except ReviewSnapshotError as error:
+            print(f"⛔ Reviewer 快照创建失败：{error}")
+            comment_pr(
+                args.pr,
+                "## ⛔ Reviewer 快照创建失败（环境问题）\n\n"
+                f"- `git archive {sha[:8]}`：{error}\n"
+                "- 未运行 `make test-dispatcher` 与 Reviewer，未生成 verdict。\n"
+                "- issue 已标记 `status:blocked`；修复后重新触发 review。\n",
+            )
+            set_status(issue_number, "status:blocked")
+            return 1
+        reviewer_cwd = str(snapshot.resolve())
 
-    run_dir = review_dir
-    run_result = run_review_agent(
-        prompt,
-        run_dir,
-        args.timeout,
-        role="reviewer",
-        job_id=f"review-{args.pr}",
-        ticket=issue_number,
-        pr=args.pr,
-        worktree=os.getcwd(),
-        details={"pr": args.pr},
-    )
+    try:
+        if snapshot is not None:
+            test_result = run_review_tests(snapshot)
+        test_evidence = format_review_tests(test_result)
+        prompt += (
+            "\n\n---\n\n# Dispatcher 独立测试（read-only snapshot）\n\n"
+            f"{test_evidence}\n"
+        )
+
+        run_dir = review_dir
+        run_result = run_review_agent(
+            prompt,
+            run_dir,
+            args.timeout,
+            role="reviewer",
+            job_id=f"review-{args.pr}",
+            ticket=issue_number,
+            pr=args.pr,
+            worktree=reviewer_cwd,
+            cwd=reviewer_cwd,
+            env_overrides=(
+                review_snapshot_env(snapshot) if snapshot is not None else None
+            ),
+            details={"pr": args.pr},
+        )
+    finally:
+        cleanup_review_snapshot(snapshot)
     text, code = run_result
     unified = run_result if isinstance(run_result, RunnerResult) else None
     if unified is not None and unified.verdict:

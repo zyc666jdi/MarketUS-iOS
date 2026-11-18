@@ -665,17 +665,25 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         prompts: list[str] | None = None,
         comment_bodies: list[str] | None = None,
         execute: bool = True,
+        snapshot: Path | None = None,
+        prepare_error: Exception | None = None,
+        agent_side_effect: Exception | None = None,
+        head_sha: str | None = "abc123",
+        capture: dict | None = None,
     ):
+        snapshot = snapshot or Path("/tmp/dispatcher-review-snapshot")
         pr = {
             "number": 38,
             "title": "test",
             "body": "",
             "headRefName": "ai/40-fallback-review-v2",
-            "headRefOid": "abc123",
+            "headRefOid": head_sha,
             "state": "OPEN",
             "url": "",
             "comments": comments or [],
         }
+        if head_sha is None:
+            del pr["headRefOid"]
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
 
@@ -689,9 +697,16 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
             if comment_bodies is not None:
                 comment_bodies.append(body)
 
+        def fake_prepare(_pr, _sha):
+            if prepare_error is not None:
+                raise prepare_error
+            return snapshot
+
         def fake_review_agent(prompt, _run_dir, _timeout, **_kwargs):
             if prompts is not None:
                 prompts.append(prompt)
+            if agent_side_effect is not None:
+                raise agent_side_effect
             if agent_result is not None:
                 return agent_result
             return (f"## Verdict: {verdict}\n{review_body}" if verdict else "no verdict", 0)
@@ -702,21 +717,37 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
             with (
                 mock.patch.object(dispatcher, "gh_json", return_value=pr),
                 mock.patch.object(dispatcher, "issue_detail", return_value=issue),
-                mock.patch.object(dispatcher, "gh", side_effect=fake_gh),
-                mock.patch.object(dispatcher, "run_review_agent", side_effect=fake_review_agent),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh) as gh,
+                mock.patch.object(
+                    dispatcher, "prepare_review_snapshot", side_effect=fake_prepare
+                ) as prepare,
+                mock.patch.object(dispatcher, "cleanup_review_snapshot") as cleanup,
+                mock.patch.object(
+                    dispatcher, "run_review_agent", side_effect=fake_review_agent
+                ) as agent,
                 mock.patch.object(
                     dispatcher,
                     "run_review_tests",
                     return_value=dispatcher.ReviewTestResult(
                         test_status, "make test-dispatcher", "OK"
                     ),
-                ),
+                ) as run_tests,
                 mock.patch.object(dispatcher, "comment_pr", side_effect=fake_comment),
                 mock.patch.object(dispatcher, "notify"),
             ):
-                code = dispatcher.cmd_review(
-                    argparse.Namespace(pr=38, execute=execute, timeout=30)
-                )
+                try:
+                    code = dispatcher.cmd_review(
+                        argparse.Namespace(pr=38, execute=execute, timeout=30)
+                    )
+                finally:
+                    if capture is not None:
+                        capture.update(
+                            gh=gh,
+                            prepare=prepare,
+                            cleanup=cleanup,
+                            agent=agent,
+                            run_tests=run_tests,
+                        )
         finally:
             os.chdir(old_cwd)
         lock = dispatcher.acquire_named_lock("review-38")
@@ -920,6 +951,115 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         self.assertEqual(final, {"status:awaiting-human"})
         self.assertEqual(len(pr_edits), 1)
         self.assertIn("merge:requested", pr_edits[0])
+
+    def test_review_uses_snapshot_for_tests_and_reviewer(self):
+        snapshot = Path("/tmp/review-38-abc12345")
+        capture: dict = {}
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            snapshot=snapshot,
+            capture=capture,
+            diff_text="diff --git a/a b/a\n",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        self.assertEqual(capture["prepare"].call_args.args, (38, "abc123"))
+        self.assertEqual(capture["run_tests"].call_args.args, (snapshot,))
+        kwargs = capture["agent"].call_args.kwargs
+        self.assertEqual(kwargs["worktree"], str(snapshot.resolve()))
+        self.assertEqual(kwargs["cwd"], str(snapshot.resolve()))
+        self.assertEqual(
+            kwargs["env_overrides"],
+            {"GIT_CEILING_DIRECTORIES": str(snapshot.resolve().parent)},
+        )
+        diff_calls = [
+            call.args[0]
+            for call in capture["gh"].call_args_list
+            if call.args and call.args[0][:2] == ["pr", "diff"]
+        ]
+        self.assertEqual(diff_calls, [["pr", "diff", "38"]])
+        self.assertIn("diff --git a/a b/a", capture["agent"].call_args.args[0])
+        capture["cleanup"].assert_called_once_with(snapshot)
+
+    def test_snapshot_failure_blocks_without_tests_or_reviewer(self):
+        capture: dict = {}
+        bodies: list[str] = []
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            prepare_error=dispatcher.ReviewSnapshotError("head abc123 missing"),
+            capture=capture,
+            comment_bodies=bodies,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        capture["run_tests"].assert_not_called()
+        capture["agent"].assert_not_called()
+        capture["cleanup"].assert_not_called()
+        self.assertTrue(
+            any(
+                "快照创建失败" in body and "head abc123 missing" in body
+                for body in bodies
+            )
+        )
+        self.assertFalse(
+            any("dispatcher-review pr=38 sha=abc123" in body for body in bodies)
+        )
+
+    def test_missing_head_blocks_without_running_tests_or_reviewer(self):
+        capture: dict = {}
+        bodies: list[str] = []
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            head_sha=None,
+            capture=capture,
+            comment_bodies=bodies,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        capture["prepare"].assert_not_called()
+        capture["run_tests"].assert_not_called()
+        capture["agent"].assert_not_called()
+        self.assertTrue(any("headRefOid" in body for body in bodies))
+
+    def test_snapshot_is_cleaned_after_failed_tests(self):
+        snapshot = Path("/tmp/review-38-abc12345")
+        capture: dict = {}
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "REQUEST_CHANGES",
+            test_status="failed",
+            snapshot=snapshot,
+            capture=capture,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+        capture["cleanup"].assert_called_once_with(snapshot)
+
+    def test_snapshot_is_cleaned_when_reviewer_raises(self):
+        snapshot = Path("/tmp/review-38-abc12345")
+        capture: dict = {}
+        with self.assertRaises(RuntimeError):
+            self._review(
+                {"status:in-progress"},
+                "APPROVE",
+                snapshot=snapshot,
+                capture=capture,
+                agent_side_effect=RuntimeError("boom"),
+            )
+        capture["cleanup"].assert_called_once_with(snapshot)
+
+    def test_dry_run_does_not_prepare_snapshot(self):
+        capture: dict = {}
+        code, final, _ = self._review(
+            {"status:in-progress"}, "APPROVE", execute=False, capture=capture
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:in-progress"})
+        capture["prepare"].assert_not_called()
+        capture["cleanup"].assert_not_called()
 
 
 class P1BlockingPolicyTests(unittest.TestCase):
@@ -2671,49 +2811,144 @@ class RepairStateTests(IsolatedStateTestCase):
         self.assertEqual(set(removed), {dead, malformed})
 
 
-class ReviewTestCheckoutTests(unittest.TestCase):
+class ReviewSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self._git("init", "-b", "main")
+        self._git("config", "user.name", "test")
+        self._git("config", "user.email", "test@example.com")
+        self._git("config", "commit.gpgsign", "false")
+        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        (self.repo / "Tools").mkdir()
+        (self.repo / "Tools" / "note.txt").write_text("exported\n", encoding="utf-8")
+        self._git("add", ".")
+        self._git("commit", "-m", "base")
+        self.sha = self._git("rev-parse", "HEAD").stdout.strip()
+        self.reviews = self.root / "reviews"
+        root_patch = mock.patch.object(dispatcher, "REVIEWS_ROOT", self.reviews)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+        self._cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, self._cwd)
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def test_prepare_exports_head_tree_without_git(self):
+        snapshot = dispatcher.prepare_review_snapshot(123, self.sha)
+        self.assertEqual(snapshot.parent, self.reviews)
+        self.assertEqual(snapshot.name, f"review-123-{self.sha[:8]}")
+        self.assertEqual(
+            (snapshot / "README.md").read_text(encoding="utf-8"), "base\n"
+        )
+        self.assertEqual(
+            (snapshot / "Tools" / "note.txt").read_text(encoding="utf-8"),
+            "exported\n",
+        )
+        self.assertFalse((snapshot / ".git").exists())
+        self.assertFalse((snapshot / ".git").is_symlink())
+
+    def test_prepare_removes_stale_snapshot_before_export(self):
+        stale = dispatcher.review_snapshot_path(123, self.sha)
+        stale.mkdir(parents=True)
+        (stale / "stale.txt").write_text("old\n", encoding="utf-8")
+        snapshot = dispatcher.prepare_review_snapshot(123, self.sha)
+        self.assertFalse((snapshot / "stale.txt").exists())
+        self.assertTrue((snapshot / "README.md").exists())
+
+    def test_prepare_archive_failure_cleans_partial_snapshot(self):
+        missing = "deadbeef" * 5
+        snapshot = dispatcher.review_snapshot_path(123, missing)
+        with self.assertRaises(dispatcher.ReviewSnapshotError) as caught:
+            dispatcher.prepare_review_snapshot(123, missing)
+        self.assertIn("git archive", str(caught.exception))
+        self.assertFalse(snapshot.exists())
+
+    def test_prepare_rejects_missing_or_invalid_head(self):
+        for head_sha in ("", "not-a-sha", None):
+            with self.subTest(head_sha=head_sha):
+                with self.assertRaises(dispatcher.ReviewSnapshotError):
+                    dispatcher.prepare_review_snapshot(123, head_sha)
+        self.assertFalse(self.reviews.exists())
+
+    def test_prepare_rejects_dot_git_created_by_export(self):
+        def export_with_git(_head_sha: str, snapshot: Path) -> None:
+            (snapshot / ".git").mkdir()
+
+        snapshot = dispatcher.review_snapshot_path(123, self.sha)
+        with mock.patch.object(
+            dispatcher, "_export_review_archive", side_effect=export_with_git
+        ):
+            with self.assertRaises(dispatcher.ReviewSnapshotError) as caught:
+                dispatcher.prepare_review_snapshot(123, self.sha)
+        self.assertIn(".git", str(caught.exception))
+        self.assertFalse(snapshot.exists())
+
+    def test_snapshot_env_blocks_git_history_discovery(self):
+        snapshot = dispatcher.prepare_review_snapshot(123, self.sha)
+        env = {**os.environ, **dispatcher.review_snapshot_env(snapshot)}
+        result = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=snapshot,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a git repository", result.stderr)
+
+    def test_cleanup_removes_snapshot_and_ignores_missing(self):
+        snapshot = dispatcher.prepare_review_snapshot(123, self.sha)
+        dispatcher.cleanup_review_snapshot(snapshot)
+        self.assertFalse(snapshot.exists())
+        dispatcher.cleanup_review_snapshot(snapshot)
+        dispatcher.cleanup_review_snapshot(None)
+
+
+class ReviewTestCommandTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.snapshot = Path(self._tmp.name) / "review-38-abc12345"
+        self.snapshot.mkdir()
+
     def _run_with_command(
         self,
         test_command: tuple[str, ...],
         *,
         env: dict[str, str] | None = None,
-        git_result: subprocess.CompletedProcess[str] | None = None,
         grace: float = 5.0,
     ):
-        commands: list[tuple[list[str], int]] = []
-
-        def fake_run(args, *, timeout_seconds, cwd=None):
-            commands.append((args, timeout_seconds))
-            if args[:3] == ["git", "worktree", "add"]:
-                Path(args[4]).mkdir(parents=True, exist_ok=True)
-            return git_result or subprocess.CompletedProcess(args, 0, "", "")
-
         env_patch = {
             "MARKETUS_REVIEW_TESTS": "1",
             "MARKETUS_REVIEW_TEST_TIMEOUT": "10",
         }
         env_patch.update(env or {})
-        with tempfile.TemporaryDirectory() as tmp:
-            with (
-                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
-                mock.patch.object(dispatcher, "REVIEW_TEST_COMMAND", test_command),
-                mock.patch.object(dispatcher.shutil, "which", return_value=test_command[0]),
-                mock.patch.object(dispatcher, "run_bounded", side_effect=fake_run),
-                mock.patch.object(dispatcher, "REVIEW_TEST_KILL_GRACE_SECONDS", grace),
-                mock.patch.dict(os.environ, env_patch, clear=False),
-            ):
-                result = dispatcher.run_review_tests(38)
-        return result, commands
+        with (
+            mock.patch.object(dispatcher, "REVIEW_TEST_COMMAND", test_command),
+            mock.patch.object(dispatcher.shutil, "which", return_value=test_command[0]),
+            mock.patch.object(dispatcher, "REVIEW_TEST_KILL_GRACE_SECONDS", grace),
+            mock.patch.dict(os.environ, env_patch, clear=False),
+        ):
+            return dispatcher.run_review_tests(self.snapshot)
 
-    def test_fetch_failure_is_reported_as_environment(self):
-        result, _ = self._run_with_command(
-            ("make", "test-dispatcher"),
-            git_result=subprocess.CompletedProcess([], 1, "", "network"),
-        )
+    def test_missing_snapshot_is_reported_as_environment(self):
+        missing = Path(self._tmp.name) / "missing"
+        result = dispatcher.run_review_tests(missing)
         self.assertEqual(result.status, "environment")
         self.assertFalse(result.blocks_review)
-        self.assertEqual(result.command, "git fetch")
-        self.assertIn("network", result.output)
+        self.assertIn("snapshot not found", result.output)
 
     def test_missing_make_is_reported_as_environment(self):
         with (
@@ -2723,47 +2958,51 @@ class ReviewTestCheckoutTests(unittest.TestCase):
             mock.patch.object(dispatcher.shutil, "which", return_value=None),
             mock.patch.dict(os.environ, {"MARKETUS_REVIEW_TESTS": "1"}, clear=False),
         ):
-            result = dispatcher.run_review_tests(38)
+            result = dispatcher.run_review_tests(self.snapshot)
         self.assertEqual(result.status, "environment")
         self.assertFalse(result.blocks_review)
         self.assertIn("make not found", result.output)
 
-    def test_disabled_by_config_skips_without_checkout(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with (
-                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
-                mock.patch.object(dispatcher, "run_bounded") as git_run,
-                mock.patch.dict(
-                    os.environ, {"MARKETUS_REVIEW_TESTS": "0"}, clear=False
-                ),
-            ):
-                result = dispatcher.run_review_tests(38)
-        git_run.assert_not_called()
+    def test_disabled_by_config_skips_without_running_command(self):
+        with (
+            mock.patch.object(dispatcher, "_run_review_test_command") as run_command,
+            mock.patch.dict(os.environ, {"MARKETUS_REVIEW_TESTS": "0"}, clear=False),
+        ):
+            result = dispatcher.run_review_tests(self.snapshot)
+        run_command.assert_not_called()
         self.assertEqual(result.status, "skipped")
         self.assertFalse(result.blocks_review)
         self.assertIn("skipped by config", result.output)
         self.assertEqual(result.command, "make test-dispatcher")
 
-    def test_success_runs_command_then_cleans_worktree_and_ref(self):
+    def test_success_runs_command_with_snapshot_cwd(self):
         command = (
             sys.executable,
             "-c",
-            "print('Ran 1 test in 0.1s'); print('OK')",
+            "import os; print(os.getcwd()); print('OK')",
         )
-        result, commands = self._run_with_command(command)
+        result = self._run_with_command(command)
         self.assertEqual(result.status, "passed")
         self.assertFalse(result.blocks_review)
         self.assertEqual(result.command, " ".join(command))
         self.assertIn("OK", result.output)
-        self.assertTrue(
-            any(
-                args[:3] == ["git", "worktree", "remove"]
-                for args, _timeout in commands
-            )
+        reported_cwd = Path(result.output.splitlines()[0]).resolve()
+        self.assertEqual(reported_cwd, self.snapshot.resolve())
+        self.assertTrue(self.snapshot.exists())
+
+    def test_runs_only_the_test_command_in_snapshot(self):
+        with mock.patch.object(
+            dispatcher,
+            "_run_bounded_process",
+            return_value=(0, "OK", "", False),
+        ) as bounded:
+            result = dispatcher.run_review_tests(self.snapshot)
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(
+            bounded.call_args.args[0], list(dispatcher.REVIEW_TEST_COMMAND)
         )
-        self.assertTrue(
-            any(args[:2] == ["git", "update-ref"] for args, _timeout in commands)
-        )
+        self.assertEqual(bounded.call_args.kwargs["cwd"], str(self.snapshot))
+        self.assertNotIn("git", bounded.call_args.args[0])
 
     def test_failing_suite_returns_failed_p1(self):
         command = (
@@ -2771,11 +3010,24 @@ class ReviewTestCheckoutTests(unittest.TestCase):
             "-c",
             "import sys; print('FAILED (failures=1)'); sys.exit(1)",
         )
-        result, _ = self._run_with_command(command)
+        result = self._run_with_command(command)
         self.assertEqual(result.status, "failed")
         self.assertTrue(result.blocks_review)
         self.assertEqual(result.command, " ".join(command))
         self.assertIn("FAILED", result.output)
+
+    def test_missing_git_metadata_is_environment_not_p1(self):
+        command = (
+            sys.executable,
+            "-c",
+            "import sys; print('fatal: not a git repository "
+            "(or any of the parent directories): .git'); sys.exit(1)",
+        )
+        result = self._run_with_command(command)
+        self.assertEqual(result.status, "environment")
+        self.assertFalse(result.blocks_review)
+        self.assertIn("不判定为 P1", result.output)
+        self.assertIn("not a git repository", result.output)
 
     def test_signal_terminated_suite_is_reported_as_environment(self):
         for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -2785,28 +3037,10 @@ class ReviewTestCheckoutTests(unittest.TestCase):
                     "-c",
                     f"import os, signal; os.kill(os.getpid(), signal.{sig.name})",
                 )
-                result, _ = self._run_with_command(command)
+                result = self._run_with_command(command)
                 self.assertEqual(result.status, "environment")
                 self.assertFalse(result.blocks_review)
                 self.assertIn(f"signal {int(sig)}", result.output)
-
-    def test_git_checkout_commands_are_bounded(self):
-        command = (sys.executable, "-c", "print('OK')")
-        _, commands = self._run_with_command(command)
-        git_calls = [
-            (args, timeout) for args, timeout in commands if args[:1] == ["git"]
-        ]
-        self.assertTrue(git_calls)
-        self.assertTrue(any(args[:2] == ["git", "fetch"] for args, _ in git_calls))
-        self.assertTrue(
-            any(args[:3] == ["git", "worktree", "add"] for args, _ in git_calls)
-        )
-        self.assertTrue(
-            all(
-                timeout == dispatcher.REVIEW_GIT_TIMEOUT_SECONDS
-                for _, timeout in git_calls
-            )
-        )
 
     def test_bounded_command_times_out_and_kills_group(self):
         command = [
@@ -2841,7 +3075,7 @@ class ReviewTestCheckoutTests(unittest.TestCase):
             "print('started', flush=True); time.sleep(10)",
         )
         started = time.monotonic()
-        result, _ = self._run_with_command(
+        result = self._run_with_command(
             command,
             env={"MARKETUS_REVIEW_TEST_TIMEOUT": "1"},
             grace=0.2,
@@ -4014,6 +4248,32 @@ class LoopAgentTraceTests(unittest.TestCase):
         end = next(event for event in events if event["event"] == "agent_end")
         self.assertEqual((start["step"], start["details"]["role"]), ("review", "reviewer"))
         self.assertEqual((end["step"], end["details"]["pr"]), ("review", 9))
+
+    def test_run_review_agent_uses_snapshot_cwd_and_env(self):
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        script = (
+            "import os; print(os.getcwd()); "
+            "print(os.environ.get('GIT_CEILING_DIRECTORIES', ''))"
+        )
+        with (
+            mock.patch.object(
+                dispatcher,
+                "agent_command",
+                return_value=[sys.executable, "-c", script],
+            ),
+            mock.patch.object(dispatcher, "load_agent_secrets"),
+        ):
+            text, code = dispatcher.run_review_agent(
+                "prompt",
+                self.root / "review-10",
+                1,
+                cwd=str(snapshot),
+                env_overrides={"GIT_CEILING_DIRECTORIES": str(snapshot.parent)},
+            )
+        self.assertEqual(code, 0)
+        self.assertIn(str(snapshot.resolve()), text)
+        self.assertIn(str(snapshot.parent), text)
 
     def test_repair_child_events_reuse_parent_loop(self):
         parent = dispatcher.LoopTrace(loop_id="20260101T000000-abcdef12")
