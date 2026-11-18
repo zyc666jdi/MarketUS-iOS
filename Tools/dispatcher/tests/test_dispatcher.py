@@ -748,9 +748,18 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
                         run_tests=run_tests,
                         agent=agent_mock,
                     )
-                code = dispatcher.cmd_review(
-                    argparse.Namespace(pr=38, execute=execute, timeout=30)
+                output = io.StringIO()
+                stdout_context = (
+                    contextlib.redirect_stdout(output)
+                    if capture is not None
+                    else contextlib.nullcontext()
                 )
+                with stdout_context:
+                    code = dispatcher.cmd_review(
+                        argparse.Namespace(pr=38, execute=execute, timeout=30)
+                    )
+                if capture is not None:
+                    capture["stdout"] = output.getvalue()
         finally:
             os.chdir(old_cwd)
         lock = dispatcher.acquire_named_lock("review-38")
@@ -1039,6 +1048,58 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         self.assertEqual(len(pr_edits), 1)
         self.assertIn("merge:requested", pr_edits[0])
 
+    def test_shadow_risk_prints_and_extends_existing_bundle_meta(self):
+        diff = (
+            "diff --git a/Tools/dispatcher/dispatcher.py b/Tools/dispatcher/dispatcher.py\n"
+            "--- a/Tools/dispatcher/dispatcher.py\n"
+            "+++ b/Tools/dispatcher/dispatcher.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "review-38-abc123"
+            bundle.mkdir()
+            (bundle / "meta.json").write_text('{"pr": 38}\n', encoding="utf-8")
+            capture: dict = {}
+            code, final, _ = self._review(
+                {"status:in-progress"},
+                "APPROVE",
+                diff_text=diff,
+                bundle=bundle,
+                capture=capture,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(final, {"status:awaiting-human"})
+            meta = json.loads((bundle / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["pr"], 38)
+            self.assertEqual(meta["risk"]["level"], "L2")
+            self.assertIn("risk     L2", capture["stdout"])
+            self.assertIn("high-risk path", capture["stdout"])
+            capture["agent"].assert_called_once()
+
+    def test_shadow_risk_does_not_run_reviewer_in_dry_run(self):
+        capture: dict = {}
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            execute=False,
+            capture=capture,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:in-progress"})
+        self.assertIn("risk     L1", capture["stdout"])
+        capture["agent"].assert_not_called()
+        capture["prepare"].assert_not_called()
+
+    def test_shadow_risk_failure_does_not_block_review(self):
+        with mock.patch.object(
+            dispatcher, "assess_review_risk", side_effect=RuntimeError("boom")
+        ):
+            code, final, _ = self._review({"status:in-progress"}, "APPROVE")
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+
 
 class P1BlockingPolicyTests(unittest.TestCase):
     def test_p1_section_is_the_only_blocking_section(self):
@@ -1313,6 +1374,316 @@ class ReviewBundleTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("not a git repository", completed.stderr)
+
+
+class ReviewRiskAssessmentTests(unittest.TestCase):
+    """Shadow risk scoring: docs L0, high-risk L2, thresholds and renames."""
+
+    def test_docs_only_markdown_config_is_l0(self):
+        risk = dispatcher.assess_review_risk(
+            ["docs/pr-review-system.md", "README.md", ".gitignore"],
+            40,
+            ["documentation"],
+            "docs: update review design",
+            "",
+            0,
+            40,
+        )
+        self.assertEqual(risk.score, 0)
+        self.assertEqual(risk.level, "L0")
+        self.assertFalse(risk.requires_agent)
+        self.assertTrue(any("docs/config-only" in reason for reason in risk.reasons))
+
+    def test_docs_only_deletion_remains_l0(self):
+        risk = dispatcher.assess_review_risk(
+            [{"path": "docs/old.md", "status": "deleted"}],
+            20,
+            [],
+            "docs: drop stale page",
+            "",
+            10,
+            0,
+        )
+        self.assertEqual(risk.score, 2)
+        self.assertEqual(risk.level, "L0")
+        self.assertFalse(risk.requires_agent)
+
+    def test_high_risk_paths_force_l2(self):
+        for path in (
+            "Tools/dispatcher/dispatcher.py",
+            ".github/workflows/ci.yml",
+            "Packages/MarketUSKit/Sources/FeatureWatchlist/View.swift",
+            "project.yml",
+            "Package.swift",
+            "AGENTS.md",
+            ".agent/config.yml",
+        ):
+            with self.subTest(path=path):
+                risk = dispatcher.assess_review_risk(
+                    [path], 10, ["risk:low"], "chore: update", "", 1, 9
+                )
+                self.assertEqual(risk.level, "L2")
+                self.assertGreaterEqual(risk.score, 3)
+                self.assertTrue(risk.requires_agent)
+                self.assertTrue(
+                    any("high-risk path" in reason for reason in risk.reasons)
+                )
+
+    def test_score_accumulates_all_signals(self):
+        risk = dispatcher.assess_review_risk(
+            ["Sources/Auth/APIClient.swift", "Makefile"],
+            600,
+            ["risk:low"],
+            "make public API stable",
+            "",
+            40,
+            60,
+        )
+        self.assertEqual(risk.score, 9)
+        self.assertEqual(risk.level, "L2")
+        self.assertTrue(risk.requires_agent)
+        self.assertEqual(len(risk.reasons), 5)
+
+    def test_high_risk_label_forces_l2(self):
+        risk = dispatcher.assess_review_risk(
+            ["Sources/Widget.swift"], 10, ["risk:high"], "fix", "", 0, 10
+        )
+        self.assertEqual(risk.score, 3)
+        self.assertEqual(risk.level, "L2")
+        self.assertTrue(any("high-risk label" in reason for reason in risk.reasons))
+
+    def test_api_signal_alone_is_l1(self):
+        risk = dispatcher.assess_review_risk(
+            ["Sources/MarketAPI.swift"], 500, [], "add API", "", 0, 20
+        )
+        self.assertEqual(risk.score, 2)
+        self.assertEqual(risk.level, "L1")
+
+    def test_sensitive_keyword_alone_is_l1(self):
+        risk = dispatcher.assess_review_risk(
+            ["Sources/LoginView.swift"], 10, [], "fix", "", 0, 20
+        )
+        self.assertEqual(risk.score, 3)
+        self.assertEqual(risk.level, "L1")
+
+    def test_score_six_is_l2(self):
+        risk = dispatcher.assess_review_risk(
+            ["Sources/Auth/APIClient.swift"], 501, [], "fix", "", 0, 20
+        )
+        self.assertEqual(risk.score, 6)
+        self.assertEqual(risk.level, "L2")
+
+    def test_diff_line_boundary_is_strict(self):
+        at_limit = dispatcher.assess_review_risk(
+            ["Sources/Widget.swift"], 500, [], "fix", "", 0, 20
+        )
+        over_limit = dispatcher.assess_review_risk(
+            ["Sources/Widget.swift"], 501, [], "fix", "", 0, 20
+        )
+        self.assertEqual(at_limit.score, 0)
+        self.assertEqual(over_limit.score, 1)
+
+    def test_deletion_ratio_boundary_is_strict(self):
+        exactly_thirty = dispatcher.assess_review_risk(
+            ["Sources/Widget.swift"], 10, [], "fix", "", 3, 7
+        )
+        over_thirty = dispatcher.assess_review_risk(
+            ["Sources/Widget.swift"], 10, [], "fix", "", 31, 69
+        )
+        self.assertEqual(exactly_thirty.score, 0)
+        self.assertEqual(over_thirty.score, 2)
+
+    def test_rename_from_high_risk_path_still_l2(self):
+        risk = dispatcher.assess_review_risk(
+            [
+                {
+                    "path": "Sources/Moved.swift",
+                    "old_path": "Tools/dispatcher/old.py",
+                    "status": "renamed",
+                }
+            ],
+            10,
+            [],
+            "refactor: move file",
+            "",
+            0,
+            10,
+        )
+        self.assertEqual(risk.score, 3)
+        self.assertEqual(risk.level, "L2")
+
+    def test_deleted_high_risk_file_is_l2(self):
+        risk = dispatcher.assess_review_risk(
+            [{"path": ".github/workflows/ci.yml", "status": "deleted"}],
+            20,
+            [],
+            "chore: remove workflow",
+            "",
+            20,
+            0,
+        )
+        self.assertEqual(risk.score, 5)
+        self.assertEqual(risk.level, "L2")
+
+    def test_empty_change_set_is_l1(self):
+        risk = dispatcher.assess_review_risk([], 0, [], "", "", 0, 0)
+        self.assertEqual(risk.score, 0)
+        self.assertEqual(risk.level, "L1")
+        self.assertTrue(risk.requires_agent)
+        self.assertEqual(risk.reasons, [])
+
+    def test_result_is_json_ready_dict(self):
+        risk = dispatcher.assess_review_risk(
+            ["docs/a.md"], 1, [], "", "", 0, 1
+        )
+        self.assertIsInstance(risk, dict)
+        self.assertEqual(
+            set(risk.to_dict()),
+            {"score", "level", "requires_agent", "reasons"},
+        )
+        self.assertEqual(json.loads(json.dumps(risk))["level"], "L0")
+
+
+class ReviewRiskBundleMetaTests(unittest.TestCase):
+    """The shadow result only extends an existing bundle's meta.json."""
+
+    def _risk(self) -> dispatcher.ReviewRisk:
+        return dispatcher.assess_review_risk(
+            ["docs/a.md"], 1, [], "", "", 0, 1
+        )
+
+    def test_existing_meta_is_extended_and_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "review-1-abcdef12"
+            bundle.mkdir()
+            meta = bundle / "meta.json"
+            meta.write_text('{"pr": 1, "ticket": 2}\n', encoding="utf-8")
+            self.assertTrue(
+                dispatcher._attach_review_risk_to_bundle(bundle, self._risk())
+            )
+            data = json.loads(meta.read_text(encoding="utf-8"))
+            self.assertEqual(data["pr"], 1)
+            self.assertEqual(data["ticket"], 2)
+            self.assertEqual(data["risk"]["level"], "L0")
+
+    def test_missing_meta_is_not_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "review-1-abcdef12"
+            bundle.mkdir()
+            self.assertFalse(
+                dispatcher._attach_review_risk_to_bundle(bundle, self._risk())
+            )
+            self.assertFalse((bundle / "meta.json").exists())
+
+    def test_malformed_meta_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "review-1-abcdef12"
+            bundle.mkdir()
+            (bundle / "meta.json").write_text("not json", encoding="utf-8")
+            self.assertFalse(
+                dispatcher._attach_review_risk_to_bundle(bundle, self._risk())
+            )
+
+
+class ReviewRouteCommandTests(unittest.TestCase):
+    """`review route --pr N` output and read-only GitHub access."""
+
+    DISPATCHER_DIFF = (
+        "diff --git a/Tools/dispatcher/dispatcher.py b/Tools/dispatcher/dispatcher.py\n"
+        "--- a/Tools/dispatcher/dispatcher.py\n"
+        "+++ b/Tools/dispatcher/dispatcher.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+new\n"
+    )
+    DOCS_DIFF = (
+        "diff --git a/docs/a.md b/docs/a.md\n"
+        "--- a/docs/a.md\n"
+        "+++ b/docs/a.md\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    RENAME_DIFF = (
+        "diff --git a/Tools/dispatcher/old.py b/Sources/new.py\n"
+        "similarity index 100%\n"
+        "rename from Tools/dispatcher/old.py\n"
+        "rename to Sources/new.py\n"
+    )
+
+    def _run(self, diff: str) -> tuple[int, str, list[list[str]]]:
+        pr = {
+            "number": 38,
+            "title": "test",
+            "body": "",
+            "labels": [{"name": "risk:low"}],
+        }
+        calls: list[list[str]] = []
+
+        def fake_gh(args, check=True):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, diff, "")
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "gh_json", return_value=pr),
+            mock.patch.object(dispatcher, "gh", side_effect=fake_gh),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.cmd_review_route(argparse.Namespace(pr=38))
+        return code, output.getvalue(), calls
+
+    def test_route_prints_required_fields_and_writes_nothing(self):
+        code, text, calls = self._run(self.DISPATCHER_DIFF)
+        self.assertEqual(code, 0)
+        for expected in (
+            "PR #38",
+            "changed_files 1",
+            f"diff_lines {len(self.DISPATCHER_DIFF.splitlines())}",
+            "score          3",
+            "level          L2",
+            "requires_agent yes",
+            "high-risk path",
+        ):
+            self.assertIn(expected, text)
+        self.assertEqual(calls, [["pr", "diff", "38"]])
+
+    def test_route_docs_only_reports_l0(self):
+        code, text, _ = self._run(self.DOCS_DIFF)
+        self.assertEqual(code, 0)
+        self.assertIn("level          L0", text)
+        self.assertIn("requires_agent no", text)
+        self.assertIn("docs/config-only", text)
+
+    def test_route_uses_rename_old_path(self):
+        code, text, _ = self._run(self.RENAME_DIFF)
+        self.assertEqual(code, 0)
+        self.assertIn("changed_files 1", text)
+        self.assertIn("level          L2", text)
+        self.assertIn("Tools/dispatcher/old.py", text)
+
+
+class ReviewCommandParserTests(unittest.TestCase):
+    """The route subcommand coexists with the legacy `review --pr` form."""
+
+    def test_review_route_subcommand_parses_pr(self):
+        argv = ["dispatcher.py", "review", "route", "--pr", "7"]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(dispatcher, "cmd_review_route", return_value=0) as route,
+        ):
+            self.assertEqual(dispatcher.main(), 0)
+        route.assert_called_once()
+        self.assertEqual(route.call_args.args[0].pr, 7)
+
+    def test_legacy_review_pr_form_still_dispatches(self):
+        argv = ["dispatcher.py", "review", "--pr", "8"]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(dispatcher, "cmd_review", return_value=0) as review,
+        ):
+            self.assertEqual(dispatcher.main(), 0)
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[0].pr, 8)
 
 
 class SetStatusTests(unittest.TestCase):

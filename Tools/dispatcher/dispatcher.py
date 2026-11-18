@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Iterable, Mapping
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -2221,6 +2222,356 @@ def cleanup_review_bundle(bundle: Path | None) -> None:
         print(f"⚠️ 无法清理 Review Bundle {bundle}：{error}")
 
 
+HIGH_RISK_PATH_PREFIXES = ("Tools/dispatcher/", ".github/", "Packages/", ".agent/")
+HIGH_RISK_PATH_EXACT = frozenset({"project.yml", "Package.swift"})
+HIGH_RISK_PATH_BASENAMES = frozenset({"AGENTS.md"})
+HIGH_RISK_LABELS = frozenset({"risk:high", "security:suspicious"})
+
+SENSITIVE_KEYWORDS = frozenset(
+    """
+    acl actor actors atomic auth authentication authorization authorize
+    billing cache caches caching checkout concurrency concurrent coredata
+    credential credentials database entitlement entitlements filestore gdpr
+    iap jwt keychain lock locking locks login migration migrations mutex oauth
+    passcode password payment payments permission permissions persist
+    persistence pii privacy purchase rbac semaphore session signin sqlite
+    storage thread threading threads token tokens
+    """.split()
+)
+SENSITIVE_ZH_KEYWORDS = tuple(
+    "认证 鉴权 授权 权限 登录 凭据 口令 支付 付款 隐私 并发 线程 锁 缓存 持久化 数据库 迁移".split()
+)
+PUBLIC_API_TOKENS = frozenset(
+    "abi api apis contract contracts openapi protocol protocols public".split()
+)
+PUBLIC_API_PHRASES = (
+    "public api",
+    "public protocol",
+    "breaking change",
+    "breaking-change",
+    "source compatibility",
+    "source-compatible",
+    "api change",
+    "公共 api",
+    "公共接口",
+    "协议变更",
+    "破坏性变更",
+)
+DEPENDENCY_BUILD_BASENAMES = frozenset(
+    """
+    .gitleaks.toml .swiftformat .swiftlint.yml .xcode-version Brewfile Cartfile
+    Cartfile.resolved Dockerfile Gemfile Gemfile.lock Makefile Package.resolved
+    Package.swift Pipfile Pipfile.lock Podfile Podfile.lock docker-compose.yaml
+    docker-compose.yml poetry.lock project.pbxproj project.yml pyproject.toml
+    setup.cfg setup.py
+    """.split()
+)
+DEPENDENCY_BUILD_SUFFIXES = (".pbxproj", ".xcconfig")
+DOC_EXTENSIONS = frozenset({
+    ".adoc",
+    ".cfg",
+    ".conf",
+    ".ini",
+    ".json",
+    ".md",
+    ".markdown",
+    ".mdx",
+    ".rst",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+})
+DOC_BASENAMES = frozenset(
+    "authors changelog changes code_of_conduct contributing license licence "
+    "notice readme security support".split()
+)
+DOC_CONFIG_BASENAMES = frozenset(
+    ".editorconfig .gitattributes .gitignore .mailmap".split()
+)
+
+_ACRONYM_BOUNDARY = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+class ReviewRisk(dict[str, Any]):
+    """Shadow L0/L1/L2 routing result as a JSON-ready mapping.
+
+    Attribute access is provided for callers, while the object itself remains a
+    dict so it can be serialised into ``meta.json`` without conversion.
+    """
+
+    def __init__(
+        self, score: int, level: str, requires_agent: bool, reasons: list[str]
+    ) -> None:
+        super().__init__(
+            score=score,
+            level=level,
+            requires_agent=requires_agent,
+            reasons=list(reasons),
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self)
+
+
+def _review_paths(
+    changed_files: Iterable[str | Mapping[str, Any]] | None,
+) -> list[str]:
+    """Flatten strings and rename entries into normalised POSIX paths."""
+    if isinstance(changed_files, str):
+        changed_files = [changed_files]
+    paths: list[str] = []
+    for item in changed_files or ():
+        candidates: list[str] = []
+        if isinstance(item, str):
+            candidates.append(item)
+        elif isinstance(item, Mapping):
+            for key in ("path", "new_path", "old_path", "filename"):
+                value = item.get(key)
+                if isinstance(value, str) and value:
+                    candidates.append(value)
+        for candidate in candidates:
+            path = candidate.strip()
+            while path.startswith("./"):
+                path = path[2:]
+            if path:
+                paths.append(path)
+    return paths
+
+
+def _review_labels(labels: Iterable[Any] | None) -> list[str]:
+    if isinstance(labels, str):
+        labels = [labels]
+    names: list[str] = []
+    for label in labels or ():
+        if isinstance(label, str):
+            names.append(label)
+        elif isinstance(label, Mapping):
+            name = label.get("name")
+            if isinstance(name, str):
+                names.append(name)
+    return names
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, number)
+
+
+def _match_high_risk_path(path: str) -> bool:
+    if path in HIGH_RISK_PATH_EXACT:
+        return True
+    if PurePosixPath(path).name in HIGH_RISK_PATH_BASENAMES:
+        return True
+    return any(
+        path == prefix.rstrip("/") or path.startswith(prefix)
+        for prefix in HIGH_RISK_PATH_PREFIXES
+    )
+
+
+def _is_dependency_build_path(path: str) -> bool:
+    name = PurePosixPath(path).name
+    if name in DEPENDENCY_BUILD_BASENAMES:
+        return True
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return True
+    return name.endswith(DEPENDENCY_BUILD_SUFFIXES)
+
+
+def _is_docs_like_path(path: str) -> bool:
+    if path == "docs" or path.startswith("docs/"):
+        return True
+    lower = PurePosixPath(path).name.lower()
+    if lower in DOC_BASENAMES or lower in DOC_CONFIG_BASENAMES:
+        return True
+    return PurePosixPath(lower).suffix in DOC_EXTENSIONS
+
+
+def _review_tokens(text: str) -> set[str]:
+    spaced = _ACRONYM_BOUNDARY.sub(r"\1 \2", text)
+    spaced = _CAMEL_BOUNDARY.sub(r"\1 \2", spaced)
+    return set(_WORD_RE.findall(spaced.lower()))
+
+
+def _sensitive_keyword(text: str) -> str | None:
+    tokens = _review_tokens(text)
+    for keyword in sorted(SENSITIVE_KEYWORDS):
+        if keyword in tokens:
+            return keyword
+    lowered = text.lower()
+    for keyword in SENSITIVE_ZH_KEYWORDS:
+        if keyword in lowered:
+            return keyword
+    return None
+
+
+def _public_api_signal(text: str) -> str | None:
+    tokens = _review_tokens(text)
+    for keyword in sorted(PUBLIC_API_TOKENS):
+        if keyword in tokens:
+            return keyword
+    lowered = text.lower()
+    for phrase in PUBLIC_API_PHRASES:
+        if phrase in lowered:
+            return phrase
+    return None
+
+
+def assess_review_risk(
+    changed_files: Iterable[str | Mapping[str, Any]] | None,
+    diff_lines: int,
+    labels: Iterable[Any] | None,
+    title: str,
+    body: str,
+    deletions: int,
+    additions: int,
+) -> ReviewRisk:
+    """Score a PR for shadow review routing (docs-only L0 / normal L1 / high L2).
+
+    Signals are additive and each contributes at most once. High-risk paths and
+    high-risk labels force L2. Documentation/config-only changes force L0. This
+    function is pure and advisory: callers must not use it to skip review.
+    """
+    paths = _review_paths(changed_files)
+    label_names = _review_labels(labels)
+    title_text = title if isinstance(title, str) else ""
+    body_text = body if isinstance(body, str) else ""
+    line_count = _non_negative_int(diff_lines)
+    removed = _non_negative_int(deletions)
+    added = _non_negative_int(additions)
+
+    high_risk_paths = [path for path in paths if _match_high_risk_path(path)]
+    build_paths = [path for path in paths if _is_dependency_build_path(path)]
+    docs_only = (
+        bool(paths)
+        and not high_risk_paths
+        and all(
+            _is_docs_like_path(path) and not _is_dependency_build_path(path)
+            for path in paths
+        )
+    )
+
+    score = 0
+    reasons: list[str] = []
+    forced_l2 = bool(high_risk_paths)
+
+    if docs_only:
+        reasons.append("docs/config-only change: route L0 without reviewer")
+
+    if high_risk_paths:
+        score += 3
+        reasons.append(f"high-risk path '{high_risk_paths[0]}' (+3)")
+
+    high_risk_label = next(
+        (label for label in label_names if label in HIGH_RISK_LABELS), None
+    )
+    if high_risk_label is not None:
+        score += 3
+        forced_l2 = True
+        reasons.append(f"high-risk label '{high_risk_label}' (+3)")
+
+    sensitive_hit: tuple[str, str] | None = None
+    for source, text in (("path", " ".join(paths)), ("title", title_text)):
+        keyword = _sensitive_keyword(text)
+        if keyword is not None:
+            sensitive_hit = (keyword, source)
+            break
+    if sensitive_hit is not None:
+        keyword, source = sensitive_hit
+        score += 3
+        reasons.append(f"sensitive area keyword '{keyword}' in {source} (+3)")
+
+    public_api_hit: tuple[str, str] | None = None
+    for source, text in (
+        ("path", " ".join(paths)),
+        ("title", title_text),
+        ("body", body_text),
+    ):
+        signal = _public_api_signal(text)
+        if signal is not None:
+            public_api_hit = (signal, source)
+            break
+    if public_api_hit is not None:
+        signal, source = public_api_hit
+        score += 2
+        reasons.append(f"public API/protocol signal '{signal}' in {source} (+2)")
+
+    changed_lines = removed + added
+    if changed_lines > 0 and removed * 10 > changed_lines * 3:
+        score += 2
+        percent = round(removed * 100 / changed_lines)
+        reasons.append(
+            f"deletions {removed}/{changed_lines} changed lines "
+            f"({percent}%) > 30% (+2)"
+        )
+
+    if build_paths:
+        score += 1
+        reasons.append(f"dependency/build config '{build_paths[0]}' (+1)")
+
+    if line_count > 500:
+        score += 1
+        reasons.append(f"diff {line_count} lines > 500 (+1)")
+
+    if docs_only:
+        level = "L0"
+        requires_agent = False
+    elif forced_l2 or score >= 6:
+        level = "L2"
+        requires_agent = True
+    else:
+        level = "L1"
+        requires_agent = True
+    return ReviewRisk(score, level, requires_agent, reasons)
+
+
+def format_review_risk(risk: ReviewRisk) -> str:
+    lines = [
+        f"score          {risk.score}",
+        f"level          {risk.level}",
+        f"requires_agent {'yes' if risk.requires_agent else 'no'}",
+        "reasons:",
+    ]
+    if risk.reasons:
+        lines.extend(f"  - {reason}" for reason in risk.reasons)
+    else:
+        lines.append("  - (none)")
+    return "\n".join(lines)
+
+
+def _attach_review_risk_to_bundle(bundle: Path | None, risk: ReviewRisk) -> bool:
+    """Add risk to an existing Review Bundle meta.json; never creates a bundle."""
+    if bundle is None:
+        return False
+    meta_path = bundle / "meta.json"
+    try:
+        if not meta_path.is_file():
+            return False
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            return False
+        meta["risk"] = risk.to_dict()
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except (OSError, TypeError, ValueError) as error:
+        print(f"⚠️ 无法把影子风险评分写入 Review Bundle：{error}")
+        return False
+
+
 def _redact_review_text(text: str) -> tuple[str, bool]:
     """Redact obvious credentials from test evidence."""
     redacted = False
@@ -2597,6 +2948,7 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
             return 0
 
     issue = issue_detail(issue_number)
+    labels = labels_of(issue)
     diff = gh(["pr", "diff", str(args.pr)]).stdout
     diff_lines = len(diff.splitlines())
     if diff_lines > MAX_REVIEW_DIFF_LINES:
@@ -2610,6 +2962,21 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
             set_status(issue_number, "status:blocked")
         return 1
 
+    risk: ReviewRisk | None = None
+    try:
+        entries, diff_stat = _parse_review_diff(diff)
+        risk = assess_review_risk(
+            entries,
+            diff_lines,
+            labels,
+            str(pr.get("title") or ""),
+            str(pr.get("body") or ""),
+            diff_stat["deletions"],
+            diff_stat["insertions"],
+        )
+    except Exception as error:  # Shadow scoring must never block review.
+        print(f"⚠️ 影子风险评分失败（忽略，不影响评审）：{error}")
+
     prompt = (
         REVIEW_POLICY
         + f"\n\n---\n\n# PR #{args.pr}: {pr['title']}\n\n{pr.get('body') or ''}"
@@ -2621,6 +2988,13 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     print(f"ticket   #{issue_number}")
     print(f"sha      {sha[:8]}")
     print(f"diff     {len(diff)} chars / {diff_lines} lines")
+    if risk is not None:
+        print(
+            f"risk     {risk.level} score={risk.score} "
+            f"requires_agent={'yes' if risk.requires_agent else 'no'}"
+        )
+        for reason in risk.reasons:
+            print(f"         - {reason}")
     review_dir = RUN_ROOT / f"review-{args.pr}"
     try:
         review_command = role_command(
@@ -2635,10 +3009,8 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
         print("\n(dry-run) 未调用 Reviewer；加 --execute 执行。")
         return 0
 
-    labels = labels_of(issue)
     if "status:in-progress" in labels:
         set_status(issue_number, "status:in-review")
-
     if pr.get("isCrossRepository"):
         # AGENTS.md forbids checking out and executing fork code.
         test_result = ReviewTestResult(
@@ -2677,6 +3049,8 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
             )
             set_status(issue_number, "status:blocked")
             return 1
+        if risk is not None:
+            _attach_review_risk_to_bundle(bundle, risk)
         prompt += f"\n\n---\n\n{review_bundle_prompt()}\n"
         run_dir = review_dir
         run_result = run_review_agent(
@@ -2776,6 +3150,39 @@ def _cmd_review_locked(args: argparse.Namespace) -> int:
     set_status(issue_number, "status:in-progress")
     print("⛔ REQUEST_CHANGES 含 P1 — 已退回实现")
     return 1
+
+
+def cmd_review_route(args: argparse.Namespace) -> int:
+    """Print the shadow L0/L1/L2 route for a PR without writing to GitHub."""
+    pr = gh_json(
+        [
+            "pr",
+            "view",
+            str(args.pr),
+            "--json",
+            "number,title,body,labels",
+        ]
+    )
+    if not isinstance(pr, dict):
+        pr = {}
+    diff = gh(["pr", "diff", str(args.pr)]).stdout
+    diff_lines = len(diff.splitlines())
+    entries, diff_stat = _parse_review_diff(diff)
+    changed_files = sorted({str(entry["path"]) for entry in entries})
+    risk = assess_review_risk(
+        entries,
+        diff_lines,
+        _review_labels(pr.get("labels")),
+        str(pr.get("title") or ""),
+        str(pr.get("body") or ""),
+        diff_stat["deletions"],
+        diff_stat["insertions"],
+    )
+    print(f"PR #{args.pr}")
+    print(f"changed_files {len(changed_files)}")
+    print(f"diff_lines {diff_lines}")
+    print(format_review_risk(risk))
+    return 0
 
 
 def postmerge_cursor_path() -> Path:
@@ -4605,9 +5012,14 @@ def main() -> int:
     watch_parser.add_argument("--dry-run", action="store_true", help="只预览，不写分支/评论/状态")
 
     review_parser = subparsers.add_parser("review", help="对 PR 运行只读 Reviewer（默认 dry-run）")
-    review_parser.add_argument("--pr", type=int, required=True)
+    review_parser.add_argument("--pr", type=int)
     review_parser.add_argument("--execute", action="store_true")
     review_parser.add_argument("--timeout", type=int, default=30)
+    review_subparsers = review_parser.add_subparsers(dest="review_command")
+    route_parser = review_subparsers.add_parser(
+        "route", help="只读输出 PR 影子风险评分（L0/L1/L2，不调用 Reviewer）"
+    )
+    route_parser.add_argument("--pr", type=int, required=True)
 
     postmerge_parser = subparsers.add_parser("postmerge", help="收尾已合并 PR 对应的 issue")
     postmerge_parser.add_argument("--dry-run", action="store_true")
@@ -4654,6 +5066,10 @@ def main() -> int:
     if args.command == "repair":
         return cmd_repair(args)
     if args.command == "review":
+        if getattr(args, "review_command", None) == "route":
+            return cmd_review_route(args)
+        if args.pr is None:
+            parser.error("review: --pr is required")
         return cmd_review(args)
     if args.command == "postmerge":
         return cmd_postmerge(args)
