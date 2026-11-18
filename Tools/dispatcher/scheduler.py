@@ -58,11 +58,15 @@ STATUS_ROLE = dict(STATUS_ROLES)
 ROLE_ORDER = {role: index for index, role in enumerate(("implementer", "reviewer", "repair"))}
 
 ACTIVE_JOB_STATES = frozenset({"queued", "leased", "running", "reducing", "stale"})
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 GH_ISSUE_FIELDS = "number,title,body,labels,state,url"
-GH_PR_FIELDS = "number,title,body,headRefName,headRefOid,baseRefOid,state,isDraft,url"
 GH_ISSUE_LIMIT = 50
-GH_PR_LIMIT = 200
+# gh issue list exposes no authorAssociation; status labels are maintainer
+# applied, so the untrusted code path is the PR association below.
+# `gh pr list --json` does not expose authorAssociation, so PRs are read from
+# the REST pulls endpoint (which returns author_association plus head/base repo).
+GH_PR_PAGE_SIZE = 100
 
 PR_BRANCH_PATTERN = re.compile(r"(?:ai|human)/(\d+)-", re.IGNORECASE)
 PR_ISSUE_PATTERN = re.compile(r"(?:Fixes|Closes|Refs)\s*#(\d+)", re.IGNORECASE)
@@ -127,7 +131,20 @@ def _is_open(item: Mapping[str, Any]) -> bool:
 
 
 def _is_open_pr(pr: Mapping[str, Any]) -> bool:
-    return _is_open(pr) and not bool(pr.get("isDraft"))
+    """Return True only for open, non-draft, trusted same-repo PRs.
+
+    Missing provenance fails closed: a PR without an explicit same-repo marker
+    and a trusted author association is ignored rather than planned.  This
+    gate runs before ``_prs_by_ticket`` picks the highest PR number, so an
+    external fork PR can never win by number.
+    """
+    return (
+        _is_open(pr)
+        and not bool(pr.get("isDraft"))
+        and pr.get("isCrossRepository") is False
+        and str(pr.get("authorAssociation") or "").strip().upper()
+        in TRUSTED_ASSOCIATIONS
+    )
 
 
 def _planned_status(issue: Mapping[str, Any]) -> str | None:
@@ -169,7 +186,11 @@ def _identity_sha(role: str, head_sha: str) -> str:
 
 
 def _prs_by_ticket(prs: Iterable[Mapping[str, Any]]) -> dict[int, Mapping[str, Any]]:
-    """Pick the newest open PR per ticket (highest PR number wins)."""
+    """Pick the newest trusted open PR per ticket (highest PR number wins).
+
+    Untrusted / cross-repository PRs are removed by ``_is_open_pr`` before the
+    number comparison, so they cannot shadow a legitimate linked PR.
+    """
     selected: dict[int, Mapping[str, Any]] = {}
     for pr in prs or []:
         if not _is_open_pr(pr):
@@ -389,6 +410,52 @@ def read_issues() -> list[dict[str, Any]]:
     return _read_list("issue", GH_ISSUE_FIELDS, GH_ISSUE_LIMIT)
 
 
+def _repo_name(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    name = value.get("full_name")
+    return str(name) if isinstance(name, str) else ""
+
+
+def _normalize_pr(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Map a REST PR onto the same shape used by injected test inputs."""
+    head = item.get("head")
+    base = item.get("base")
+    head = head if isinstance(head, Mapping) else {}
+    base = base if isinstance(base, Mapping) else {}
+    head_repo = _repo_name(head.get("repo"))
+    base_repo = _repo_name(base.get("repo"))
+    return {
+        "number": item.get("number"),
+        "title": item.get("title"),
+        "body": item.get("body"),
+        "headRefName": head.get("ref"),
+        "headRefOid": head.get("sha"),
+        "baseRefOid": base.get("sha"),
+        "state": item.get("state"),
+        "isDraft": item.get("draft"),
+        "url": item.get("html_url"),
+        "authorAssociation": item.get("author_association"),
+        "isCrossRepository": (
+            head_repo != base_repo if head_repo and base_repo else None
+        ),
+    }
+
+
 def read_prs() -> list[dict[str, Any]]:
-    """Read open PRs through ``gh pr list`` (read-only)."""
-    return _read_list("pr", GH_PR_FIELDS, GH_PR_LIMIT)
+    """Read open PRs with provenance through the read-only REST endpoint."""
+    pages = _gh_json(
+        [
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{{owner}}/{{repo}}/pulls?state=open&per_page={GH_PR_PAGE_SIZE}",
+        ]
+    )
+    return [
+        _normalize_pr(item)
+        for page in (pages if isinstance(pages, list) else [])
+        if isinstance(page, list)
+        for item in page
+        if isinstance(item, Mapping)
+    ]

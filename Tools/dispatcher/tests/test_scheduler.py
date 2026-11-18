@@ -42,7 +42,8 @@ def make_issue(number, status=None, *, extra_labels=(), state="OPEN"):
 
 
 def make_pr(number, ticket=None, *, base_sha="base", head_sha=None, state="OPEN",
-            draft=False, branch=None, body=None):
+            draft=False, branch=None, body=None, author_association="OWNER",
+            cross_repository=False):
     if branch is None:
         branch = f"ai/{ticket}-test" if ticket is not None else f"ai/{number}-test"
     if body is None:
@@ -56,6 +57,8 @@ def make_pr(number, ticket=None, *, base_sha="base", head_sha=None, state="OPEN"
         "baseRefOid": base_sha,
         "state": state,
         "isDraft": draft,
+        "authorAssociation": author_association,
+        "isCrossRepository": cross_repository,
     }
 
 
@@ -176,6 +179,56 @@ class PlanJobTests(unittest.TestCase):
         )
         self.assertEqual([job.pr for job in planned], [262])
 
+    def test_external_fork_pr_never_wins_by_higher_number(self):
+        issue = make_issue(51, "status:in-review")
+        trusted = make_pr(510, 51, head_sha="head-trusted")
+        fork = make_pr(
+            999,
+            51,
+            head_sha="head-fork",
+            author_association="NONE",
+            cross_repository=True,
+        )
+        owner_fork = make_pr(
+            998,
+            51,
+            head_sha="head-owner-fork",
+            author_association="OWNER",
+            cross_repository=True,
+        )
+        planned = scheduler.plan_jobs(
+            [issue], [fork, owner_fork, trusted], prompt_hashes=PROMPT_HASHES
+        )
+        self.assertEqual([job.pr for job in planned], [510])
+        self.assertEqual([job.head_sha for job in planned], ["head-trusted"])
+        self.assertEqual(
+            scheduler.plan_jobs([issue], [fork], prompt_hashes=PROMPT_HASHES), []
+        )
+
+    def test_untrusted_same_repo_author_is_ignored(self):
+        issue = make_issue(52, "status:in-review")
+        untrusted = make_pr(520, 52, author_association="CONTRIBUTOR")
+        trusted = make_pr(521, 52, author_association="MEMBER")
+        planned = scheduler.plan_jobs(
+            [issue], [untrusted, trusted], prompt_hashes=PROMPT_HASHES
+        )
+        self.assertEqual([job.pr for job in planned], [521])
+
+    def test_missing_provenance_fields_fail_closed(self):
+        issue = make_issue(53, "status:in-review")
+        missing_cross = make_pr(530, 53)
+        del missing_cross["isCrossRepository"]
+        missing_author = make_pr(531, 53)
+        del missing_author["authorAssociation"]
+        for pr in (missing_cross, missing_author):
+            with self.subTest(pr=pr["number"]):
+                self.assertEqual(
+                    scheduler.plan_jobs(
+                        [issue], [pr], prompt_hashes=PROMPT_HASHES
+                    ),
+                    [],
+                )
+
     def test_prompt_hash_defaults_to_the_role_prompt_content(self):
         planned = scheduler.plan_jobs([make_issue(27, "status:ready")], [])
         expected = "sha256:" + hashlib.sha256(
@@ -286,6 +339,26 @@ class ShadowTickTests(unittest.TestCase):
         self.assertEqual(second["diff"]["created"], [])
         self.assertEqual(len(second["diff"]["unchanged"]), 3)
         self.assertEqual(rows_after_first, rows_after_second)
+
+    def test_fork_pr_cannot_hijack_shadow_tick(self):
+        issue = make_issue(54, "status:in-review")
+        trusted = make_pr(540, 54, head_sha="head-trusted")
+        fork = make_pr(
+            999,
+            54,
+            head_sha="head-fork",
+            author_association="NONE",
+            cross_repository=True,
+        )
+        result = scheduler.shadow_tick(
+            self.store, [issue], [fork, trusted], prompt_hashes=PROMPT_HASHES
+        )
+        rows = self.store.list_jobs()
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["missing_pr"], 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pr"], 540)
+        self.assertEqual(rows[0]["head_sha"], "head-trusted")
 
     def test_head_change_with_same_base_creates_a_second_job(self):
         issue = make_issue(43, "status:in-review")
@@ -479,17 +552,80 @@ class ShadowTickTests(unittest.TestCase):
 
 
 class ReadOnlyGhTests(unittest.TestCase):
-    def test_read_helpers_use_only_list_commands(self):
+    def test_read_helpers_use_only_read_commands(self):
         completed = subprocess.CompletedProcess([], 0, "[]", "")
         with mock.patch.object(scheduler.subprocess, "run", return_value=completed) as run:
             self.assertEqual(scheduler.read_issues(), [])
             self.assertEqual(scheduler.read_prs(), [])
         calls = [call.args[0] for call in run.call_args_list]
         self.assertEqual(calls[0][:3], ["gh", "issue", "list"])
-        self.assertEqual(calls[1][:3], ["gh", "pr", "list"])
+        self.assertEqual(calls[1][:3], ["gh", "api", "--paginate"])
+        self.assertIn("--slurp", calls[1])
+        self.assertIn("pulls?state=open", calls[1][-1])
         for command in calls:
             for write_command in ("edit", "create", "comment", "merge", "push"):
                 self.assertNotIn(write_command, command)
+
+    def test_read_prs_normalizes_rest_provenance_fields(self):
+        payload = [[
+            {
+                "number": 550,
+                "title": "trusted",
+                "body": "Fixes #55",
+                "head": {
+                    "ref": "ai/55-x", "sha": "head-550",
+                    "repo": {"full_name": "owner/repo"},
+                },
+                "base": {
+                    "ref": "main", "sha": "base",
+                    "repo": {"full_name": "owner/repo"},
+                },
+                "state": "open",
+                "draft": False,
+                "html_url": "https://example.test/550",
+                "author_association": "MEMBER",
+            },
+            {
+                "number": 551,
+                "title": "fork",
+                "body": "Fixes #55",
+                "head": {
+                    "ref": "ai/55-x", "sha": "head-551",
+                    "repo": {"full_name": "fork/repo"},
+                },
+                "base": {
+                    "ref": "main", "sha": "base",
+                    "repo": {"full_name": "owner/repo"},
+                },
+                "state": "open",
+                "draft": False,
+                "html_url": "https://example.test/551",
+                "author_association": "NONE",
+            },
+            {
+                "number": 552,
+                "title": "missing repo metadata",
+                "body": "Fixes #55",
+                "head": {"ref": "ai/55-x", "sha": "head-552"},
+                "base": {"ref": "main", "sha": "base"},
+                "state": "open",
+                "draft": False,
+                "html_url": "https://example.test/552",
+                "author_association": "OWNER",
+            },
+        ]]
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        with mock.patch.object(scheduler.subprocess, "run", return_value=completed):
+            prs = scheduler.read_prs()
+
+        self.assertEqual(len(prs), 3)
+        self.assertEqual(prs[0]["authorAssociation"], "MEMBER")
+        self.assertIs(prs[0]["isCrossRepository"], False)
+        self.assertEqual(prs[0]["headRefOid"], "head-550")
+        self.assertEqual(prs[0]["baseRefOid"], "base")
+        self.assertEqual(prs[0]["headRefName"], "ai/55-x")
+        self.assertIs(prs[1]["isCrossRepository"], True)
+        self.assertIsNone(prs[2]["isCrossRepository"])
 
     def test_read_helper_failure_raises_scheduler_error(self):
         failed = subprocess.CompletedProcess([], 1, "", "boom")
