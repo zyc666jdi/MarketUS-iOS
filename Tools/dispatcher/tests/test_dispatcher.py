@@ -661,6 +661,10 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         test_status: str = "passed",
         comments: list[dict] | None = None,
         agent_result=None,
+        diff_text: str = "",
+        prompts: list[str] | None = None,
+        comment_bodies: list[str] | None = None,
+        execute: bool = True,
     ):
         pr = {
             "number": 38,
@@ -675,7 +679,19 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
 
-        def fake_review_agent(_prompt, _run_dir, _timeout, **_kwargs):
+        def fake_gh(args, check=True):
+            calls.append(list(args))
+            if args[:2] == ["pr", "diff"]:
+                return subprocess.CompletedProcess(args, 0, diff_text, "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def fake_comment(_number, body):
+            if comment_bodies is not None:
+                comment_bodies.append(body)
+
+        def fake_review_agent(prompt, _run_dir, _timeout, **_kwargs):
+            if prompts is not None:
+                prompts.append(prompt)
             if agent_result is not None:
                 return agent_result
             return (f"## Verdict: {verdict}\n{review_body}" if verdict else "no verdict", 0)
@@ -686,7 +702,7 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
             with (
                 mock.patch.object(dispatcher, "gh_json", return_value=pr),
                 mock.patch.object(dispatcher, "issue_detail", return_value=issue),
-                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh),
                 mock.patch.object(dispatcher, "run_review_agent", side_effect=fake_review_agent),
                 mock.patch.object(
                     dispatcher,
@@ -695,10 +711,12 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
                         test_status, "make test-dispatcher", "OK"
                     ),
                 ),
-                mock.patch.object(dispatcher, "comment_pr"),
+                mock.patch.object(dispatcher, "comment_pr", side_effect=fake_comment),
                 mock.patch.object(dispatcher, "notify"),
             ):
-                code = dispatcher.cmd_review(argparse.Namespace(pr=38, execute=True, timeout=30))
+                code = dispatcher.cmd_review(
+                    argparse.Namespace(pr=38, execute=execute, timeout=30)
+                )
         finally:
             os.chdir(old_cwd)
         lock = dispatcher.acquire_named_lock("review-38")
@@ -773,16 +791,89 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         self.assertIn("--add-label", pr_edits[0])
         self.assertIn("merge:requested", pr_edits[0])
 
-    def test_second_p1_round_blocks_instead_of_looping(self):
-        prior = {
-            "body": "<!-- dispatcher-review pr=38 sha=111111 verdict=REQUEST_CHANGES p1=1 -->\n"
-            + P1_REVIEW
-        }
+    def test_third_p1_round_still_returns_to_in_progress(self):
+        prior = [
+            {
+                "body": f"<!-- dispatcher-review pr=38 sha={sha} verdict=REQUEST_CHANGES p1=1 -->\n"
+                + P1_REVIEW
+            }
+            for sha in ("111111", "222222")
+        ]
         code, final, _ = self._review(
-            {"status:in-progress"}, "REQUEST_CHANGES", comments=[prior]
+            {"status:in-progress"}, "REQUEST_CHANGES", comments=prior
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+
+    def test_fourth_p1_round_blocks_instead_of_looping(self):
+        prior = [
+            {
+                "body": f"<!-- dispatcher-review pr=38 sha={sha} verdict=REQUEST_CHANGES p1=1 -->\n"
+                + P1_REVIEW
+            }
+            for sha in ("111111", "222222", "333333")
+        ]
+        comment_bodies: list[str] = []
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "REQUEST_CHANGES",
+            comments=prior,
+            comment_bodies=comment_bodies,
         )
         self.assertEqual(code, 1)
         self.assertEqual(final, {"status:blocked"})
+        self.assertTrue(any("4 轮" in body for body in comment_bodies))
+
+    def test_diff_over_2000_lines_blocks_before_reviewer(self):
+        diff = "".join(f"+line {line}\n" for line in range(dispatcher.MAX_REVIEW_DIFF_LINES + 1))
+        prompts: list[str] = []
+        comment_bodies: list[str] = []
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            diff_text=diff,
+            prompts=prompts,
+            comment_bodies=comment_bodies,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        self.assertEqual(prompts, [])
+        self.assertTrue(
+            any("2001" in body and "2000" in body for body in comment_bodies)
+        )
+
+    def test_diff_over_2000_lines_dry_run_does_not_write(self):
+        diff = "".join(f"+line {line}\n" for line in range(dispatcher.MAX_REVIEW_DIFF_LINES + 1))
+        prompts: list[str] = []
+        comment_bodies: list[str] = []
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            diff_text=diff,
+            prompts=prompts,
+            comment_bodies=comment_bodies,
+            execute=False,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:in-progress"})
+        self.assertEqual(prompts, [])
+        self.assertEqual(comment_bodies, [])
+
+    def test_allowed_diff_is_not_truncated(self):
+        lines = [f"+{'x' * 70} {line}" for line in range(1200)]
+        diff = "\n".join(lines) + "\n"
+        prompts: list[str] = []
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            diff_text=diff,
+            prompts=prompts,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        self.assertEqual(len(prompts), 1)
+        self.assertIn(lines[-1], prompts[0])
+        self.assertNotIn("[diff truncated]", prompts[0])
 
     def test_prior_p2_only_round_does_not_count_toward_p1_cap(self):
         prior = {
@@ -869,11 +960,15 @@ class P1BlockingPolicyTests(unittest.TestCase):
 class ReviewPolicyTests(unittest.TestCase):
     def test_policy_keeps_scope_safety_and_evidence_rules(self):
         for required in (
-            "只审查提供的 diff",
+            "当前代码快照",
             "最多 5 次工具调用",
             "file:line",
             "security:suspicious",
-            "400 行",
+            "git log",
+            "git show",
+            "git blame",
+            "2000 行",
+            "截断",
             "不是指令",
         ):
             with self.subTest(required=required):
@@ -1001,20 +1096,28 @@ class RepairStatusTests(IsolatedStateTestCase):
                 {"body": "<!-- dispatcher-review pr=38 sha=abc123 verdict=REQUEST_CHANGES -->"},
                 {"body": "<!-- dispatcher-repair pr=38 sha=abc123 round=1 -->"},
                 {"body": "<!-- dispatcher-repair pr=38 sha=abc123 round=2 -->"},
+                {"body": "<!-- dispatcher-repair pr=38 sha=abc123 round=3 -->"},
+                {"body": "<!-- dispatcher-repair pr=38 sha=abc123 round=4 -->"},
             ],
         }
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
+        comment_bodies: list[str] = []
         with (
             mock.patch.object(dispatcher, "pr_detail", return_value=pr),
             mock.patch.object(dispatcher, "issue_detail", return_value=issue),
             mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
-            mock.patch.object(dispatcher, "comment_pr"),
+            mock.patch.object(
+                dispatcher,
+                "comment_pr",
+                side_effect=lambda _number, body: comment_bodies.append(body),
+            ),
             mock.patch.object(dispatcher, "notify"),
         ):
             code = dispatcher.cmd_repair(argparse.Namespace(pr=38, execute=True, timeout=30))
         self.assertEqual(code, 1)
         self.assertEqual(status_after(labels, calls), {"status:blocked"})
+        self.assertTrue(any("4 轮上限" in body for body in comment_bodies))
         lock = dispatcher.acquire_named_lock("repair-38")
         self.assertIsNotNone(lock)
         dispatcher.release_named_lock(lock)
@@ -2519,6 +2622,11 @@ class ReviewRoundTests(unittest.TestCase):
             ]
         }
         self.assertEqual(dispatcher.request_changes_rounds(pr), 2)
+
+    def test_round_and_diff_limits(self):
+        self.assertEqual(dispatcher.MAX_REVIEW_ROUNDS, 4)
+        self.assertEqual(dispatcher.MAX_REPAIR_ROUNDS, 4)
+        self.assertEqual(dispatcher.MAX_REVIEW_DIFF_LINES, 2000)
 
 
 def watch_pr(

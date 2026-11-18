@@ -38,8 +38,8 @@ concurrency:
 
 limits:
   timeout_minutes: 90
-  max_changed_lines: 1000          # 超过则必须拆票
-  hard_max_changed_lines: 1000     # 绝对上限，超过直接终止并上报
+  max_changed_lines: 2000          # 超过则必须拆票
+  hard_max_changed_lines: 2000     # 绝对上限，超过直接终止并上报
   max_files_changed: 25
   max_new_dependencies: 0          # 新增 SPM 依赖需人类批准
   tool_call_budget: 400
@@ -65,7 +65,7 @@ gates:
 review:
   independent_context: true        # Reviewer 不得继承 Implementer 的对话上下文
   read_only: true                  # Reviewer 只能评论，不能 push
-  max_rounds: 2                    # 两轮仍有 blocker → 升级给人
+  max_rounds: 4                    # 第 4 次 P1 REQUEST_CHANGES 即升级给人
   require_evidence: true           # 评论必须引用 file:line 与依据
 
 merge:
