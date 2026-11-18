@@ -29,6 +29,7 @@ MarketUS.xcodeproj/
 .agent/runs/
 .agent/jobs/
 .agent/loops/
+.agent/reviews/
 .agent/locks/
 .agent/state/
 .agent/cache/

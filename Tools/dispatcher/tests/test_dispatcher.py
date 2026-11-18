@@ -665,6 +665,10 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         prompts: list[str] | None = None,
         comment_bodies: list[str] | None = None,
         execute: bool = True,
+        bundle: Path | None = None,
+        prepare_error: Exception | None = None,
+        agent_error: Exception | None = None,
+        capture: dict | None = None,
     ):
         pr = {
             "number": 38,
@@ -672,12 +676,23 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
             "body": "",
             "headRefName": "ai/40-fallback-review-v2",
             "headRefOid": "abc123",
+            "baseRefOid": "base000",
             "state": "OPEN",
             "url": "",
             "comments": comments or [],
         }
         issue = {"number": 40, "body": "ticket", "labels": [{"name": name} for name in labels]}
         calls = []
+        bundle_path = (
+            bundle
+            if bundle is not None
+            else Path(tempfile.gettempdir()) / "review-38-abc123"
+        )
+        prepare_kwargs = (
+            {"side_effect": prepare_error}
+            if prepare_error is not None
+            else {"return_value": bundle_path}
+        )
 
         def fake_gh(args, check=True):
             calls.append(list(args))
@@ -689,9 +704,14 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
             if comment_bodies is not None:
                 comment_bodies.append(body)
 
-        def fake_review_agent(prompt, _run_dir, _timeout, **_kwargs):
+        def fake_review_agent(prompt, _run_dir, _timeout, **kwargs):
+            if capture is not None:
+                capture["prompt"] = prompt
+                capture["kwargs"] = kwargs
             if prompts is not None:
                 prompts.append(prompt)
+            if agent_error is not None:
+                raise agent_error
             if agent_result is not None:
                 return agent_result
             return (f"## Verdict: {verdict}\n{review_body}" if verdict else "no verdict", 0)
@@ -703,17 +723,31 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
                 mock.patch.object(dispatcher, "gh_json", return_value=pr),
                 mock.patch.object(dispatcher, "issue_detail", return_value=issue),
                 mock.patch.object(dispatcher, "gh", side_effect=fake_gh),
-                mock.patch.object(dispatcher, "run_review_agent", side_effect=fake_review_agent),
+                mock.patch.object(
+                    dispatcher, "run_review_agent", side_effect=fake_review_agent
+                ) as agent_mock,
+                mock.patch.object(
+                    dispatcher, "prepare_review_bundle", **prepare_kwargs
+                ) as prepare,
+                mock.patch.object(dispatcher, "cleanup_review_bundle") as cleanup,
                 mock.patch.object(
                     dispatcher,
                     "run_review_tests",
                     return_value=dispatcher.ReviewTestResult(
                         test_status, "make test-dispatcher", "OK"
                     ),
-                ),
+                ) as run_tests,
                 mock.patch.object(dispatcher, "comment_pr", side_effect=fake_comment),
                 mock.patch.object(dispatcher, "notify"),
             ):
+                if capture is not None:
+                    capture.update(
+                        bundle=bundle_path,
+                        prepare=prepare,
+                        cleanup=cleanup,
+                        run_tests=run_tests,
+                        agent=agent_mock,
+                    )
                 code = dispatcher.cmd_review(
                     argparse.Namespace(pr=38, execute=execute, timeout=30)
                 )
@@ -724,6 +758,90 @@ class ReviewLabelTransitionTests(IsolatedStateTestCase):
         dispatcher.release_named_lock(lock)
         pr_edits = [args for args in calls if args[:2] == ["pr", "edit"]]
         return code, status_after(labels, calls), pr_edits
+
+    def test_review_uses_bundle_cwd_and_bundle_relative_prompt(self):
+        capture: dict = {}
+        bundle = Path(tempfile.gettempdir()) / "marketus-review-bundle-127"
+        diff = (
+            "diff --git a/a b/a\n"
+            "--- a/a\n"
+            "+++ b/a\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            diff_text=diff,
+            bundle=bundle,
+            capture=capture,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(final, {"status:awaiting-human"})
+        prepare_args = capture["prepare"].call_args.args
+        self.assertEqual(prepare_args[:4], (38, "base000", "abc123", 40))
+        self.assertEqual(prepare_args[4], diff)
+        self.assertEqual(prepare_args[5].status, "passed")
+        kwargs = capture["kwargs"]
+        self.assertEqual(kwargs["cwd"], str(bundle.resolve()))
+        self.assertEqual(kwargs["worktree"], str(bundle.resolve()))
+        self.assertEqual(
+            kwargs["env_overrides"],
+            {"GIT_CEILING_DIRECTORIES": str(bundle.resolve().parent)},
+        )
+        prompt = capture["prompt"]
+        for required in (
+            "meta.json",
+            "diff.patch",
+            "files/<path>",
+            "context/imports.md",
+            "tests.json",
+            "policy.md",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, prompt)
+        self.assertNotIn(str(ROOT), prompt)
+        self.assertNotIn(str(bundle), prompt)
+        capture["cleanup"].assert_called_once_with(bundle)
+
+    def test_review_cleans_bundle_when_agent_raises(self):
+        capture: dict = {}
+        bundle = Path(tempfile.gettempdir()) / "marketus-review-bundle-fail"
+        with self.assertRaises(RuntimeError):
+            self._review(
+                {"status:in-progress"},
+                "APPROVE",
+                bundle=bundle,
+                agent_error=RuntimeError("boom"),
+                capture=capture,
+            )
+        capture["cleanup"].assert_called_once_with(bundle)
+
+    def test_bundle_failure_blocks_without_running_reviewer(self):
+        capture: dict = {}
+        bodies: list[str] = []
+        prompts: list[str] = []
+        code, final, _ = self._review(
+            {"status:in-progress"},
+            "APPROVE",
+            prepare_error=dispatcher.ReviewBundleError("head object missing"),
+            capture=capture,
+            comment_bodies=bodies,
+            prompts=prompts,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(final, {"status:blocked"})
+        self.assertEqual(prompts, [])
+        capture["agent"].assert_not_called()
+        capture["run_tests"].assert_called_once_with(38)
+        capture["cleanup"].assert_called_once_with(None)
+        self.assertTrue(
+            any(
+                "Review Bundle" in body and "head object missing" in body
+                for body in bodies
+            )
+        )
 
     def test_approve_from_in_progress_leaves_only_awaiting_human(self):
         code, final, _ = self._review({"status:in-progress"}, "APPROVE")
@@ -985,6 +1103,216 @@ class ReviewPolicyTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, dispatcher.CODEX_REVIEW_CONTRACT)
+
+
+class ReviewBundleTests(unittest.TestCase):
+    """Review Bundle contents, isolation and cleanup."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.reviews = self.root / "reviews"
+        old_cwd = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, old_cwd)
+        root_patch = mock.patch.object(dispatcher, "REVIEWS_ROOT", self.reviews)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+
+        self._git("init", "-q")
+        self._git("config", "user.email", "test@example.com")
+        self._git("config", "user.name", "Test")
+        self._write("Sources/Widget.swift", "struct Widget {}\n")
+        self._write("Sources/Deleted.swift", "struct Deleted {}\n")
+        self._write("Sources/Unrelated.swift", "struct Unrelated {}\n")
+        self._write("Tests/WidgetTests.swift", "import XCTest\n")
+        self._write("Tools/dispatcher/dispatcher.py", "# dispatcher\n")
+        self._write("Tools/dispatcher/tests/test_dispatcher.py", "# tests\n")
+        self._git("add", ".")
+        self._git("commit", "-qm", "base")
+        self.base = self._git("rev-parse", "HEAD").stdout.strip()
+
+        self._write("Sources/Widget.swift", "struct Widget { let id = 1 }\n")
+        self._write("Sources/Added.swift", "struct Added {}\n")
+        (self.repo / "Sources/Deleted.swift").unlink()
+        self._write("Tools/dispatcher/dispatcher.py", "# dispatcher v2\n")
+        self._write("Tools/dispatcher/tests/test_dispatcher.py", "# tests v2\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "head")
+        self.head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.diff = self._git("diff", f"{self.base}..{self.head}").stdout
+        self.changed = {
+            "Sources/Added.swift",
+            "Sources/Deleted.swift",
+            "Sources/Widget.swift",
+            "Tools/dispatcher/dispatcher.py",
+            "Tools/dispatcher/tests/test_dispatcher.py",
+        }
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    def _write(self, path: str, content: str) -> None:
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    def _test_result(
+        self,
+        status: str = "passed",
+        command: str = "make test-dispatcher",
+        output: str = "Ran 1 test in 0.1s\nOK",
+    ) -> dispatcher.ReviewTestResult:
+        return dispatcher.ReviewTestResult(status, command, output)
+
+    def _prepare(
+        self,
+        *,
+        diff: str | None = None,
+        test_result: dispatcher.ReviewTestResult | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
+    ) -> Path:
+        return dispatcher.prepare_review_bundle(
+            127,
+            self.base if base_sha is None else base_sha,
+            self.head if head_sha is None else head_sha,
+            42,
+            self.diff if diff is None else diff,
+            self._test_result() if test_result is None else test_result,
+        )
+
+    def test_bundle_layout_meta_and_files(self):
+        bundle = self._prepare()
+        self.assertEqual(bundle, self.reviews / f"review-127-{self.head[:8]}")
+        self.assertTrue(bundle.is_dir())
+        meta = json.loads((bundle / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["pr"], 127)
+        self.assertEqual(meta["ticket"], 42)
+        self.assertEqual(meta["base_sha"], self.base)
+        self.assertEqual(meta["head_sha"], self.head)
+        self.assertEqual(meta["merge_base"], self.base)
+        self.assertEqual(meta["changed_files"], sorted(self.changed))
+        self.assertEqual(meta["deleted_files"], ["Sources/Deleted.swift"])
+        self.assertEqual(meta["diff_stat"]["files"], 5)
+        self.assertGreater(meta["diff_stat"]["insertions"], 0)
+        self.assertGreater(meta["diff_stat"]["deletions"], 0)
+        self.assertEqual(
+            (bundle / "diff.patch").read_text(encoding="utf-8"), self.diff
+        )
+        self.assertEqual(
+            (bundle / "files/Sources/Widget.swift").read_text(encoding="utf-8"),
+            "struct Widget { let id = 1 }\n",
+        )
+        self.assertFalse((bundle / "files/Sources/Deleted.swift").exists())
+        self.assertIn(
+            "deleted at",
+            (bundle / "files/Sources/Deleted.swift.deleted").read_text(
+                encoding="utf-8"
+            ),
+        )
+        self.assertFalse((bundle / "files/Sources/Unrelated.swift").exists())
+        self.assertFalse((bundle / "AGENTS.md").exists())
+        self.assertFalse(any(path.name == ".git" for path in bundle.rglob("*")))
+
+    def test_deleted_file_is_recorded_but_not_copied(self):
+        bundle = self._prepare()
+        meta = json.loads((bundle / "meta.json").read_text(encoding="utf-8"))
+        self.assertIn("Sources/Deleted.swift", meta["changed_files"])
+        self.assertEqual(meta["deleted_files"], ["Sources/Deleted.swift"])
+        self.assertFalse((bundle / "files/Sources/Deleted.swift").exists())
+        marker = bundle / "files/Sources/Deleted.swift.deleted"
+        self.assertTrue(marker.is_file())
+        self.assertIn(self.head, marker.read_text(encoding="utf-8"))
+
+    def test_context_lists_changed_files_and_related_tests(self):
+        bundle = self._prepare()
+        imports = (bundle / "context/imports.md").read_text(encoding="utf-8")
+        for path in self.changed:
+            with self.subTest(path=path):
+                self.assertIn(f"`{path}`", imports)
+        self.assertIn("`Tests/WidgetTests.swift`", imports)
+        self.assertIn("`Tools/dispatcher/tests/test_dispatcher.py`", imports)
+        self.assertNotIn("Sources/Unrelated.swift", imports)
+        self.assertIn("Bundle 不包含完整仓库副本", imports)
+
+    def test_tests_json_records_status_and_redacts_secrets(self):
+        output = (
+            "GITHUB_TOKEN=ghp_" + "a" * 30 + "\n"
+            "Authorization: Bearer abcdefghijklmnop\n"
+            "Ran 1 test\nOK"
+        )
+        bundle = self._prepare(test_result=self._test_result(output=output))
+        raw = (bundle / "tests.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+        self.assertEqual(data["status"], "passed")
+        self.assertEqual(data["command"], "make test-dispatcher")
+        self.assertTrue(data["redacted"])
+        self.assertIn("[REDACTED]", data["output"])
+        self.assertNotIn("ghp_", raw)
+        self.assertNotIn("abcdefghijklmnop", raw)
+
+    def test_policy_contains_review_policy_and_code_review_summary(self):
+        bundle = self._prepare()
+        policy = (bundle / "policy.md").read_text(encoding="utf-8")
+        self.assertIn(dispatcher.REVIEW_POLICY.splitlines()[0], policy)
+        self.assertIn("docs/code-review.md", policy)
+        self.assertIn("P1", policy)
+        self.assertIn("2000 行", policy)
+
+    def test_stale_bundle_is_removed_before_rebuild(self):
+        bundle = self.reviews / f"review-127-{self.head[:8]}"
+        bundle.mkdir(parents=True)
+        (bundle / "stale.txt").write_text("stale", encoding="utf-8")
+        prepared = self._prepare()
+        self.assertEqual(prepared, bundle)
+        self.assertFalse((bundle / "stale.txt").exists())
+        self.assertTrue((bundle / "meta.json").is_file())
+
+    def test_failure_removes_partial_bundle(self):
+        missing = "deadbeef"
+        with self.assertRaises(dispatcher.ReviewBundleError):
+            self._prepare(head_sha=missing)
+        self.assertFalse((self.reviews / f"review-127-{missing}").exists())
+
+    def test_diff_path_traversal_is_rejected(self):
+        diff = (
+            "diff --git a/../evil b/../evil\n"
+            "--- a/../evil\n"
+            "+++ b/../evil\n"
+            "@@ -1 +1 @@\n"
+            "+x\n"
+        )
+        with self.assertRaises(dispatcher.ReviewBundleError):
+            self._prepare(diff=diff)
+        self.assertFalse((self.reviews / f"review-127-{self.head[:8]}").exists())
+
+    def test_bundle_env_stops_git_discovery(self):
+        bundle = self.repo / ".agent/reviews/review-127-abcdef12"
+        bundle.mkdir(parents=True)
+        env = os.environ.copy()
+        env.pop("GIT_DIR", None)
+        env.pop("GIT_WORK_TREE", None)
+        env.update(dispatcher.review_bundle_env(bundle))
+        completed = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=bundle,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("not a git repository", completed.stderr)
 
 
 class SetStatusTests(unittest.TestCase):
@@ -4014,6 +4342,34 @@ class LoopAgentTraceTests(unittest.TestCase):
         end = next(event for event in events if event["event"] == "agent_end")
         self.assertEqual((start["step"], start["details"]["role"]), ("review", "reviewer"))
         self.assertEqual((end["step"], end["details"]["pr"]), ("review", 9))
+
+    def test_run_review_agent_uses_bundle_cwd_and_env(self):
+        bundle = self.root / "bundle"
+        bundle.mkdir()
+        script = (
+            "import os; print(os.getcwd()); "
+            "print(os.environ.get('GIT_CEILING_DIRECTORIES', ''))"
+        )
+        with (
+            mock.patch.object(
+                dispatcher,
+                "agent_command",
+                return_value=[sys.executable, "-c", script],
+            ),
+            mock.patch.object(dispatcher, "load_agent_secrets"),
+        ):
+            text, code = dispatcher.run_review_agent(
+                "prompt",
+                self.root / "review-10",
+                1,
+                cwd=str(bundle),
+                env_overrides={
+                    "GIT_CEILING_DIRECTORIES": str(bundle.resolve().parent)
+                },
+            )
+        self.assertEqual(code, 0)
+        self.assertIn(str(bundle.resolve()), text)
+        self.assertIn(str(bundle.resolve().parent), text)
 
     def test_repair_child_events_reuse_parent_loop(self):
         parent = dispatcher.LoopTrace(loop_id="20260101T000000-abcdef12")
