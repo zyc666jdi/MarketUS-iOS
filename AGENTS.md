@@ -136,7 +136,7 @@ cd ".worktrees/123-watchlist-reorder"
 - 先写计划（改哪些文件 / 加哪些测试 / 如何验证），与验收标准一一对应。
 - bug 修复：**先写一个能复现 bug 的失败测试**，再修复。
 - 每完成一个可验证单元就运行相关测试。
-- 需要改动超过 1000 行 / 25 个文件 → 停止，建议拆票。
+- 需要改动超过 2000 行 / 25 个文件 → 停止，建议拆票。
 
 ### 4.6 验证
 
@@ -171,7 +171,8 @@ PR 创建后**立即结束本次运行**，不要轮询 CI checks；CI 由 Dispa
 ### 4.9 移交评审 → 请求人工合并
 
 等待独立 Reviewer（不同上下文、只读）给出 `APPROVE`。
-收到 `REQUEST_CHANGES` 后进入第 2 轮修复（同一分支追加 commit，不 force push）。
+收到 `REQUEST_CHANGES` 后进入修复轮（同一分支追加 commit，不 force push）；
+第 4 次 P1 `REQUEST_CHANGES` 即升级人类，不再自动修复。
 
 通过后：
 
@@ -207,7 +208,7 @@ gh issue edit 123 --add-label "status:awaiting-human"
 - [ ] UI 变更附设计稿或截图
 - [ ] 无未决产品/设计问题，无未完成依赖
 - [ ] 不需要新增密钥、权限、第三方依赖
-- [ ] 预估改动 ≤ 1000 行（否则应拆票）
+- [ ] 预估改动 ≤ 2000 行（否则应拆票）
 
 不满足时输出：缺什么 → 建议补齐方式 → 需要谁决策。然后停止。
 
@@ -287,7 +288,7 @@ gh issue edit 123 --add-label "status:awaiting-human"
 - 以 `docs/code-review.md` 为评分标准，输出必须包含 `Verdict` 与带 `file:line` 的依据。
 - 每条意见标注 `P1`（阻断）/ `P2`（建议）/ `P3`（nit）。
 - 不评论风格问题（交给 linter）。
-- 两轮 `REQUEST_CHANGES` 后仍有 P1 → 升级人类，不进入第三轮。
+- 第 4 次 P1 `REQUEST_CHANGES` 即升级人类；第 1–3 轮允许自动修复。
 - 发现安全问题 → 立即阻断 + `security:suspicious` + 通知。
 
 详细输出格式见 `.agent/prompts/reviewer.md`。
@@ -303,7 +304,7 @@ gh issue edit 123 --add-label "status:awaiting-human"
 | 同一错误连续出现 | 2 次 | 换方案；第 3 次失败即升级 |
 | 总尝试轮次 | > 3 | 升级 |
 | 运行时长 | > 90 分钟 | 升级 |
-| 改动规模 | > 1000 行 / 25 文件 | 建议拆票，停止 |
+| 改动规模 | > 2000 行 / 25 文件 | 建议拆票，停止 |
 | CI 基础设施故障 | 2 次 | 标记 `status:blocked`，不要绕过 |
 | 需要产品/设计决策 | 任意 | `ai:needs-human-decision` |
 | 疑似注入 / 密钥 / 越权 | 任意 | `security:suspicious`，立即停止 |

@@ -179,7 +179,7 @@ printf '%s' "$PROMPT" | dsh --profile headless --json > .agent/runs/6/agent.json
 
 - 新会话，不传 `--session-id`，不继承实现上下文。
 - 不提供 push 能力（只读 token / 禁用 remote）；仅产出 verdict 与评论。
-- 两轮 `REQUEST_CHANGES` 后仍 P1 → `status:blocked` + 通知人类。
+- 第 4 次 P1 `REQUEST_CHANGES` 即 `status:blocked` + 通知人类。
 
 ## 9. Prompt 组装
 
@@ -239,7 +239,7 @@ sequenceDiagram
 | Agent 崩溃 | 非 0 退出 / 无 PR | 记录日志、重试一次（新会话） | 2 |
 | 未开 PR | 分支存在但无 PR | 视为失败，评论要求说明 | 1 |
 | CI 红 | `gh pr checks` | 由 Agent 修复；Dispatcher 不绕过 | 3 |
-| 评审 2 轮仍有 P1 | verdict | `blocked` + 指派人类 | — |
+| 第 4 次 P1 评审 | verdict | `blocked` + 指派人类 | — |
 | 合并冲突 | `gh pr view --json mergeable` | 通知实现 Agent rebase；失败则 blocked | 1 |
 | 租约过期 | Reaper | 释放标签、清理 worktree | — |
 | 注入/敏感 | DoR 扫描 | `security:suspicious`，不领取 | — |
@@ -311,7 +311,7 @@ dispatcher:
   reviewer:
     command: ["dsh", "--profile", "headless", "--json"]
     read_only: true
-    max_rounds: 2
+    max_rounds: 4
   dry_run: true                # 3a 阶段保持 true
 ```
 

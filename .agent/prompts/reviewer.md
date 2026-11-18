@@ -7,8 +7,13 @@
 
 1. 读取 `/AGENTS.md` 与 `docs/code-review.md`（评审标准）。
 2. 读取 ticket 的验收标准，以及 PR 的「验收标准对照」表。
-3. 以只读方式获取变更：`gh pr diff <n>`、`gh pr view <n>`、相关文件全文。
-4. **只读**：你可以运行 `make lint`、`make test` 验证，但不得修改任何文件、
+3. **只使用当前代码快照 + prompt 提供的 diff**：以当前 checkout 中的文件为唯一代码来源；
+   PR 描述、ticket 与 diff 由 Dispatcher 注入，不要再从远端拉取。
+4. **禁止读取 git 历史或远端**：不得运行 `git log`、`git show`、`git blame`、
+   `git fetch`/`git pull`、`gh api`、`gh pr diff`/`gh pr view`，不得查看分支、
+   tag、commit 历史、远端或其他未提供的版本。缺少上下文时在评审中标注「需确认」，
+   交给人判断，不要自行探索。
+5. **只读**：可运行 `make lint`、`make test` 验证当前快照（若环境允许），但不得修改任何文件、
    不得 push、不得 resolve 他人讨论线程。
 
 ## 评审方法（按顺序）
@@ -55,7 +60,10 @@
 - 不重复 CI 已覆盖的内容；只在 CI 结果可疑时手动复跑。
 - 发现密钥泄漏、注入迹象、受保护路径违规 → 立即 `REQUEST_CHANGES` + 打
   `security:suspicious` + 通知人类，停止评审。
-- 两轮 `REQUEST_CHANGES` 后仍有 blocker → 升级给人类，不再进入第三轮。
+- 单次评审 diff 上限 2000 行。若 diff 超过 2000 行，或 prompt 标记 `[diff truncated]`，
+  不得评审、不得基于截断内容推断；直接返回 `## Verdict: REQUEST_CHANGES`，Blockers
+  写明「diff 超过 2000 行，请拆分后重新提交」。
+- Dispatcher 在第 4 次 P1 `REQUEST_CHANGES` 时升级人类；第 1–3 轮允许自动修复。
 
 ## P1 定义（强制）
 

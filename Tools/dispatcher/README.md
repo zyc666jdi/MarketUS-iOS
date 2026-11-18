@@ -124,7 +124,7 @@ launchctl bootout gui/$UID/com.marketus.dispatcher        # 停止
 Reviewer 给出 `REQUEST_CHANGES` 后，下一轮 `run` 会在后台启动 `repair --pr N`
 （每轮最多一个，日志追加到 `.agent/runs/repair-N.out`）：
 Implementer 在 PR 分支的临时 worktree 修复、push，issue 回到 `status:in-review`。
-每个 PR 最多 2 轮；仍失败则 `status:blocked` 并发送通知。PR 创建/修复本身不通知，
+每个 PR 最多 4 轮修复；仍失败则 `status:blocked` 并发送通知。PR 创建/修复本身不通知，
 只有 Reviewer APPROVE 后才通知合并。
 
 review 与 repair 使用各自独立的 per-PR 锁（`.agent/state/review-N.lock` /
