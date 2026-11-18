@@ -2170,7 +2170,7 @@ def run_review_tests(snapshot: Path) -> ReviewTestResult:
                 "（不阻塞评审、不判定为 P1）。"
             )
             return ReviewTestResult(
-                "environment", command_text, f"{note}\n{output[-3800:]}"
+                "environment", command_text, f"{output[-3600:]}\n\n{note}"
             )
         return ReviewTestResult("failed", command_text, output[-4000:])
     return ReviewTestResult("passed", command_text, output[-4000:])
