@@ -2486,8 +2486,11 @@ def cmd_postmerge(args: argparse.Namespace) -> int:
         if updated:
             changed += 1
         # Only a fully processed PR moves the cursor, so a crash or GitHub error
-        # leaves the same PR in the next window for an idempotent retry.
-        cursor = _advance_postmerge_cursor(pr, cursor)
+        # leaves the same PR in the next window for an idempotent retry. The
+        # explicit dry-run guard keeps this true even if the block above is
+        # reordered later.
+        if not args.dry_run:
+            cursor = _advance_postmerge_cursor(pr, cursor)
     if skipped:
         print(f"postmerge: skipped {skipped} already-processed PR(s)")
     print(f"postmerge: {changed} issue(s) updated")
@@ -2842,9 +2845,10 @@ def watch_pr_signature(pr: dict[str, Any], detail: dict[str, Any]) -> dict[str, 
 def watch_signature_is_fresh(cached: Any, pr: dict[str, Any]) -> bool:
     """Return True when the cache allows skipping the PR detail/CI call.
 
-    A missing or legacy entry forces a fetch. A rollup with in-flight checks
-    also forces a fetch: CI can finish without headRefOid or updatedAt moving,
-    so only settled signatures are safe to reuse.
+    A missing or legacy entry forces a fetch. A rollup with in-flight checks or
+    an empty rollup also forces a fetch: CI can finish (or checks can register)
+    without headRefOid or updatedAt moving, so only non-empty settled
+    signatures are safe to reuse.
     """
     if not isinstance(cached, dict):
         return False
@@ -2852,6 +2856,8 @@ def watch_signature_is_fresh(cached: Any, pr: dict[str, Any]) -> bool:
         if str(cached.get(key) or "") != str(pr.get(key) or ""):
             return False
     if cached.get("ciPending"):
+        return False
+    if not str(cached.get("ci") or ""):
         return False
     if str(cached.get("mergeable") or "") in ("", "UNKNOWN"):
         return False
@@ -2882,8 +2888,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     """跟踪 ai/* PR 的创建/合并/关闭/冲突/CI 失败，去重通知。
 
     ``pr-watch.json`` 为每个 open PR 保存 head/updatedAt/mergeState/CI 签名。
-    签名未变化时跳过 ``gh pr view`` 详情/CI 调用；没有缓存（包括旧格式）或
-    仍有 pending check 时一定重新拉取，避免漏掉合并、冲突与 CI 结果。
+    签名未变化且 CI 已稳定非空时跳过 ``gh pr view`` 详情/CI 调用；没有缓存
+    （包括旧格式）、CI 为空、仍有 pending check，或上一轮详情读取失败（retry）
+    时一定重新拉取，避免漏掉合并、冲突与 CI 结果。
 
     ``dry_run`` 时只打印计划：不更新远端分支、不评论、不改 issue 状态，也不写
     本地 watch 状态，保证 ``run --dry-run`` 是纯预览。
@@ -2909,6 +2916,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
         {item for item in raw_handled if isinstance(item, str)}
         if isinstance(raw_handled, list) else set()
     )
+    raw_retry = state.get("retry", [])
+    retry = (
+        {
+            str(item)
+            for item in raw_retry
+            if isinstance(item, (str, int)) and not isinstance(item, bool)
+        }
+        if isinstance(raw_retry, list) else set()
+    )
     initialized = bool(known)
     slug = ""
 
@@ -2922,6 +2938,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         prs = []
     events: list[tuple[str, str, str]] = []
     current: dict[str, dict[str, Any]] = {}
+    failed_retry: set[str] = set()
     for pr in prs:
         if not isinstance(pr, dict):
             continue
@@ -2934,7 +2951,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
         if watch_signature_is_fresh(cached, pr):
             signature = cached
         else:
-            detail = gh_json(["pr", "view", n, "--json", WATCH_DETAIL_FIELDS])
+            try:
+                detail = gh_json(["pr", "view", n, "--json", WATCH_DETAIL_FIELDS])
+            except SystemExit:
+                print(f"watch: 无法读取 PR #{n} 详情，本轮不缓存该 PR")
+                # Do not cache a signature from a failed call. Remember the PR
+                # in ``retry`` so the next sweep retries it without treating it
+                # as newly created.
+                failed_retry.add(n)
+                continue
             if not isinstance(detail, dict):
                 detail = {}
             signature = watch_pr_signature(pr, detail)
@@ -2942,7 +2967,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         mergeable = str(signature.get("mergeable") or "")
         merge_state = str(signature.get("mergeStateStatus") or "")
         failed_checks = int(signature.get("failedChecks") or 0)
-        if initialized and n not in known:
+        if initialized and n not in known and n not in retry:
             events.append(("MarketUS PR 已创建", f"#{n} {pr['title']}", f"created:{n}"))
         if mergeable == "CONFLICTING":
             key = f"conflict:{n}:{sha}"
@@ -3019,7 +3044,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if not dry_run:
         _write_state_file(
             state_path,
-            {"known": current, "notified": sorted(notified), "handled": sorted(handled)},
+            {
+                "known": current,
+                "notified": sorted(notified),
+                "handled": sorted(handled),
+                "retry": sorted(failed_retry),
+            },
         )
     return 0
 

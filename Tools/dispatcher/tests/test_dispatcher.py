@@ -1847,6 +1847,45 @@ class PostmergeCursorTests(IsolatedStateTestCase):
         detail.assert_called_once_with(500)
         self.assertFalse(dispatcher.postmerge_cursor_path().exists())
 
+    def test_dry_run_does_not_call_cursor_advance(self):
+        pr = self._pr(503, "2026-02-02T00:00:00Z", issue=502)
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "gh_json", return_value=[pr]),
+                mock.patch.object(
+                    dispatcher,
+                    "issue_detail",
+                    return_value={"number": 502, "labels": [{"name": "status:done"}]},
+                ),
+                mock.patch.object(dispatcher, "_advance_postmerge_cursor") as advance,
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+            ):
+                code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=True))
+        self.assertEqual(code, 0)
+        advance.assert_not_called()
+        self.assertFalse(dispatcher.postmerge_cursor_path().exists())
+
+    def test_dry_run_does_not_advance_cursor_without_linked_issue(self):
+        pr = {
+            "number": 504,
+            "title": "no issue",
+            "body": "",
+            "headRefName": "feature/no-issue",
+            "url": "https://example/pr/504",
+            "labels": [],
+            "mergedAt": "2026-02-03T00:00:00Z",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "gh_json", return_value=[pr]),
+                mock.patch.object(dispatcher, "_advance_postmerge_cursor") as advance,
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+            ):
+                code = dispatcher.cmd_postmerge(argparse.Namespace(dry_run=True))
+        self.assertEqual(code, 0)
+        advance.assert_not_called()
+        self.assertFalse(dispatcher.postmerge_cursor_path().exists())
+
     def test_cursor_round_trips_without_temp_files(self):
         dispatcher._write_postmerge_cursor("2026-03-01T12:00:00Z", 601)
         self.assertEqual(
@@ -2811,10 +2850,12 @@ class WatchTests(IsolatedStateTestCase):
         update_rc=0,
         details: dict[int, dict] | None = None,
         terminal: dict[int, str] | None = None,
+        detail_errors: set[int] | None = None,
         calls: list[list[str]] | None = None,
     ):
         detail_map = dict(details or {})
         terminal_map = dict(terminal or {})
+        error_numbers = set(detail_errors or ())
 
         def fake_json(args):
             if calls is not None:
@@ -2823,6 +2864,8 @@ class WatchTests(IsolatedStateTestCase):
                 return prs
             if args[:2] == ["pr", "view"]:
                 number = int(args[2])
+                if number in error_numbers:
+                    raise SystemExit(f"detail for #{number} failed")
                 if number in terminal_map:
                     return {"state": terminal_map[number], "title": "test PR", "url": ""}
                 for pr in prs:
@@ -2994,6 +3037,60 @@ class WatchTests(IsolatedStateTestCase):
         self.assertTrue(any(args[:2] == ["pr", "view"] for args in calls))
         notify.assert_called_once()
         self.assertIn("CI 失败", notify.call_args.args[0])
+
+    def test_detail_failure_skips_cache_and_continues_scan(self):
+        prs = [
+            watch_pr(91, merge_state="CLEAN"),
+            watch_pr(92, merge_state="CLEAN", checks=ci_checks()),
+        ]
+        calls: list[list[str]] = []
+        code, _, _, _, _, _, _ = self._watch(prs, detail_errors={91}, calls=calls)
+        self.assertEqual(code, 0)
+        state = json.loads((dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8"))
+        self.assertNotIn("91", state["known"])
+        self.assertEqual(state["retry"], ["91"])
+        self.assertEqual(state["known"]["92"]["ci"], "CI:COMPLETED:SUCCESS")
+        self.assertTrue(any(args[:3] == ["pr", "view", "91"] for args in calls))
+        self.assertTrue(any(args[:3] == ["pr", "view", "92"] for args in calls))
+
+        # The failed PR is not cached, so the next sweep retries it while the
+        # successfully scanned PR stays on its cached signature. ``retry``
+        # prevents a false "PR created" notification for the failed PR.
+        retry_calls: list[list[str]] = []
+        _, _, _, _, retry_notify, _, _ = self._watch(prs, calls=retry_calls)
+        self.assertTrue(any(args[:3] == ["pr", "view", "91"] for args in retry_calls))
+        self.assertFalse(any(args[:3] == ["pr", "view", "92"] for args in retry_calls))
+        retry_notify.assert_not_called()
+        retry_state = json.loads(
+            (dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("91", retry_state["known"])
+        self.assertEqual(retry_state["retry"], [])
+
+    def test_empty_ci_rollup_is_refetched_not_cached_as_settled(self):
+        pr = watch_pr(merge_state="CLEAN", checks=[])
+        self._watch([pr])
+        state = json.loads((dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["known"]["91"]["ci"], "")
+        calls: list[list[str]] = []
+        detail = {
+            "number": 91,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": ci_checks("FAILURE"),
+        }
+        _, _, _, _, notify, _, _ = self._watch([pr], details={91: detail}, calls=calls)
+        self.assertTrue(any(args[:2] == ["pr", "view"] for args in calls))
+        notify.assert_called_once()
+        self.assertIn("CI 失败", notify.call_args.args[0])
+
+    def test_empty_ci_signature_is_not_fresh(self):
+        pr = watch_pr(merge_state="CLEAN", checks=[])
+        signature = dispatcher.watch_pr_signature(
+            pr, {"mergeable": "MERGEABLE", "statusCheckRollup": []}
+        )
+        self.assertEqual(signature["ci"], "")
+        self.assertFalse(dispatcher.watch_signature_is_fresh(signature, pr))
 
     def test_pr_without_cached_signature_fetches_detail(self):
         dispatcher.STATE_ROOT.mkdir(parents=True, exist_ok=True)
