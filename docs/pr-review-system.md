@@ -1,7 +1,8 @@
 # PR Review 系统设计
 
-> 状态：v1 草案  
-> 适用仓库：MarketUS-iOS  
+> 状态：v1 草案
+>
+> 适用仓库：MarketUS-iOS
 > 上位契约：`AGENTS.md`。本文只收紧评审流程，不改变“Agent 永不合并”的红线。
 
 ## 1. 目标与非目标
