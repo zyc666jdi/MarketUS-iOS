@@ -3038,34 +3038,69 @@ class WatchTests(IsolatedStateTestCase):
         notify.assert_called_once()
         self.assertIn("CI 失败", notify.call_args.args[0])
 
-    def test_detail_failure_skips_cache_and_continues_scan(self):
+    def test_detail_failure_keeps_fallback_and_continues_scan(self):
         prs = [
             watch_pr(91, merge_state="CLEAN"),
             watch_pr(92, merge_state="CLEAN", checks=ci_checks()),
         ]
         calls: list[list[str]] = []
-        code, _, _, _, _, _, _ = self._watch(prs, detail_errors={91}, calls=calls)
+        code, _, _, _, first_notify, _, _ = self._watch(prs, detail_errors={91}, calls=calls)
         self.assertEqual(code, 0)
+        first_notify.assert_not_called()
         state = json.loads((dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8"))
-        self.assertNotIn("91", state["known"])
+        self.assertEqual(state["known"]["91"], "OPEN")
         self.assertEqual(state["retry"], ["91"])
         self.assertEqual(state["known"]["92"]["ci"], "CI:COMPLETED:SUCCESS")
         self.assertTrue(any(args[:3] == ["pr", "view", "91"] for args in calls))
         self.assertTrue(any(args[:3] == ["pr", "view", "92"] for args in calls))
 
-        # The failed PR is not cached, so the next sweep retries it while the
-        # successfully scanned PR stays on its cached signature. ``retry``
-        # prevents a false "PR created" notification for the failed PR.
+        # The next sweep retries the failed PR while the successfully scanned
+        # PR stays on its cached signature. The fallback was never announced,
+        # so the first successful retry emits exactly one created event.
         retry_calls: list[list[str]] = []
         _, _, _, _, retry_notify, _, _ = self._watch(prs, calls=retry_calls)
         self.assertTrue(any(args[:3] == ["pr", "view", "91"] for args in retry_calls))
         self.assertFalse(any(args[:3] == ["pr", "view", "92"] for args in retry_calls))
-        retry_notify.assert_not_called()
+        retry_notify.assert_called_once()
+        self.assertEqual(retry_notify.call_args.args[0], "MarketUS PR 已创建")
         retry_state = json.loads(
             (dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8")
         )
-        self.assertIn("91", retry_state["known"])
+        self.assertIsInstance(retry_state["known"]["91"], dict)
         self.assertEqual(retry_state["retry"], [])
+
+        _, _, _, _, third_notify, _, _ = self._watch(prs)
+        third_notify.assert_not_called()
+
+    def test_detail_failure_keeps_fallback_for_merged_transition(self):
+        pr = watch_pr(91, merge_state="CLEAN")
+        self._watch([pr], detail_errors={91})
+        state = json.loads((dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["known"]["91"], "OPEN")
+
+        # The PR merges before the next open-PR list. The fallback entry must
+        # keep it visible to the terminal scan so postmerge still runs.
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "cmd_postmerge") as postmerge,
+            contextlib.redirect_stdout(output),
+        ):
+            self._watch([], terminal={91: "MERGED"})
+        postmerge.assert_called_once()
+        self.assertIn("merged PR #91: running postmerge", output.getvalue())
+
+    def test_created_event_is_emitted_once_on_retry_recovery(self):
+        pr = watch_pr(91, merge_state="CLEAN", checks=ci_checks())
+        self._watch([pr], detail_errors={91})
+        _, _, _, _, notify, _, _ = self._watch([pr])
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.args[0], "MarketUS PR 已创建")
+        state = json.loads((dispatcher.STATE_ROOT / "pr-watch.json").read_text(encoding="utf-8"))
+        self.assertIn("91", state["known"])
+        self.assertEqual(state["retry"], [])
+
+        _, _, _, _, third_notify, _, _ = self._watch([pr])
+        third_notify.assert_not_called()
 
     def test_empty_ci_rollup_is_refetched_not_cached_as_settled(self):
         pr = watch_pr(merge_state="CLEAN", checks=[])

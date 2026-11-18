@@ -2937,7 +2937,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if not isinstance(prs, list):
         prs = []
     events: list[tuple[str, str, str]] = []
-    current: dict[str, dict[str, Any]] = {}
+    current: dict[str, Any] = {}
     failed_retry: set[str] = set()
     for pr in prs:
         if not isinstance(pr, dict):
@@ -2954,10 +2954,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
             try:
                 detail = gh_json(["pr", "view", n, "--json", WATCH_DETAIL_FIELDS])
             except SystemExit:
-                print(f"watch: 无法读取 PR #{n} 详情，本轮不缓存该 PR")
-                # Do not cache a signature from a failed call. Remember the PR
-                # in ``retry`` so the next sweep retries it without treating it
-                # as newly created.
+                print(f"watch: 无法读取 PR #{n} 详情，保留 fallback 并在下一轮重试")
+                # Keep the PR in current/known even without a detail signature:
+                # if it merges before the next list it must still reach the
+                # terminal scan. A string marks it as a fallback, never a fresh
+                # cache, so the next sweep fetches the detail again.
+                current[n] = cached if isinstance(cached, dict) else "OPEN"
                 failed_retry.add(n)
                 continue
             if not isinstance(detail, dict):
@@ -2967,7 +2969,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
         mergeable = str(signature.get("mergeable") or "")
         merge_state = str(signature.get("mergeStateStatus") or "")
         failed_checks = int(signature.get("failedChecks") or 0)
-        if initialized and n not in known and n not in retry:
+        known_entry = known.get(n)
+        was_cached = isinstance(known_entry, dict) and "mergeable" in known_entry
+        if n not in known and initialized and n not in retry:
+            events.append(("MarketUS PR 已创建", f"#{n} {pr['title']}", f"created:{n}"))
+        elif n in retry and not was_cached:
+            # First seen while its detail call failed: announce it once on the
+            # first successful retry. A real previous signature means it was
+            # already announced and must not be repeated.
             events.append(("MarketUS PR 已创建", f"#{n} {pr['title']}", f"created:{n}"))
         if mergeable == "CONFLICTING":
             key = f"conflict:{n}:{sha}"
