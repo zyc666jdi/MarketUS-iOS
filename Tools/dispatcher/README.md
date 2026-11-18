@@ -88,14 +88,19 @@ GitHub 不允许 approve 自己的 PR，所以 Dispatcher 用 **评论 verdict +
 
 ### 独立测试执行
 
-`review` 会在 PR head 的临时 worktree 中运行 `make test-dispatcher`：
+`review` 会把 PR head 的跟踪文件导出到 `.agent/reviews/review-<pr>-<shortsha>`，
+并在该快照中运行 `make test-dispatcher`：
 
+- 快照由 `git archive <head> | tar -x` 生成，目录内没有 `.git`；
+  `GIT_CEILING_DIRECTORIES` 阻止 Git 向上发现主仓库历史。
+- Reviewer 的 cwd 与 runner worktree 都指向快照；不需要 checkout/worktree add。
 - 默认硬超时 300s，可用 `MARKETUS_REVIEW_TEST_TIMEOUT` 覆盖（正整数秒）。
 - `MARKETUS_REVIEW_TESTS=0` 跳过执行；也接受 `false` / `no` / `off`（不区分大小写）。
   跳过时报告 `skipped by config`，CI 已覆盖 dispatcher-tests。
-- 超时、被信号终止、checkout/环境失败都记为 environment，不单独阻塞评审；
-  只有正数非零退出（测试断言失败）才是 P1。
-- `git fetch` / `git worktree add` 等 checkout 命令同样有 60s 超时和进程组清理。
+- 超时、被信号终止、快照创建/环境失败都记为 environment，不单独阻塞评审；
+  只有正数非零退出（测试断言失败）才是 P1。失败信息显示缺少 git 元数据时
+  同样按 environment 处理（快照本身没有 `.git`）。
+- 快照在评审结束（成功或失败）后清理；创建失败会先删除残留再阻塞评审。
 
 ### launchd（不会自动安装）
 
