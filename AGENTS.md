@@ -346,6 +346,7 @@ gh issue edit 123 --add-label "status:awaiting-human"
 | ticket 字段、DoR、标签 | `docs/ticket-protocol.md` |
 | 分支/提交/PR 细则 | `docs/git-conventions.md` |
 | 评审标准与清单 | `docs/code-review.md` |
+| PR Review 系统（L0/L1/L2、Review Bundle、权限、指标） | `docs/pr-review-system.md` |
 | 谁能合并、怎么请求合并 | `docs/merge-policy.md` |
 | 测试策略与覆盖率 | `docs/testing-strategy.md` |
 | CI 流水线与必需检查 | `docs/ci-cd.md` |
