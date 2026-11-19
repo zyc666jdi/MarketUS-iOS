@@ -2179,6 +2179,7 @@ class CmdOnceStatusTests(unittest.TestCase):
                 mock.patch.object(dispatcher, "build_prompt", return_value="prompt"),
                 mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
+                mock.patch.object(dispatcher, "clean_issue_worktree", return_value=""),
                 mock.patch.object(
                     dispatcher,
                     "prepare_issue_worktree",
@@ -2191,6 +2192,46 @@ class CmdOnceStatusTests(unittest.TestCase):
                 code = dispatcher.cmd_once(argparse.Namespace(issue=40, execute=True, timeout=90))
         self.assertEqual(code, 1)
         self.assertEqual(status_after(labels, calls), {"status:blocked"})
+
+    def test_existing_unsafe_worktree_fails_before_claim_with_reason(self):
+        labels = {"type:feature", "area:infrastructure", "priority:p1", "risk:low", "status:ready"}
+        issue = {
+            "number": 40,
+            "title": "test",
+            "body": VALID_BODY,
+            "labels": [{"name": name} for name in labels],
+            "state": "open",
+            "author_association": "OWNER",
+        }
+        calls = []
+        output = io.StringIO()
+        reason = (
+            "worktree .worktrees/40-test 有未提交改动，"
+            "保留以避免丢失 Agent 工作"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+                mock.patch.object(dispatcher, "build_prompt", return_value="prompt"),
+                mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
+                mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(dispatcher, "load_agent_secrets"),
+                mock.patch.object(
+                    dispatcher, "clean_issue_worktree", return_value=reason
+                ),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+                mock.patch.object(dispatcher, "comment"),
+                mock.patch.object(dispatcher, "notify"),
+                contextlib.redirect_stdout(output),
+            ):
+                code = dispatcher.cmd_once(
+                    argparse.Namespace(issue=40, execute=True, timeout=90)
+                )
+        self.assertEqual(code, 1)
+        self.assertIn("不可安全复用", output.getvalue())
+        self.assertIn("未提交改动", output.getvalue())
+        self.assertEqual(calls, [])
 
     def test_gh_pr_list_failure_includes_stderr_in_output(self):
         labels = {
@@ -2221,6 +2262,7 @@ class CmdOnceStatusTests(unittest.TestCase):
                 mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/true"),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
                 mock.patch.object(dispatcher, "prepare_issue_worktree", return_value=""),
+                mock.patch.object(dispatcher, "clean_issue_worktree", return_value=""),
                 mock.patch.object(
                     dispatcher,
                     "run_agent_streaming",
@@ -3468,6 +3510,7 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
                 mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
                 mock.patch.object(dispatcher, "prepare_issue_worktree", return_value=""),
+                mock.patch.object(dispatcher, "clean_issue_worktree", return_value=""),
                 mock.patch.object(
                     dispatcher,
                     "run",
@@ -3862,6 +3905,301 @@ class PrepareIssueWorktreeTests(unittest.TestCase):
         self.assertIn("git fetch 失败", error)
         self.assertIn("connection reset", error)
         self.assertFalse(any(command[:3] == ["git", "worktree", "add"] for command in calls))
+
+    def test_existing_clean_worktree_is_removed_and_recreated(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "40-test"
+            worktree.mkdir()
+
+            def fake_run(command):
+                calls.append(command)
+                if command[:2] == ["git", "fetch"]:
+                    return self.completed()
+                if command[:3] == ["git", "-C", str(worktree)]:
+                    if "rev-parse" in command:
+                        return self.completed(0, "ai/40-test\n")
+                    return self.completed(0, "", "")
+                if command[:2] == ["git", "rev-list"]:
+                    return self.completed(0, "0\n")
+                return self.completed()
+
+            with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+                error = dispatcher.prepare_issue_worktree("ai/40-test", worktree)
+
+        self.assertEqual(error, "")
+        remove = ["git", "worktree", "remove", str(worktree), "--force"]
+        delete = ["git", "branch", "-D", "ai/40-test"]
+        add = ["git", "worktree", "add", str(worktree), "-b", "ai/40-test", "origin/main"]
+        self.assertLess(calls.index(remove), calls.index(delete))
+        self.assertLess(calls.index(delete), calls.index(add))
+
+    def test_existing_dirty_worktree_is_preserved_with_reason(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "40-test"
+            worktree.mkdir()
+
+            def fake_run(command):
+                calls.append(command)
+                if command[:2] == ["git", "fetch"]:
+                    return self.completed()
+                if command[:3] == ["git", "-C", str(worktree)]:
+                    if "rev-parse" in command:
+                        return self.completed(0, "ai/40-test\n")
+                    return self.completed(0, " M App/main.swift\n")
+                return self.completed()
+
+            with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+                error = dispatcher.prepare_issue_worktree("ai/40-test", worktree)
+
+        self.assertIn("未提交改动", error)
+        self.assertFalse(any(command[:3] == ["git", "worktree", "add"] for command in calls))
+        self.assertFalse(any(command[:3] == ["git", "branch", "-D"] for command in calls))
+
+    def test_existing_worktree_with_unmerged_commits_is_preserved(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "40-test"
+            worktree.mkdir()
+
+            def fake_run(command):
+                calls.append(command)
+                if command[:2] == ["git", "fetch"]:
+                    return self.completed()
+                if command[:3] == ["git", "-C", str(worktree)]:
+                    if "rev-parse" in command:
+                        return self.completed(0, "ai/40-test\n")
+                    return self.completed(0, "", "")
+                if command[:2] == ["git", "rev-list"]:
+                    return self.completed(0, "2\n")
+                return self.completed()
+
+            with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+                error = dispatcher.prepare_issue_worktree("ai/40-test", worktree)
+
+        self.assertIn("2 个未合并提交", error)
+        self.assertFalse(any(command[:3] == ["git", "worktree", "add"] for command in calls))
+        self.assertFalse(any(command[:3] == ["git", "worktree", "remove"] for command in calls))
+
+    def test_preflight_clean_worktree_does_not_mutate(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "40-test"
+            worktree.mkdir()
+
+            def fake_run(command):
+                calls.append(command)
+                if command[:3] == ["git", "-C", str(worktree)]:
+                    if "rev-parse" in command:
+                        return self.completed(0, "ai/40-test\n")
+                    return self.completed(0, "", "")
+                if command[:2] == ["git", "rev-list"]:
+                    return self.completed(0, "0\n")
+                return self.completed()
+
+            with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+                error = dispatcher.clean_issue_worktree(
+                    "ai/40-test", worktree, remove=False
+                )
+
+        self.assertEqual(error, "")
+        self.assertFalse(any(command[:3] == ["git", "worktree", "remove"] for command in calls))
+        self.assertFalse(any(command[:3] == ["git", "branch", "-D"] for command in calls))
+
+    def test_existing_worktree_on_a_different_branch_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "40-test"
+            worktree.mkdir()
+
+            def fake_run(command):
+                if command[:2] == ["git", "fetch"]:
+                    return self.completed()
+                if command[:3] == ["git", "-C", str(worktree)]:
+                    return self.completed(0, "main\n")
+                return self.completed()
+
+            with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+                error = dispatcher.prepare_issue_worktree("ai/40-test", worktree)
+
+        self.assertIn("当前分支为 main", error)
+        self.assertIn("保留", error)
+
+
+class SchedulerRetryRecoveryTests(unittest.TestCase):
+    """Infra requeue recovery restores role status and protects agent work."""
+
+    @staticmethod
+    def issue(*labels, state="open", title="Retry Scheduler", number=137):
+        return {
+            "number": number,
+            "title": title,
+            "state": state,
+            "labels": [{"name": name} for name in labels],
+        }
+
+    def test_implementer_cleans_worktree_and_restores_ready(self):
+        before = self.issue("status:claimed", "status:in-progress", "status:blocked")
+        after = self.issue("status:ready")
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(
+                    dispatcher, "issue_detail", side_effect=[before, after]
+                ),
+                mock.patch.object(
+                    dispatcher, "clean_issue_worktree", return_value=""
+                ) as clean,
+                mock.patch.object(
+                    dispatcher, "gh", side_effect=lambda args: calls.append(args)
+                ),
+            ):
+                result = dispatcher.recover_scheduler_retry(
+                    {"role": "implementer", "ticket": 137}
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["status"], "status:ready")
+        self.assertEqual(result["worktree_action"], "cleaned")
+        clean.assert_called_once_with(
+            "ai/137-retry-scheduler",
+            Path(tmp) / "137-retry-scheduler",
+            remove=True,
+        )
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "issue", "edit", "137",
+                    "--remove-label", "status:claimed",
+                    "--remove-label", "status:in-progress",
+                    "--remove-label", "status:blocked",
+                    "--add-label", "status:ready",
+                ]
+            ],
+        )
+
+    def test_recovery_readback_failure_is_not_reported_as_success(self):
+        before = self.issue("status:claimed")
+        after = self.issue("status:claimed")
+        with (
+            mock.patch.object(dispatcher, "issue_detail", side_effect=[before, after]),
+            mock.patch.object(dispatcher, "clean_issue_worktree", return_value=""),
+            mock.patch.object(dispatcher, "gh"),
+        ):
+            result = dispatcher.recover_scheduler_retry(
+                {"role": "implementer", "ticket": 137}
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["retryable"])
+        self.assertIn("状态恢复校验失败", result["reason"])
+        self.assertIn("status:claimed", result["reason"])
+
+    def test_dirty_worktree_is_preserved_and_status_is_untouched(self):
+        before = self.issue("status:claimed")
+        with (
+            mock.patch.object(dispatcher, "issue_detail", return_value=before),
+            mock.patch.object(
+                dispatcher,
+                "clean_issue_worktree",
+                return_value="worktree .worktrees/137-retry-scheduler 有未提交改动，保留",
+            ),
+            mock.patch.object(dispatcher, "gh") as gh,
+        ):
+            result = dispatcher.recover_scheduler_retry(
+                {"role": "implementer", "ticket": 137}
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["retryable"])
+        self.assertIn("未提交改动", result["reason"])
+        gh.assert_not_called()
+
+    def test_status_update_failure_is_reported_without_silent_success(self):
+        issue = self.issue("status:claimed")
+        with (
+            mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+            mock.patch.object(dispatcher, "clean_issue_worktree", return_value=""),
+            mock.patch.object(
+                dispatcher, "restore_issue_retry_status", side_effect=SystemExit("gh boom")
+            ),
+        ):
+            result = dispatcher.recover_scheduler_retry(
+                {"role": "implementer", "ticket": 137}
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["retryable"])
+        self.assertIn("恢复 status:ready 失败", result["reason"])
+        self.assertIn("gh boom", result["reason"])
+
+    def test_reviewer_and_repair_restore_their_role_status_without_worktree_cleanup(self):
+        cases = (
+            ("reviewer", "status:in-review"),
+            ("repair", "status:in-progress"),
+        )
+        for role, target in cases:
+            with self.subTest(role=role):
+                before = self.issue("status:claimed", "status:blocked")
+                after = self.issue(target)
+                calls = []
+                with (
+                    mock.patch.object(
+                        dispatcher, "issue_detail", side_effect=[before, after]
+                    ),
+                    mock.patch.object(dispatcher, "clean_issue_worktree") as clean,
+                    mock.patch.object(
+                        dispatcher, "gh", side_effect=lambda args: calls.append(args)
+                    ),
+                ):
+                    result = dispatcher.recover_scheduler_retry(
+                        {"role": role, "ticket": 137}
+                    )
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["status"], target)
+                self.assertEqual(result["worktree_action"], "not_applicable")
+                clean.assert_not_called()
+                self.assertIn(target, calls[0])
+                self.assertIn("status:claimed", calls[0])
+                self.assertIn("status:blocked", calls[0])
+
+    def test_advanced_status_is_not_rewound_to_ready(self):
+        issue = self.issue("status:in-review")
+        with (
+            mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+            mock.patch.object(dispatcher, "clean_issue_worktree") as clean,
+            mock.patch.object(dispatcher, "gh") as gh,
+        ):
+            result = dispatcher.recover_scheduler_retry(
+                {"role": "implementer", "ticket": 137}
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["retryable"])
+        self.assertIn("不适合自动恢复", result["reason"])
+        clean.assert_not_called()
+        gh.assert_not_called()
+
+    def test_closed_or_done_issue_is_not_reopened(self):
+        closed = self.issue("status:claimed", state="closed")
+        done = self.issue("status:done")
+        for issue in (closed, done):
+            with self.subTest(state=issue["state"], labels=issue["labels"]):
+                with (
+                    mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+                    mock.patch.object(dispatcher, "clean_issue_worktree") as clean,
+                    mock.patch.object(dispatcher, "gh") as gh,
+                ):
+                    result = dispatcher.recover_scheduler_retry(
+                        {"role": "implementer", "ticket": 137}
+                    )
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["retryable"])
+                clean.assert_not_called()
+                gh.assert_not_called()
 
 
 class PrepareRepairWorktreeTests(unittest.TestCase):
@@ -5336,6 +5674,10 @@ class SchedulerRunIntegrationTests(IsolatedStateTestCase):
         self.run_once.assert_called_once()
         self.assertIs(self.run_once.call_args.args[0], self.job_store.return_value)
         self.assertTrue(self.run_once.call_args.kwargs["execute"])
+        self.assertIs(
+            self.run_once.call_args.kwargs["recovery"],
+            dispatcher.recover_scheduler_retry,
+        )
         self.review.assert_not_called()
         self.once.assert_not_called()
         self.planner.assert_called_once()

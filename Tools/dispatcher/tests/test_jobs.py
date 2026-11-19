@@ -752,16 +752,53 @@ class JobsCliTests(JobStoreTestCase):
         store.claim("runner-a", 60, now=1000.0)
         store.finish(job["job_id"], "failed", "agent failed", owner="runner-a", now=1100.0)
 
-        code, text = self._output(
-            dispatcher.cmd_jobs_retry, argparse.Namespace(job_id=job["job_id"])
-        )
+        recovery = {
+            "ok": True,
+            "retryable": True,
+            "status": "status:ready",
+            "worktree_action": "cleaned",
+            "reason": "",
+        }
+        with mock.patch.object(
+            dispatcher, "recover_scheduler_retry", return_value=recovery
+        ):
+            code, text = self._output(
+                dispatcher.cmd_jobs_retry, argparse.Namespace(job_id=job["job_id"])
+            )
         self.assertEqual(code, 0)
         self.assertIn("-> queued", text)
+        self.assertIn("status:ready", text)
         stored = store.get_job(job["job_id"])
         self.assertEqual(stored["state"], "queued")
         self.assertEqual(stored["attempt"], 2)
         self.assertEqual(stored["error"], "")
         self.assertIsNone(stored["retry_at"])
+
+    def test_jobs_retry_refuses_unsafe_recovery_and_keeps_failed_job(self):
+        store = jobs.JobStore(self.db)
+        job = store.enqueue(
+            "implementer", 118, 46, "base000", "head111", PROMPT_HASH, now=1000.0
+        )
+        store.claim("runner-a", 60, now=1000.0)
+        store.finish(job["job_id"], "failed", "boom", owner="runner-a", now=1100.0)
+
+        recovery = {
+            "ok": False,
+            "retryable": False,
+            "reason": "worktree 有未提交改动，保留",
+        }
+        with mock.patch.object(
+            dispatcher, "recover_scheduler_retry", return_value=recovery
+        ):
+            code, text = self._output(
+                dispatcher.cmd_jobs_retry, argparse.Namespace(job_id=job["job_id"])
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("不可 retry", text)
+        self.assertIn("未提交改动", text)
+        stored = store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "failed")
+        self.assertEqual(stored["error"], "boom")
 
     def test_jobs_retry_rejects_non_retryable_and_missing_jobs(self):
         _, newer = self._seed()
@@ -789,8 +826,18 @@ class JobsCliTests(JobStoreTestCase):
         store.finish(job["job_id"], "failed", "boom", owner="runner-a", now=1100.0)
 
         output = io.StringIO()
+        recovery = {
+            "ok": True,
+            "retryable": True,
+            "status": "status:ready",
+            "worktree_action": "cleaned",
+            "reason": "",
+        }
         with (
             mock.patch.object(dispatcher, "JOBS_DB_PATH", self.db),
+            mock.patch.object(
+                dispatcher, "recover_scheduler_retry", return_value=recovery
+            ),
             mock.patch.object(
                 sys, "argv", ["dispatcher.py", "jobs", "retry", job["job_id"]]
             ),

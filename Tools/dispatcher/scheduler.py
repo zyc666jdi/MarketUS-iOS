@@ -42,7 +42,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -624,6 +624,44 @@ def _refresh_execution_state(
     result["retry_at"] = current.get("retry_at")
 
 
+def _apply_retry_recovery(
+    recovery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+    job: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run the optional pre-requeue recovery hook, normalizing failures."""
+    if recovery is None:
+        # Requeuing without restoring the issue would make the next claim fail
+        # admission; fail closed instead of silently breaking the retry.
+        return {
+            "ok": False,
+            "retryable": False,
+            "skipped": False,
+            "reason": "未配置 retry recovery，拒绝在状态未恢复时 requeue",
+        }
+    try:
+        outcome = recovery(job)
+    except (Exception, SystemExit) as error:
+        return {
+            "ok": False,
+            "retryable": False,
+            "skipped": False,
+            "reason": f"{type(error).__name__}: {error}",
+        }
+    if not isinstance(outcome, Mapping):
+        return {
+            "ok": False,
+            "retryable": False,
+            "skipped": False,
+            "reason": f"recovery 返回值无效：{type(outcome).__name__}",
+        }
+    result = dict(outcome)
+    result.setdefault("ok", False)
+    result.setdefault("retryable", True)
+    result.setdefault("skipped", False)
+    result["reason"] = str(result.get("reason") or "")
+    return result
+
+
 def run_once(
     store: JobStore,
     execute: bool = True,
@@ -631,6 +669,7 @@ def run_once(
     lease_seconds: float = DEFAULT_LEASE_SECONDS,
     *,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+    recovery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Claim at most one queued job, run its role command, and record the outcome.
 
@@ -643,8 +682,12 @@ def run_once(
     * exit 2 (per-PR lock busy) -> back to ``queued`` with a short backoff via
       :meth:`JobStore.requeue`, never ``failed``
     * a GitHub infrastructure failure (timeout, connection, rate limit,
-      HTTP 5xx, GraphQL network) -> ``queued`` with exponential-ish backoff
-      (60s per attempt, capped at 15 minutes)
+      HTTP 5xx, GraphQL network) -> run the ``recovery`` hook first
+      (restore issue status, clean safe worktree), then ``queued`` with
+      exponential-ish backoff (60s per attempt, capped at 15 minutes); if
+      recovery fails or is not configured, the job becomes ``failed`` with
+      ``retryable=False`` and the reason is recorded instead of silently
+      requeueing a job whose issue cannot be claimed
     * any other exit or start failure -> ``failed`` with the combined
       stdout/stderr tail
 
@@ -794,19 +837,34 @@ def run_once(
             delay=LOCK_BUSY_RETRY_SECONDS,
         )
     elif exit_code is not None and is_github_infrastructure_error(combined):
-        # GitHub had a transient outage; retry later instead of burning the
-        # job's only attempt as a failure.
-        message = _truncate(combined)
-        delay = github_retry_delay(attempt)
-        result["action"] = "requeued"
-        result["retry_delay"] = delay
-        result["finished"] = store.requeue(
-            job_id,
-            owner_value,
-            attempt=attempt,
-            error=message,
-            delay=delay,
-        )
+        # GitHub had a transient outage.  Before retrying, put the issue back
+        # in the state its role expects and clean a safe stale worktree;
+        # otherwise the next claim would fail admission and burn the job.
+        recovery_result = _apply_retry_recovery(recovery, claimed)
+        result["recovery"] = recovery_result
+        result["retryable"] = bool(recovery_result.get("retryable", True))
+        if not recovery_result.get("ok") or not recovery_result.get("retryable", True):
+            reason = str(recovery_result.get("reason") or "unknown recovery failure")
+            message = _truncate(f"retry recovery failed: {reason}")
+            result["action"] = "failed"
+            result["retryable"] = False
+            result["error"] = message
+            result["finished"] = store.finish(
+                job_id, "failed", message, owner=owner_value, attempt=attempt
+            )
+        else:
+            message = _truncate(combined)
+            delay = github_retry_delay(attempt)
+            result["action"] = "requeued"
+            result["retryable"] = True
+            result["retry_delay"] = delay
+            result["finished"] = store.requeue(
+                job_id,
+                owner_value,
+                attempt=attempt,
+                error=message,
+                delay=delay,
+            )
     else:
         message = _truncate(
             combined or f"delegated command exited {exit_code}"

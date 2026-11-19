@@ -67,6 +67,32 @@ ACTIVE_STATUS = {
     "status:awaiting-human",
 }
 
+# A scheduler retry must put the issue back into the state its role expects,
+# otherwise `cmd_once` rejects the next claim for missing status:ready.
+SCHEDULER_RETRY_STATUS = {
+    "implementer": "status:ready",
+    "reviewer": "status:in-review",
+    "repair": "status:in-progress",
+}
+
+# If a run already advanced past these states (e.g. implementer opened a PR and
+# then hit a transient error), rewinding to ready would duplicate the work.
+SCHEDULER_RETRY_ALLOWED_STATUSES = {
+    "implementer": {
+        "status:ready",
+        "status:claimed",
+        "status:in-progress",
+        "status:blocked",
+    },
+    "reviewer": {
+        "status:in-review",
+        "status:claimed",
+        "status:in-progress",
+        "status:blocked",
+    },
+    "repair": {"status:in-progress", "status:claimed", "status:blocked"},
+}
+
 PRIORITY_ORDER = {
     "priority:p0": 0,
     "priority:p1": 1,
@@ -1483,17 +1509,98 @@ def command_error(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
 
 
-def prepare_issue_worktree(branch: str, worktree: Path) -> str:
-    """Fetch main and add the implementer worktree; return an error or ``""``.
+def _branch_exists(branch: str) -> bool:
+    result = run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
+    return result.returncode == 0
 
-    ``git worktree add -b`` fails when a previous run left the branch behind.
-    If that branch has no commits not already on ``origin/main`` it is safe to
-    delete and retry once; a branch with commits is surfaced untouched so no
-    agent work is discarded.  The original stderr is always included.
+
+def _branch_ahead_origin_main(branch: str) -> tuple[int | None, str]:
+    """Return commits on ``branch`` not on origin/main, or ``(None, reason)``."""
+    result = run(["git", "rev-list", "--count", f"origin/main..{branch}"])
+    if result.returncode != 0:
+        return None, command_error(result)
+    raw_count = (result.stdout or "").strip()
+    try:
+        return max(0, int(raw_count or "0")), ""
+    except ValueError:
+        return None, f"提交数无效：{raw_count!r}"
+
+
+def clean_issue_worktree(branch: str, worktree: Path, *, remove: bool = True) -> str:
+    """Inspect an implementer worktree/branch and optionally clean it.
+
+    Returns ``""`` when the worktree/branch is safe (and, with ``remove=True``,
+    has been removed).  A non-empty string is an explicit preservation reason:
+    uncommitted changes, a different checked-out branch, unmerged commits, or
+    an unreadable git state.  With ``remove=False`` this is a read-only
+    preflight, so ``cmd_once`` can refuse before claiming the issue.
+    """
+    branch_exists = _branch_exists(branch)
+    worktree_exists = worktree.exists()
+    if not branch_exists and not worktree_exists:
+        return ""
+
+    if worktree_exists:
+        current = run(["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"])
+        if current.returncode != 0:
+            return (
+                f"worktree {worktree} 无法读取当前分支，保留："
+                f"{command_error(current)}"
+            )
+        current_branch = (current.stdout or "").strip()
+        if current_branch != branch:
+            return (
+                f"worktree {worktree} 当前分支为 {current_branch or '-'}"
+                f"（期望 {branch}），保留"
+            )
+        status = run(["git", "-C", str(worktree), "status", "--porcelain"])
+        if status.returncode != 0:
+            return f"worktree {worktree} 无法读取状态，保留：{command_error(status)}"
+        if (status.stdout or "").strip():
+            return f"worktree {worktree} 有未提交改动，保留以避免丢失 Agent 工作"
+
+    if branch_exists:
+        ahead, reason = _branch_ahead_origin_main(branch)
+        if ahead is None:
+            return f"无法统计未合并提交（分支 {branch}）：{reason}"
+        if ahead > 0:
+            return (
+                f"分支 {branch} 有 {ahead} 个未合并提交，"
+                "保留以避免丢失 Agent 工作"
+            )
+
+    if not remove:
+        return ""
+
+    if worktree_exists:
+        removed = run(["git", "worktree", "remove", str(worktree), "--force"])
+        if removed.returncode != 0:
+            return f"无法移除 worktree {worktree}：{command_error(removed)}"
+        run(["git", "worktree", "prune"])
+    if branch_exists:
+        deleted = run(["git", "branch", "-D", branch])
+        if deleted.returncode != 0:
+            return f"无法删除分支 {branch}：{command_error(deleted)}"
+    return ""
+
+
+def prepare_issue_worktree(branch: str, worktree: Path) -> str:
+    """Fetch main and create a fresh implementer worktree.
+
+    A previous run may have left a clean, zero-commit worktree/branch behind;
+    that is removed so the next attempt starts from the current origin/main.
+    A dirty worktree or a branch with unmerged commits is preserved and
+    returned as an explicit error instead of discarding agent work.
     """
     fetched = run(["git", "fetch", "origin", "main"])
     if fetched.returncode != 0:
         return f"git fetch 失败：{command_error(fetched)}"
+
+    if worktree.exists():
+        reason = clean_issue_worktree(branch, worktree, remove=True)
+        if reason:
+            return reason
+
     added = run(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
     if added.returncode == 0:
         return ""
@@ -1501,37 +1608,139 @@ def prepare_issue_worktree(branch: str, worktree: Path) -> str:
     if "already exists" not in first_error.lower():
         return f"git worktree add 失败：{first_error}"
 
-    counted = run(["git", "rev-list", "--count", f"origin/main..{branch}"])
-    if counted.returncode != 0:
-        return (
-            f"git worktree add 失败（分支 {branch} 已存在），"
-            f"且无法统计未合并提交："
-            f"{command_error(counted)}；原始 stderr：{first_error}"
-        )
-    raw_count = (counted.stdout or "").strip()
-    try:
-        ahead = int(raw_count)
-    except ValueError:
-        return (
-            f"git worktree add 失败（分支 {branch} 已存在），提交数无效："
-            f"{raw_count!r}；原始 stderr：{first_error}"
-        )
-    if ahead > 0:
-        return (
-            f"git worktree add 失败：分支 {branch} 已有 {ahead} 个未合并提交，"
-            f"未自动删除；stderr：{first_error}"
-        )
-
-    deleted = run(["git", "branch", "-D", branch])
-    if deleted.returncode != 0:
-        return (
-            f"git worktree add 失败：无法删除无提交的 stale 分支 {branch}："
-            f"{command_error(deleted)}；原始 stderr：{first_error}"
-        )
+    reason = clean_issue_worktree(branch, worktree, remove=True)
+    if reason:
+        return f"git worktree add 失败：{first_error}；{reason}"
     retried = run(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
     if retried.returncode != 0:
         return f"git worktree add 重试失败：{command_error(retried)}"
     return ""
+
+
+def restore_issue_retry_status(issue: Mapping[str, Any], target: str) -> None:
+    """Move an issue to the status its retried role expects.
+
+    Only labels that are actually present are removed, so the call does not
+    depend on ``gh`` tolerating missing labels.  ``status:done`` is terminal
+    and must never be silently reopened; callers check it before calling.
+    """
+    if target not in STATUS_LABELS:
+        raise ValueError(f"unknown status label: {target}")
+    labels = labels_of(dict(issue))
+    args = ["issue", "edit", str(issue["number"])]
+    for label in STATUS_LABELS:
+        if label in ("status:done", target):
+            continue
+        if label in labels:
+            args.extend(["--remove-label", label])
+    if target not in labels:
+        args.extend(["--add-label", target])
+    if len(args) > 3:
+        gh(args)
+
+
+def recover_scheduler_retry(job: Mapping[str, Any]) -> dict[str, Any]:
+    """Prepare an issue for a scheduler retry before the job is requeued.
+
+    The delegated command may already have moved the issue to claimed /
+    in-progress / blocked and created a ticket worktree.  This function:
+
+    * cleans the implementer worktree/branch only when it is clean and has no
+      commits ahead of ``origin/main`` (otherwise preserves it and reports
+      ``retryable=False``);
+    * restores the role-appropriate status label and reads the issue back to
+      verify the transition.
+
+    It never raises: every failure is returned as ``ok=False`` with a reason so
+    the scheduler can fail the job with visible diagnostics instead of
+    silently reporting success.
+    """
+    role = str(job.get("role") or "").strip().lower()
+    try:
+        ticket = int(job.get("ticket") or 0)
+    except (TypeError, ValueError):
+        ticket = 0
+    target = SCHEDULER_RETRY_STATUS.get(role, "")
+    result: dict[str, Any] = {
+        "ok": False,
+        "retryable": False,
+        "role": role,
+        "ticket": ticket,
+        "status": target,
+        "branch": "",
+        "worktree": "",
+        "worktree_action": "",
+        "reason": "",
+    }
+    if not target:
+        result["reason"] = f"未知 role，无法恢复状态：{role or '-'}"
+        return result
+    if ticket <= 0:
+        result["reason"] = "job ticket 无效，无法恢复状态"
+        return result
+
+    try:
+        issue = issue_detail(ticket)
+    except (SystemExit, OSError) as error:
+        result["reason"] = f"读取 issue #{ticket} 失败：{error}"
+        return result
+    if issue.get("state") != "open":
+        result["reason"] = f"issue #{ticket} 不是 open 状态，未自动恢复"
+        return result
+    labels = labels_of(issue)
+    if "status:done" in labels:
+        result["reason"] = f"issue #{ticket} 已是 status:done，未自动恢复"
+        return result
+    current_statuses = labels & (set(STATUS_LABELS) - {"status:done"})
+    unexpected = current_statuses - SCHEDULER_RETRY_ALLOWED_STATUSES.get(role, set())
+    if unexpected:
+        result["reason"] = (
+            f"issue #{ticket} 当前状态 {sorted(unexpected)} 不适合自动恢复，"
+            "可能已产生 PR 或评审结果"
+        )
+        return result
+
+    if role == "implementer":
+        slug = slugify(str(issue.get("title") or ""))
+        branch = f"ai/{ticket}-{slug}"
+        worktree = WORKTREE_ROOT / f"{ticket}-{slug}"
+        result["branch"] = branch
+        result["worktree"] = str(worktree)
+        try:
+            reason = clean_issue_worktree(branch, worktree, remove=True)
+        except OSError as error:
+            reason = str(error)
+        if reason:
+            result["reason"] = reason
+            return result
+        result["worktree_action"] = "cleaned"
+    else:
+        result["worktree_action"] = "not_applicable"
+
+    try:
+        restore_issue_retry_status(issue, target)
+    except (SystemExit, OSError) as error:
+        result["reason"] = f"恢复 {target} 失败：{error}"
+        return result
+
+    try:
+        after = issue_detail(ticket)
+    except (SystemExit, OSError) as error:
+        result["reason"] = f"恢复 {target} 后回读 issue 失败：{error}"
+        return result
+    after_labels = labels_of(after)
+    conflicting = after_labels & (set(STATUS_LABELS) - {"status:done", target})
+    if target not in after_labels or conflicting:
+        result["reason"] = (
+            f"状态恢复校验失败：期望 {target}，"
+            f"实际 labels={sorted(after_labels)}"
+        )
+        return result
+
+    result["ok"] = True
+    result["retryable"] = True
+    result["labels"] = sorted(after_labels)
+    return result
 
 
 def cmd_once(args: argparse.Namespace) -> int:
@@ -1574,8 +1783,12 @@ def cmd_once(args: argparse.Namespace) -> int:
         print("\n(dry-run) 未写入 GitHub、未创建 worktree、未调用 Agent；加 --execute 执行。")
         return 0
 
-    if worktree.exists():
-        print(f"⛔ worktree 已存在：{worktree}")
+    try:
+        worktree_blocker = clean_issue_worktree(branch, worktree, remove=False)
+    except OSError as error:
+        worktree_blocker = str(error)
+    if worktree_blocker:
+        print(f"⛔ 现有 worktree/分支不可安全复用：{worktree_blocker}")
         return 1
 
     if command and command[0] == "dsh" and not os.environ.get("DEEPSEEK_API_KEY"):
@@ -4988,7 +5201,7 @@ def cmd_jobs_show(args: argparse.Namespace) -> int:
 
 
 def cmd_jobs_retry(args: argparse.Namespace) -> int:
-    """Reset a failed/stale job to queued for another attempt."""
+    """Reset a failed/stale job to queued after restoring its issue/worktree."""
     job_id = str(getattr(args, "job_id", "")).strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", job_id):
         print(f"⛔ 未找到 job：{job_id}")
@@ -5003,6 +5216,18 @@ def cmd_jobs_retry(args: argparse.Namespace) -> int:
         if state not in ("failed", "stale"):
             print(f"⛔ job {job_id} 当前 state={state or '-'}，仅 failed/stale 可 retry")
             return 1
+        try:
+            recovery = recover_scheduler_retry(job)
+        except (Exception, SystemExit) as error:  # defensive: recovery promises no raise
+            recovery = {
+                "ok": False,
+                "retryable": False,
+                "reason": f"{type(error).__name__}: {error}",
+            }
+        if not recovery.get("ok") or not recovery.get("retryable", True):
+            reason = str(recovery.get("reason") or "recovery failed")
+            print(f"⛔ job {job_id} 不可 retry：{reason}")
+            return 1
         if not store.retry(job_id):
             print(f"⛔ job {job_id} retry 失败（状态可能已变化）")
             return 1
@@ -5012,7 +5237,8 @@ def cmd_jobs_retry(args: argparse.Namespace) -> int:
         return 1
     print(
         f"job {job_id} -> {updated.get('state') or 'queued'} "
-        f"(attempt {int(updated.get('attempt') or 0)})"
+        f"(attempt {int(updated.get('attempt') or 0)}, "
+        f"status {recovery.get('status') or '-'})"
     )
     return 0
 
@@ -5088,6 +5314,13 @@ def _print_scheduler_run(result: dict[str, Any]) -> None:
         retry_delay = result.get("retry_delay")
         if retry_delay is not None:
             print(f"  retry in {int(float(retry_delay))}s")
+        recovery = result.get("recovery") or {}
+        if recovery and not recovery.get("skipped"):
+            print(
+                "  recovery: "
+                f"status={recovery.get('status') or '-'} "
+                f"worktree={recovery.get('worktree_action') or '-'}"
+            )
     if result.get("action") in ("failed", "requeued"):
         for stream in ("stdout", "stderr"):
             text = result.get(stream)
@@ -5104,7 +5337,9 @@ def _cmd_scheduler_run(args: argparse.Namespace) -> int:
     already the only mode, matching the launchd ``run`` cadence.
     """
     try:
-        result = scheduler.run_once(_job_store())
+        result = scheduler.run_once(
+            _job_store(), recovery=recover_scheduler_retry
+        )
     except (OSError, sqlite3.Error, ValueError, scheduler.SchedulerError) as error:
         print(f"⛔ scheduler run: {error}")
         return 1
@@ -5274,7 +5509,9 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
             with trace.step("scheduler") as phase:
                 try:
                     result = scheduler.run_once(
-                        _job_store(), execute=not args.dry_run
+                        _job_store(),
+                        execute=not args.dry_run,
+                        recovery=recover_scheduler_retry,
                     )
                 except (
                     OSError,
