@@ -5052,6 +5052,122 @@ class LoopRunTests(unittest.TestCase):
         self.assertEqual(events[-1]["status"], "failed")
 
 
+class SchedulerRunIntegrationTests(IsolatedStateTestCase):
+    """cmd_run switches from legacy sweeps to run_once only with the env flag."""
+
+    def _result(self, action="executed"):
+        return {
+            "action": action,
+            "job": {
+                "job_id": "implementer-134-abcdef0123456789",
+                "role": "implementer",
+                "ticket": 134,
+                "pr": None,
+                "state": "done" if action == "executed" else "failed",
+                "attempt": 1,
+            },
+            "state": "done" if action == "executed" else "failed",
+            "owner": "scheduler-1",
+            "lease_seconds": 7200,
+            "command": [],
+            "exit_code": 0 if action == "executed" else 1,
+            "error": "" if action == "executed" else "agent failed",
+            "finished": True,
+            "executed": True,
+            "heartbeat": {"started": True, "stopped": True, "alive": False,
+                          "beats": 0, "rejected": 0, "errors": 0,
+                          "interval_seconds": 30.0},
+        }
+
+    def _run(self, scheduler_env=None, *, dry_run=False, run_result=None):
+        result = run_result or self._result()
+        env = os.environ.copy()
+        env.pop(dispatcher.SCHEDULER_ENV, None)
+        if scheduler_env is not None:
+            env[dispatcher.SCHEDULER_ENV] = scheduler_env
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(dispatcher, "cmd_postmerge", return_value=0),
+            mock.patch.object(dispatcher, "cmd_watch", return_value=0),
+            mock.patch.object(dispatcher, "reap_worktrees"),
+            mock.patch.object(dispatcher, "gh_json", return_value=[]),
+            mock.patch.object(dispatcher, "list_issues", return_value=[]),
+            mock.patch.object(dispatcher, "maybe_run_planner", return_value=0) as planner,
+            mock.patch.object(dispatcher, "cmd_review") as review,
+            mock.patch.object(dispatcher, "cmd_once") as once,
+            mock.patch.object(dispatcher, "_job_store") as job_store,
+            mock.patch.object(
+                dispatcher.scheduler, "run_once", return_value=result
+            ) as run_once,
+        ):
+            code = dispatcher.cmd_run(argparse.Namespace(dry_run=dry_run, timeout=90))
+        self.planner = planner
+        self.review = review
+        self.once = once
+        self.job_store = job_store
+        self.run_once = run_once
+        return code
+
+    def _steps(self):
+        timelines = sorted(
+            (Path(self._state_tmp.name) / "loops").glob("*/timeline.jsonl")
+        )
+        self.assertGreaterEqual(len(timelines), 1)
+        events = [
+            json.loads(line)
+            for line in timelines[-1].read_text(encoding="utf-8").splitlines()
+        ]
+        return events, [
+            event["step"] for event in events if event["event"] == "step_end"
+        ]
+
+    def test_env_flag_skips_legacy_sweeps_and_runs_one_scheduler_tick(self):
+        code = self._run("1")
+
+        self.assertEqual(code, 0)
+        self.run_once.assert_called_once()
+        self.assertIs(self.run_once.call_args.args[0], self.job_store.return_value)
+        self.assertTrue(self.run_once.call_args.kwargs["execute"])
+        self.review.assert_not_called()
+        self.once.assert_not_called()
+        self.planner.assert_called_once()
+        events, steps = self._steps()
+        self.assertEqual(steps, ["postmerge", "watch", "scheduler", "planner"])
+        self.assertEqual(events[-1]["event"], "loop_end")
+        self.assertEqual(events[-1]["status"], "ok")
+
+    def test_default_and_unrecognized_values_keep_legacy_sweeps(self):
+        for value in (None, "0", "true", "", "yes"):
+            with self.subTest(scheduler_env=value):
+                code = self._run(value)
+                self.assertEqual(code, 0)
+                self.run_once.assert_not_called()
+                _, steps = self._steps()
+                self.assertEqual(
+                    steps,
+                    ["postmerge", "watch", "repair", "dispatch", "review", "planner"],
+                )
+
+    def test_dry_run_still_passes_execute_false_to_scheduler(self):
+        code = self._run("1", dry_run=True)
+        self.assertEqual(code, 0)
+        self.run_once.assert_called_once()
+        self.assertFalse(self.run_once.call_args.kwargs["execute"])
+
+    def test_failed_scheduler_job_marks_the_scheduler_phase_failed(self):
+        code = self._run("1", run_result=self._result("failed"))
+        self.assertEqual(code, 0)
+        events, steps = self._steps()
+        self.assertEqual(steps, ["postmerge", "watch", "scheduler", "planner"])
+        scheduler_end = next(
+            event for event in events
+            if event["event"] == "step_end" and event["step"] == "scheduler"
+        )
+        self.assertEqual(scheduler_end["status"], "failed")
+        self.assertIn("scheduler job implementer-134", scheduler_end["details"]["error"])
+        self.assertEqual(events[-1]["status"], "failed")
+
+
 class LoopAgentTraceTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

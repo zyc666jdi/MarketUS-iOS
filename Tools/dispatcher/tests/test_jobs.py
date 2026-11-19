@@ -396,6 +396,60 @@ class FinishTests(JobStoreTestCase):
         self.assertEqual(self.store.get_job(job["job_id"])["state"], "queued")
 
 
+class RequeueTests(JobStoreTestCase):
+    def test_requeue_leased_job_clears_lease_and_keeps_it_claimable(self):
+        job = self.enqueue()
+        claimed = self.store.claim("runner-a", 30, now=100.0)
+        self.assertEqual(claimed["attempt"], 1)
+        self.assertTrue(
+            self.store.requeue(job["job_id"], "runner-a", attempt=1, now=120.0)
+        )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertEqual(stored["attempt"], 1)
+        self.assertIsNone(stored["lease_owner"])
+        self.assertIsNone(stored["lease_until"])
+        self.assertIsNone(stored["heartbeat_at"])
+        self.assertEqual(stored["error"], "")
+        self.assertEqual(stored["updated_at"], 120.0)
+
+        reclaimed = self.store.claim("runner-b", 30, now=130.0)
+        self.assertEqual(reclaimed["job_id"], job["job_id"])
+        self.assertEqual(reclaimed["attempt"], 2)
+
+    def test_requeue_is_fenced_by_owner_and_attempt(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 30, now=100.0)
+        self.assertFalse(self.store.requeue(job["job_id"], "runner-b", now=110.0))
+        self.assertFalse(
+            self.store.requeue(job["job_id"], "runner-a", attempt=2, now=110.0)
+        )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "leased")
+        self.assertEqual(stored["lease_owner"], "runner-a")
+        self.assertTrue(
+            self.store.requeue(job["job_id"], "runner-a", attempt=1, now=111.0)
+        )
+
+    def test_requeue_rejects_non_active_or_missing_jobs(self):
+        done = self.enqueue(ticket=1)
+        self.store.claim("runner-a", 30, now=100.0)
+        self.store.finish(done["job_id"], "done", owner="runner-a", now=110.0)
+        queued = self.enqueue(ticket=2, now=200.0)
+        self.assertFalse(self.store.requeue(queued["job_id"], "runner-a", now=210.0))
+        self.assertFalse(self.store.requeue(done["job_id"], "runner-a", now=220.0))
+        self.assertFalse(self.store.requeue("missing", "runner-a", now=220.0))
+        self.assertEqual(self.store.get_job(done["job_id"])["state"], "done")
+
+    def test_requeue_validates_owner_and_attempt(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 30, now=100.0)
+        with self.assertRaises(ValueError):
+            self.store.requeue(job["job_id"], "", now=110.0)
+        with self.assertRaises(ValueError):
+            self.store.requeue(job["job_id"], "runner-a", attempt=-1, now=110.0)
+
+
 class ReapStaleTests(JobStoreTestCase):
     def test_reap_stale_marks_only_expired_active_leases(self):
         expired = self.enqueue(ticket=1, now=100.0)

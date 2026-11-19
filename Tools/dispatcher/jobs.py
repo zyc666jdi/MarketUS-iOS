@@ -385,6 +385,52 @@ class JobStore:
                 )
             return updated.rowcount == 1
 
+    def requeue(
+        self,
+        job_id: str,
+        owner: str,
+        *,
+        attempt: int | None = None,
+        error: str = "",
+        now: float | int | datetime | None = None,
+    ) -> bool:
+        """Return a leased job to ``queued`` without marking it failed.
+
+        A scheduler tick uses this when the delegated command could not start
+        because another dispatcher process holds the per-PR lock (exit 2): the
+        work was not attempted, so the row must stay claimable instead of
+        becoming terminal.  The update is fenced by ``owner`` (and optionally
+        ``attempt``) exactly like :meth:`finish`, so a stale worker whose lease
+        was already reclaimed cannot reset the new owner's row.  The attempt
+        counter is not rewound because the lease did happen.
+        """
+        owner_value = str(owner or "").strip()
+        if not owner_value:
+            raise ValueError("owner 不能为空")
+        attempt_value: int | None = None
+        if attempt is not None:
+            attempt_value = int(attempt)
+            if attempt_value < 0:
+                raise ValueError("attempt 不能为负数")
+        current = self._now(now)
+        active = ", ".join(f"'{state}'" for state in ACTIVE_STATES)
+        conditions = ["job_id = ?", "lease_owner = ?", f"state IN ({active})"]
+        parameters: list[Any] = [str(error or ""), current, str(job_id), owner_value]
+        if attempt_value is not None:
+            conditions.append("attempt = ?")
+            parameters.append(attempt_value)
+        with self._write() as connection:
+            updated = connection.execute(
+                f"""
+                UPDATE jobs
+                SET state = 'queued', error = ?, updated_at = ?,
+                    lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL
+                WHERE {' AND '.join(conditions)}
+                """,
+                parameters,
+            )
+            return updated.rowcount == 1
+
     def reap_stale(
         self,
         now: float | int | datetime | None = None,
