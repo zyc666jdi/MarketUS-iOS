@@ -2179,13 +2179,71 @@ class CmdOnceStatusTests(unittest.TestCase):
                 mock.patch.object(dispatcher, "build_prompt", return_value="prompt"),
                 mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
-                mock.patch.object(dispatcher, "cmd", side_effect=SystemExit("git failed")),
+                mock.patch.object(
+                    dispatcher,
+                    "prepare_issue_worktree",
+                    return_value="git worktree add 失败：branch exists",
+                ),
                 mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
                 mock.patch.object(dispatcher, "comment"),
                 mock.patch.object(dispatcher, "notify"),
             ):
                 code = dispatcher.cmd_once(argparse.Namespace(issue=40, execute=True, timeout=90))
         self.assertEqual(code, 1)
+        self.assertEqual(status_after(labels, calls), {"status:blocked"})
+
+    def test_gh_pr_list_failure_includes_stderr_in_output(self):
+        labels = {
+            "type:feature",
+            "area:infrastructure",
+            "priority:p1",
+            "risk:low",
+            "status:ready",
+            "status:claimed",
+        }
+        issue = {
+            "number": 40,
+            "title": "test",
+            "body": VALID_BODY,
+            "labels": [{"name": name} for name in labels],
+            "state": "open",
+            "author_association": "OWNER",
+        }
+        calls = []
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(dispatcher, "RUN_ROOT", Path(tmp) / "runs"),
+                mock.patch.object(dispatcher, "issue_detail", return_value=issue),
+                mock.patch.object(dispatcher, "build_prompt", return_value="prompt"),
+                mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
+                mock.patch.object(dispatcher.shutil, "which", return_value="/usr/bin/true"),
+                mock.patch.object(dispatcher, "load_agent_secrets"),
+                mock.patch.object(dispatcher, "prepare_issue_worktree", return_value=""),
+                mock.patch.object(
+                    dispatcher,
+                    "run_agent_streaming",
+                    return_value=(1, "agent log"),
+                ),
+                mock.patch.object(
+                    dispatcher,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 1, "", "gh: API rate limit exceeded"
+                    ),
+                ),
+                mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
+                mock.patch.object(dispatcher, "comment"),
+                mock.patch.object(dispatcher, "notify"),
+                contextlib.redirect_stdout(output),
+            ):
+                code = dispatcher.cmd_once(
+                    argparse.Namespace(issue=40, execute=True, timeout=90)
+                )
+        self.assertEqual(code, 1)
+        self.assertIn("gh pr list 失败", output.getvalue())
+        self.assertIn("API rate limit exceeded", output.getvalue())
         self.assertEqual(status_after(labels, calls), {"status:blocked"})
 
 
@@ -3409,7 +3467,12 @@ class CmdOnceAutoSalvageTests(unittest.TestCase):
                 mock.patch.object(dispatcher, "build_prompt", return_value="prompt"),
                 mock.patch.object(dispatcher, "agent_command", return_value=["true"]),
                 mock.patch.object(dispatcher, "load_agent_secrets"),
-                mock.patch.object(dispatcher, "cmd"),
+                mock.patch.object(dispatcher, "prepare_issue_worktree", return_value=""),
+                mock.patch.object(
+                    dispatcher,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "[]", ""),
+                ),
                 mock.patch.object(dispatcher, "run_agent_streaming", return_value=(0, "")) as stream,
                 mock.patch.object(dispatcher, "ensure_agent_pr", return_value=(salvage, reason)) as ensure,
                 mock.patch.object(dispatcher, "gh", side_effect=fake_gh(calls)),
@@ -3654,6 +3717,151 @@ class TicketSourceTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"MARKETUS_AUTOPILOT": "1", "MARKETUS_TICKET_SOURCE": "human"}),
         ):
             self.assertIn("MARKETUS_TICKET_SOURCE=human", dispatcher.autopilot_gate(state) or "")
+
+
+class PrepareIssueWorktreeTests(unittest.TestCase):
+    """cmd_once's worktree add recovers only provably stale branches."""
+
+    @staticmethod
+    def completed(code=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess([], code, stdout, stderr)
+
+    def test_stale_branch_without_commits_is_deleted_and_retried_once(self):
+        calls = []
+        add_calls = 0
+
+        def fake_run(command):
+            nonlocal add_calls
+            calls.append(command)
+            if command[:2] == ["git", "fetch"]:
+                return self.completed()
+            if command[:3] == ["git", "worktree", "add"]:
+                add_calls += 1
+                if add_calls == 1:
+                    return self.completed(
+                        128, "", "fatal: a branch named 'ai/40-test' already exists"
+                    )
+                return self.completed()
+            if command[:2] == ["git", "rev-list"]:
+                return self.completed(0, "0\n")
+            if command[:3] == ["git", "branch", "-D"]:
+                return self.completed()
+            return self.completed()
+
+        with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+            error = dispatcher.prepare_issue_worktree("ai/40-test", Path("/tmp/wt"))
+
+        self.assertEqual(error, "")
+        self.assertEqual(add_calls, 2)
+        branch = "ai/40-test"
+        self.assertIn(["git", "rev-list", "--count", f"origin/main..{branch}"], calls)
+        deleted = calls.index(["git", "branch", "-D", branch])
+        first_add = calls.index(
+            ["git", "worktree", "add", "/tmp/wt", "-b", branch, "origin/main"]
+        )
+        self.assertLess(first_add, deleted)
+        self.assertLess(deleted, calls.index(
+            ["git", "worktree", "add", "/tmp/wt", "-b", branch, "origin/main"], deleted + 1
+        ))
+
+    def test_branch_with_commits_is_not_deleted(self):
+        calls = []
+
+        def fake_run(command):
+            calls.append(command)
+            if command[:2] == ["git", "fetch"]:
+                return self.completed()
+            if command[:3] == ["git", "worktree", "add"]:
+                return self.completed(
+                    128, "", "fatal: a branch named 'ai/40-test' already exists"
+                )
+            if command[:2] == ["git", "rev-list"]:
+                return self.completed(0, "3\n")
+            return self.completed()
+
+        with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+            error = dispatcher.prepare_issue_worktree("ai/40-test", Path("/tmp/wt"))
+
+        self.assertIn("3 个未合并提交", error)
+        self.assertIn("already exists", error)
+        self.assertFalse(any(command[:3] == ["git", "branch", "-D"] for command in calls))
+        self.assertEqual(
+            sum(1 for command in calls if command[:3] == ["git", "worktree", "add"]),
+            1,
+        )
+
+    def test_non_stale_worktree_error_includes_stderr(self):
+        def fake_run(command):
+            if command[:2] == ["git", "fetch"]:
+                return self.completed()
+            if command[:3] == ["git", "worktree", "add"]:
+                return self.completed(128, "", "fatal: invalid reference: origin/main")
+            return self.completed()
+
+        with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+            error = dispatcher.prepare_issue_worktree("ai/40-test", Path("/tmp/wt"))
+
+        self.assertIn("git worktree add 失败", error)
+        self.assertIn("invalid reference: origin/main", error)
+
+    def test_unreadable_commit_count_surfaces_both_errors(self):
+        def fake_run(command):
+            if command[:2] == ["git", "fetch"]:
+                return self.completed()
+            if command[:3] == ["git", "worktree", "add"]:
+                return self.completed(
+                    128, "", "fatal: a branch named 'ai/40-test' already exists"
+                )
+            if command[:2] == ["git", "rev-list"]:
+                return self.completed(128, "", "fatal: unknown revision")
+            return self.completed()
+
+        with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+            error = dispatcher.prepare_issue_worktree("ai/40-test", Path("/tmp/wt"))
+
+        self.assertIn("无法统计未合并提交", error)
+        self.assertIn("unknown revision", error)
+        self.assertIn("already exists", error)
+
+    def test_retry_failure_includes_retry_stderr(self):
+        calls = []
+        add_calls = 0
+
+        def fake_run(command):
+            nonlocal add_calls
+            calls.append(command)
+            if command[:2] == ["git", "fetch"]:
+                return self.completed()
+            if command[:3] == ["git", "worktree", "add"]:
+                add_calls += 1
+                if add_calls == 1:
+                    return self.completed(
+                        128, "", "fatal: a branch named 'ai/40-test' already exists"
+                    )
+                return self.completed(128, "", "fatal: cannot create worktree")
+            if command[:2] == ["git", "rev-list"]:
+                return self.completed(0, "0\n")
+            return self.completed()
+
+        with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+            error = dispatcher.prepare_issue_worktree("ai/40-test", Path("/tmp/wt"))
+
+        self.assertIn("重试失败", error)
+        self.assertIn("cannot create worktree", error)
+
+    def test_fetch_failure_includes_stderr_and_skips_add(self):
+        calls = []
+
+        def fake_run(command):
+            calls.append(command)
+            return self.completed(1, "", "ssh: connection reset")
+
+        with mock.patch.object(dispatcher, "run", side_effect=fake_run):
+            error = dispatcher.prepare_issue_worktree("ai/40-test", Path("/tmp/wt"))
+
+        self.assertIn("git fetch 失败", error)
+        self.assertIn("connection reset", error)
+        self.assertFalse(any(command[:3] == ["git", "worktree", "add"] for command in calls))
 
 
 class PrepareRepairWorktreeTests(unittest.TestCase):

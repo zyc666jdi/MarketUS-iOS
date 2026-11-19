@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     lease_owner  TEXT,
     lease_until  REAL,
     heartbeat_at REAL,
+    retry_at     REAL,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
     error        TEXT NOT NULL DEFAULT ''
@@ -140,6 +141,15 @@ class JobStore:
             # WAL is persistent on the database file; set it once at creation.
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(_SCHEMA)
+            # Databases created before retry_at existed need an additive
+            # migration; ALTER TABLE adds the nullable column while preserving
+            # every row and is safe to run once per connection.
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "retry_at" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN retry_at REAL")
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -247,12 +257,13 @@ class JobStore:
     ) -> dict[str, Any] | None:
         """Atomically lease the oldest claimable job, or return ``None``.
 
-        A job is claimable when it is ``queued`` or when its lease has expired
-        (an expired worker is presumed dead).  ``stale`` jobs were reaped from an
-        expired lease and are therefore claimable again; ``attempt`` records how
-        many times the job has been leased.  ``BEGIN IMMEDIATE`` plus the
-        state/lease predicate makes the read-update-read sequence a single
-        writer critical section, so concurrent claimers cannot both win.
+        A job is claimable when it is ``queued`` (and its ``retry_at`` backoff,
+        if any, has passed) or when its lease has expired (an expired worker is
+        presumed dead).  ``stale`` jobs were reaped from an expired lease and
+        are therefore claimable again; ``attempt`` records how many times the
+        job has been taken.  ``BEGIN IMMEDIATE`` plus the state/lease predicate
+        makes the read-update-read sequence a single writer critical section,
+        so concurrent claimers cannot both win.
         """
         owner = str(owner or "").strip()
         if not owner:
@@ -264,14 +275,15 @@ class JobStore:
         deadline = current + ttl_value
         expired = ", ".join(f"'{state}'" for state in ACTIVE_STATES + ("stale",))
         claimable = (
-            f"state = 'queued' OR (state IN ({expired}) "
-            "AND (lease_until IS NULL OR lease_until <= ?))"
+            f"(state = 'queued' OR (state IN ({expired}) "
+            "AND (lease_until IS NULL OR lease_until <= ?))) "
+            "AND (retry_at IS NULL OR retry_at <= ?)"
         )
         with self._write() as connection:
             row = connection.execute(
                 f"SELECT job_id FROM jobs WHERE {claimable} "
                 "ORDER BY created_at ASC, job_id ASC LIMIT 1",
-                (current,),
+                (current, current),
             ).fetchone()
             if row is None:
                 return None
@@ -280,10 +292,10 @@ class JobStore:
                 UPDATE jobs
                 SET state = 'leased', lease_owner = ?, lease_until = ?,
                     heartbeat_at = ?, attempt = attempt + 1,
-                    updated_at = ?, error = ''
+                    retry_at = NULL, updated_at = ?, error = ''
                 WHERE job_id = ? AND ({claimable})
                 """,
-                (owner, deadline, current, current, row["job_id"], current),
+                (owner, deadline, current, current, row["job_id"], current, current),
             )
             if updated.rowcount != 1:
                 return None
@@ -392,17 +404,25 @@ class JobStore:
         *,
         attempt: int | None = None,
         error: str = "",
+        retry_at: float | int | datetime | None = None,
+        delay: float | int | None = None,
         now: float | int | datetime | None = None,
     ) -> bool:
-        """Return a leased job to ``queued`` without marking it failed.
+        """Return a leased job to ``queued`` with an optional retry backoff.
 
-        A scheduler tick uses this when the delegated command could not start
-        because another dispatcher process holds the per-PR lock (exit 2): the
-        work was not attempted, so the row must stay claimable instead of
-        becoming terminal.  The update is fenced by ``owner`` (and optionally
-        ``attempt``) exactly like :meth:`finish`, so a stale worker whose lease
-        was already reclaimed cannot reset the new owner's row.  The attempt
-        counter is not rewound because the lease did happen.
+        A scheduler tick uses this when the delegated command hit a retryable
+        GitHub infrastructure error or could not start because another
+        dispatcher process holds the per-PR lock (exit 2): the row must stay
+        claimable instead of becoming terminal.  ``retry_at`` is an absolute
+        epoch deadline and ``delay`` is a relative number of seconds; passing
+        both is rejected.  A queued row with a future ``retry_at`` is ignored
+        by :meth:`claim` until the backoff expires.
+
+        The update is fenced by ``owner`` (and optionally ``attempt``) exactly
+        like :meth:`finish`, so a stale worker whose lease was already
+        reclaimed cannot reset the new owner's row.  ``attempt`` is incremented
+        so every requeue is visible in the job history; pass the attempt value
+        that was returned by :meth:`claim`.
         """
         owner_value = str(owner or "").strip()
         if not owner_value:
@@ -413,9 +433,12 @@ class JobStore:
             if attempt_value < 0:
                 raise ValueError("attempt 不能为负数")
         current = self._now(now)
+        deadline = self._retry_deadline(current, retry_at, delay)
         active = ", ".join(f"'{state}'" for state in ACTIVE_STATES)
         conditions = ["job_id = ?", "lease_owner = ?", f"state IN ({active})"]
-        parameters: list[Any] = [str(error or ""), current, str(job_id), owner_value]
+        parameters: list[Any] = [
+            str(error or ""), current, deadline, str(job_id), owner_value
+        ]
         if attempt_value is not None:
             conditions.append("attempt = ?")
             parameters.append(attempt_value)
@@ -423,11 +446,58 @@ class JobStore:
             updated = connection.execute(
                 f"""
                 UPDATE jobs
-                SET state = 'queued', error = ?, updated_at = ?,
+                SET state = 'queued', error = ?, updated_at = ?, retry_at = ?,
+                    attempt = attempt + 1,
                     lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL
                 WHERE {' AND '.join(conditions)}
                 """,
                 parameters,
+            )
+            return updated.rowcount == 1
+
+    @staticmethod
+    def _retry_deadline(
+        current: float,
+        retry_at: float | int | datetime | None,
+        delay: float | int | None,
+    ) -> float | None:
+        """Resolve the optional absolute/relative retry deadline."""
+        if retry_at is not None and delay is not None:
+            raise ValueError("retry_at 与 delay 不能同时指定")
+        if delay is not None:
+            delay_value = float(delay)
+            if not math.isfinite(delay_value) or delay_value < 0:
+                raise ValueError("delay 不能为负数")
+            return current + delay_value
+        if retry_at is not None:
+            return _as_epoch(retry_at)
+        return None
+
+    def retry(
+        self,
+        job_id: str,
+        *,
+        now: float | int | datetime | None = None,
+    ) -> bool:
+        """Manually reset a failed/stale job to ``queued`` for another attempt.
+
+        The lease, error and pending ``retry_at`` are cleared so the row is
+        immediately claimable.  ``attempt`` is preserved as a running count by
+        incrementing it rather than resetting to zero.  Queued, active and done
+        jobs are not retryable and leave the row untouched.
+        """
+        current = self._now(now)
+        with self._write() as connection:
+            updated = connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued', error = '', retry_at = NULL,
+                    attempt = attempt + 1,
+                    lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE job_id = ? AND state IN ('failed', 'stale')
+                """,
+                (current, str(job_id)),
             )
             return updated.rowcount == 1
 

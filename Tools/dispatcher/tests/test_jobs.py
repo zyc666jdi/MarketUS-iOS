@@ -133,11 +133,60 @@ class SchemaTests(JobStoreTestCase):
                 "lease_owner",
                 "lease_until",
                 "heartbeat_at",
+                "retry_at",
                 "created_at",
                 "updated_at",
                 "error",
             ],
         )
+
+    def test_old_database_is_migrated_with_retry_at_column(self):
+        legacy_db = self.root / "legacy-jobs.db"
+        connection = sqlite3.connect(legacy_db)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE jobs (
+                    job_id       TEXT PRIMARY KEY,
+                    role         TEXT NOT NULL,
+                    ticket       INTEGER NOT NULL,
+                    pr           INTEGER,
+                    base_sha     TEXT NOT NULL DEFAULT '',
+                    head_sha     TEXT NOT NULL DEFAULT '',
+                    prompt_hash  TEXT NOT NULL DEFAULT '',
+                    state        TEXT NOT NULL DEFAULT 'queued',
+                    attempt      INTEGER NOT NULL DEFAULT 0,
+                    lease_owner  TEXT,
+                    lease_until  REAL,
+                    heartbeat_at REAL,
+                    created_at   REAL NOT NULL,
+                    updated_at   REAL NOT NULL,
+                    error        TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX idx_jobs_state_lease ON jobs (state, lease_until);
+                CREATE INDEX idx_jobs_created ON jobs (created_at);
+                INSERT INTO jobs (
+                    job_id, role, ticket, state, attempt, created_at, updated_at
+                ) VALUES ('old-job', 'implementer', 7, 'queued', 2, 100.0, 100.0);
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = jobs.JobStore(legacy_db)
+        connection = sqlite3.connect(legacy_db)
+        try:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+        finally:
+            connection.close()
+        self.assertIn("retry_at", columns)
+        migrated = store.get_job("old-job")
+        self.assertEqual(migrated["state"], "queued")
+        self.assertEqual(migrated["attempt"], 2)
+        self.assertIsNone(migrated["retry_at"])
 
     def test_store_persists_across_instances(self):
         job = self.enqueue()
@@ -406,7 +455,8 @@ class RequeueTests(JobStoreTestCase):
         )
         stored = self.store.get_job(job["job_id"])
         self.assertEqual(stored["state"], "queued")
-        self.assertEqual(stored["attempt"], 1)
+        self.assertEqual(stored["attempt"], 2)
+        self.assertIsNone(stored["retry_at"])
         self.assertIsNone(stored["lease_owner"])
         self.assertIsNone(stored["lease_until"])
         self.assertIsNone(stored["heartbeat_at"])
@@ -415,7 +465,56 @@ class RequeueTests(JobStoreTestCase):
 
         reclaimed = self.store.claim("runner-b", 30, now=130.0)
         self.assertEqual(reclaimed["job_id"], job["job_id"])
-        self.assertEqual(reclaimed["attempt"], 2)
+        self.assertEqual(reclaimed["attempt"], 3)
+        self.assertIsNone(reclaimed["retry_at"])
+
+    def test_requeue_delay_sets_retry_at_and_claim_waits_for_it(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 30, now=100.0)
+        self.assertTrue(
+            self.store.requeue(
+                job["job_id"], "runner-a", attempt=1, delay=60, now=120.0
+            )
+        )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertEqual(stored["attempt"], 2)
+        self.assertEqual(stored["retry_at"], 180.0)
+        self.assertIsNone(self.store.claim("runner-b", 30, now=179.0))
+
+        reclaimed = self.store.claim("runner-b", 30, now=180.0)
+        self.assertEqual(reclaimed["job_id"], job["job_id"])
+        self.assertEqual(reclaimed["attempt"], 3)
+        self.assertEqual(reclaimed["state"], "leased")
+        self.assertIsNone(reclaimed["retry_at"])
+
+    def test_requeue_accepts_an_absolute_retry_at(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 30, now=100.0)
+        self.assertTrue(
+            self.store.requeue(
+                job["job_id"], "runner-a", attempt=1, retry_at=500, now=120.0
+            )
+        )
+        self.assertEqual(self.store.get_job(job["job_id"])["retry_at"], 500.0)
+        self.assertIsNone(self.store.claim("runner-b", 30, now=499.0))
+        self.assertIsNotNone(self.store.claim("runner-b", 30, now=500.0))
+
+    def test_requeue_rejects_ambiguous_or_negative_backoff(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 30, now=100.0)
+        for kwargs in (
+            {"retry_at": 200, "delay": 60},
+            {"delay": -1},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    self.store.requeue(
+                        job["job_id"], "runner-a", attempt=1, now=110.0, **kwargs
+                    )
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "leased")
+        self.assertEqual(stored["attempt"], 1)
 
     def test_requeue_is_fenced_by_owner_and_attempt(self):
         job = self.enqueue()
@@ -448,6 +547,69 @@ class RequeueTests(JobStoreTestCase):
             self.store.requeue(job["job_id"], "", now=110.0)
         with self.assertRaises(ValueError):
             self.store.requeue(job["job_id"], "runner-a", attempt=-1, now=110.0)
+
+
+class RetryTests(JobStoreTestCase):
+    def _failed(self, ticket=1):
+        job = self.enqueue(ticket=ticket)
+        self.store.claim("runner-a", 30, now=100.0)
+        self.assertTrue(
+            self.store.finish(job["job_id"], "failed", "boom", owner="runner-a", now=110.0)
+        )
+        return job
+
+    def test_retry_resets_failed_job_and_preserves_attempt_history(self):
+        job = self._failed()
+        self.assertTrue(self.store.retry(job["job_id"], now=120.0))
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertEqual(stored["error"], "")
+        self.assertIsNone(stored["retry_at"])
+        self.assertIsNone(stored["lease_owner"])
+        self.assertIsNone(stored["lease_until"])
+        self.assertIsNone(stored["heartbeat_at"])
+        self.assertEqual(stored["attempt"], 2)
+        self.assertEqual(stored["updated_at"], 120.0)
+
+        reclaimed = self.store.claim("runner-b", 30, now=130.0)
+        self.assertEqual(reclaimed["job_id"], job["job_id"])
+        self.assertEqual(reclaimed["attempt"], 3)
+
+    def test_retry_resets_stale_job_and_clears_pending_retry_at(self):
+        job = self.enqueue()
+        self.store.claim("runner-a", 10, now=100.0)
+        self.store.reap_stale(now=111.0)
+        connection = sqlite3.connect(self.db)
+        try:
+            connection.execute(
+                "UPDATE jobs SET retry_at = 999 WHERE job_id = ?", (job["job_id"],)
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertTrue(self.store.retry(job["job_id"], now=120.0))
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertIsNone(stored["retry_at"])
+        self.assertEqual(stored["attempt"], 2)
+        self.assertIsNotNone(self.store.claim("runner-b", 30, now=120.0))
+
+    def test_retry_rejects_queued_active_done_and_missing_jobs(self):
+        active = self.enqueue(ticket=2, now=50.0)
+        self.store.claim("runner-a", 30, now=100.0)
+        done = self.enqueue(ticket=3, now=60.0)
+        self.store.claim("runner-a", 30, now=110.0)
+        self.store.finish(done["job_id"], "done", owner="runner-a", now=120.0)
+        queued = self.enqueue(ticket=1, now=200.0)
+
+        for job in (queued, active, done):
+            with self.subTest(ticket=job["ticket"]):
+                self.assertFalse(self.store.retry(job["job_id"], now=220.0))
+        self.assertFalse(self.store.retry("missing", now=220.0))
+        self.assertEqual(self.store.get_job(queued["job_id"])["state"], "queued")
+        self.assertEqual(self.store.get_job(active["job_id"])["state"], "leased")
+        self.assertEqual(self.store.get_job(done["job_id"])["state"], "done")
 
 
 class ReapStaleTests(JobStoreTestCase):
@@ -581,6 +743,65 @@ class JobsCliTests(JobStoreTestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("暂无记录", text)
+
+    def test_jobs_retry_resets_failed_job(self):
+        store = jobs.JobStore(self.db)
+        job = store.enqueue(
+            "implementer", 116, 44, "base000", "head111", PROMPT_HASH, now=1000.0
+        )
+        store.claim("runner-a", 60, now=1000.0)
+        store.finish(job["job_id"], "failed", "agent failed", owner="runner-a", now=1100.0)
+
+        code, text = self._output(
+            dispatcher.cmd_jobs_retry, argparse.Namespace(job_id=job["job_id"])
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("-> queued", text)
+        stored = store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertEqual(stored["attempt"], 2)
+        self.assertEqual(stored["error"], "")
+        self.assertIsNone(stored["retry_at"])
+
+    def test_jobs_retry_rejects_non_retryable_and_missing_jobs(self):
+        _, newer = self._seed()
+        code, text = self._output(
+            dispatcher.cmd_jobs_retry, argparse.Namespace(job_id=newer["job_id"])
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("仅 failed/stale 可 retry", text)
+        self.assertEqual(
+            jobs.JobStore(self.db).get_job(newer["job_id"])["state"], "queued"
+        )
+
+        code, text = self._output(
+            dispatcher.cmd_jobs_retry, argparse.Namespace(job_id="missing")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("未找到 job", text)
+
+    def test_main_dispatches_jobs_retry_from_argv(self):
+        store = jobs.JobStore(self.db)
+        job = store.enqueue(
+            "implementer", 117, 45, "base000", "head111", PROMPT_HASH, now=1000.0
+        )
+        store.claim("runner-a", 60, now=1000.0)
+        store.finish(job["job_id"], "failed", "boom", owner="runner-a", now=1100.0)
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "JOBS_DB_PATH", self.db),
+            mock.patch.object(
+                sys, "argv", ["dispatcher.py", "jobs", "retry", job["job_id"]]
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.main()
+        self.assertEqual(code, 0)
+        self.assertIn("-> queued", output.getvalue())
+        self.assertEqual(
+            jobs.JobStore(self.db).get_job(job["job_id"])["state"], "queued"
+        )
 
     def test_main_dispatches_jobs_list_from_argv(self):
         _, newer = self._seed()

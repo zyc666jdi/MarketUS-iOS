@@ -1478,6 +1478,62 @@ def run_agent_streaming(
         raise
 
 
+def command_error(result: subprocess.CompletedProcess[str]) -> str:
+    """Return the most useful stderr/stdout text for a failed command."""
+    return (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+
+
+def prepare_issue_worktree(branch: str, worktree: Path) -> str:
+    """Fetch main and add the implementer worktree; return an error or ``""``.
+
+    ``git worktree add -b`` fails when a previous run left the branch behind.
+    If that branch has no commits not already on ``origin/main`` it is safe to
+    delete and retry once; a branch with commits is surfaced untouched so no
+    agent work is discarded.  The original stderr is always included.
+    """
+    fetched = run(["git", "fetch", "origin", "main"])
+    if fetched.returncode != 0:
+        return f"git fetch 失败：{command_error(fetched)}"
+    added = run(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
+    if added.returncode == 0:
+        return ""
+    first_error = command_error(added)
+    if "already exists" not in first_error.lower():
+        return f"git worktree add 失败：{first_error}"
+
+    counted = run(["git", "rev-list", "--count", f"origin/main..{branch}"])
+    if counted.returncode != 0:
+        return (
+            f"git worktree add 失败（分支 {branch} 已存在），"
+            f"且无法统计未合并提交："
+            f"{command_error(counted)}；原始 stderr：{first_error}"
+        )
+    raw_count = (counted.stdout or "").strip()
+    try:
+        ahead = int(raw_count)
+    except ValueError:
+        return (
+            f"git worktree add 失败（分支 {branch} 已存在），提交数无效："
+            f"{raw_count!r}；原始 stderr：{first_error}"
+        )
+    if ahead > 0:
+        return (
+            f"git worktree add 失败：分支 {branch} 已有 {ahead} 个未合并提交，"
+            f"未自动删除；stderr：{first_error}"
+        )
+
+    deleted = run(["git", "branch", "-D", branch])
+    if deleted.returncode != 0:
+        return (
+            f"git worktree add 失败：无法删除无提交的 stale 分支 {branch}："
+            f"{command_error(deleted)}；原始 stderr：{first_error}"
+        )
+    retried = run(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
+    if retried.returncode != 0:
+        return f"git worktree add 重试失败：{command_error(retried)}"
+    return ""
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     number = args.issue
     issue = issue_detail(number)
@@ -1543,11 +1599,13 @@ def cmd_once(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        cmd(["git", "fetch", "origin", "main"])
-        cmd(["git", "worktree", "add", str(worktree), "-b", branch, "origin/main"])
-    except SystemExit as error:
+        worktree_error = prepare_issue_worktree(branch, worktree)
+    except OSError as error:
+        worktree_error = str(error)
+    if worktree_error:
+        print(f"⛔ 创建 worktree 失败：{worktree_error}")
         set_status(number, "status:blocked")
-        comment(number, f"⛔ 创建 worktree 失败：{error}")
+        comment(number, f"⛔ 创建 worktree 失败：{worktree_error}")
         return 1
 
     set_status(number, "status:in-progress")
@@ -1575,9 +1633,26 @@ def cmd_once(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         raise SystemExit(f"找不到 Agent 命令：{command[0]}")
 
-    prs = json.loads(
-        run(["gh", "pr", "list", "--head", branch, "--json", "number,url,title", "--limit", "1"]).stdout or "[]"
+    pr_list = run(
+        ["gh", "pr", "list", "--head", branch, "--json", "number,url,title", "--limit", "1"]
     )
+    if pr_list.returncode != 0:
+        detail = command_error(pr_list)
+        print(f"⛔ gh pr list 失败：{detail}")
+        set_status(number, "status:blocked")
+        comment(
+            number,
+            f"⛔ 查询 PR 失败：{detail}\n\n"
+            f"worktree: `{worktree}`，日志：`.agent/runs/{number}/`",
+        )
+        return 1
+    try:
+        prs = json.loads(pr_list.stdout or "[]")
+    except json.JSONDecodeError as error:
+        print(f"⛔ gh pr list 返回无效 JSON：{error}")
+        set_status(number, "status:blocked")
+        comment(number, f"⛔ 查询 PR 返回无效 JSON：{error}")
+        return 1
 
     auto_pr = None
     auto_reason = ""
@@ -4860,7 +4935,7 @@ def cmd_jobs_list(args: argparse.Namespace) -> int:
         return 0
     print(
         f"{'job_id':<34} {'state':<8} {'role':<12} {'ticket':>6} "
-        f"{'pr':>5} {'attempt':>7} {'lease_until':<21} updated_at"
+        f"{'pr':>5} {'attempt':>7} {'retry_at':<21} {'lease_until':<21} updated_at"
     )
     for row in rows:
         pr = row.get("pr")
@@ -4868,6 +4943,7 @@ def cmd_jobs_list(args: argparse.Namespace) -> int:
             f"{str(row.get('job_id') or '-'):<34} {str(row.get('state') or '-'):<8} "
             f"{str(row.get('role') or '-'):<12} {int(row.get('ticket') or 0):>6} "
             f"{(str(pr) if pr is not None else '-'):>5} {int(row.get('attempt') or 0):>7} "
+            f"{_format_job_time(row.get('retry_at')):<21} "
             f"{_format_job_time(row.get('lease_until')):<21} "
             f"{_format_job_time(row.get('updated_at'))}"
         )
@@ -4898,6 +4974,7 @@ def cmd_jobs_show(args: argparse.Namespace) -> int:
         ("lease_owner", job.get("lease_owner") or "-"),
         ("lease_until", _format_job_time(job.get("lease_until"))),
         ("heartbeat_at", _format_job_time(job.get("heartbeat_at"))),
+        ("retry_at", _format_job_time(job.get("retry_at"))),
         ("created_at", _format_job_time(job.get("created_at"))),
         ("updated_at", _format_job_time(job.get("updated_at"))),
         ("base_sha", job.get("base_sha") or "-"),
@@ -4910,9 +4987,41 @@ def cmd_jobs_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_jobs_retry(args: argparse.Namespace) -> int:
+    """Reset a failed/stale job to queued for another attempt."""
+    job_id = str(getattr(args, "job_id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", job_id):
+        print(f"⛔ 未找到 job：{job_id}")
+        return 1
+    try:
+        store = _job_store()
+        job = store.get_job(job_id)
+        if job is None:
+            print(f"⛔ 未找到 job：{job_id}")
+            return 1
+        state = str(job.get("state") or "")
+        if state not in ("failed", "stale"):
+            print(f"⛔ job {job_id} 当前 state={state or '-'}，仅 failed/stale 可 retry")
+            return 1
+        if not store.retry(job_id):
+            print(f"⛔ job {job_id} retry 失败（状态可能已变化）")
+            return 1
+        updated = store.get_job(job_id) or {}
+    except (OSError, sqlite3.Error) as error:
+        print(f"⛔ jobs retry: {error}")
+        return 1
+    print(
+        f"job {job_id} -> {updated.get('state') or 'queued'} "
+        f"(attempt {int(updated.get('attempt') or 0)})"
+    )
+    return 0
+
+
 def cmd_jobs(args: argparse.Namespace) -> int:
     if args.jobs_command == "list":
         return cmd_jobs_list(args)
+    if args.jobs_command == "retry":
+        return cmd_jobs_retry(args)
     return cmd_jobs_show(args)
 
 
@@ -4976,6 +5085,14 @@ def _print_scheduler_run(result: dict[str, Any]) -> None:
             f"heartbeat={int(heartbeat.get('beats') or 0)} "
             f"stopped={bool(heartbeat.get('stopped'))}"
         )
+        retry_delay = result.get("retry_delay")
+        if retry_delay is not None:
+            print(f"  retry in {int(float(retry_delay))}s")
+    if result.get("action") in ("failed", "requeued"):
+        for stream in ("stdout", "stderr"):
+            text = result.get(stream)
+            if text:
+                print(f"  {stream}: {text}")
     if result.get("error"):
         print(f"  error: {result['error']}")
 
@@ -5419,6 +5536,10 @@ def main() -> int:
     jobs_list_parser.add_argument("--limit", type=int, default=50, help="最多显示条数")
     jobs_show_parser = jobs_subparsers.add_parser("show", help="显示一个 job")
     jobs_show_parser.add_argument("job_id")
+    jobs_retry_parser = jobs_subparsers.add_parser(
+        "retry", help="将 failed/stale 的 job 重置为 queued"
+    )
+    jobs_retry_parser.add_argument("job_id")
 
     scheduler_parser = subparsers.add_parser(
         "scheduler", help="Scheduler shadow（只入队）或 run（显式执行一个 job）"
