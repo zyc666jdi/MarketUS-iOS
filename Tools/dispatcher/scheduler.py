@@ -42,7 +42,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,32 @@ DEFAULT_LEASE_SECONDS = 7200.0
 MAX_ERROR_CHARS = 2000
 # dispatcher.py uses 2 for "another process already holds the per-PR lock".
 EXIT_LOCK_BUSY = 2
+# GitHub infrastructure failures are retryable: back off 60s per attempt and
+# cap the wait at 15 minutes.  A busy per-PR lock only needs a short pause.
+GITHUB_INFRA_RETRY_BASE_SECONDS = 60.0
+GITHUB_INFRA_RETRY_MAX_SECONDS = 900.0
+LOCK_BUSY_RETRY_SECONDS = 5.0
+GITHUB_INFRA_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\btimeout\b|\btimed?\s+out\b", re.IGNORECASE),
+    re.compile(r"\bconnection\b", re.IGNORECASE),
+    re.compile(
+        r"\brate[\s_-]?limit(?:ed|ing)?\b|\btoo many requests\b", re.IGNORECASE
+    ),
+    re.compile(r"\bHTTP(?:/\d(?:\.\d)?)?\s*[: ]?\s*5\d{2}\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:status|response)(?:\s+code)?\s*[:=]?\s*5\d{2}\b", re.IGNORECASE
+    ),
+    re.compile(
+        r"\b5\d{2}\s+(?:internal server error|bad gateway|service unavailable|"
+        r"gateway timeout)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bgraphql\b[^\n]*\b(?:network|timeout|timed out|connection)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bnetwork (?:error|is unreachable)\b", re.IGNORECASE),
+)
 
 
 class SchedulerError(RuntimeError):
@@ -417,6 +443,36 @@ def _truncate(text: str, limit: int = MAX_ERROR_CHARS) -> str:
     return "…" + value[-(limit - 1):]
 
 
+def _combined_output(stdout: str, stderr: str) -> str:
+    """Label and join captured stdout/stderr; empty streams are omitted."""
+    sections = []
+    for label, value in (("stdout", stdout), ("stderr", stderr)):
+        text = str(value or "").strip()
+        if text:
+            sections.append(f"{label}:\n{text}")
+    return "\n".join(sections)
+
+
+def is_github_infrastructure_error(text: str) -> bool:
+    """Return True when the delegated command failed on GitHub infrastructure.
+
+    Covered failures are timeouts, connection errors, rate limits, HTTP 5xx
+    responses and GraphQL network errors.  The caller retries these with
+    backoff instead of treating them as a failed implementation attempt.
+    """
+    value = str(text or "")
+    return any(pattern.search(value) for pattern in GITHUB_INFRA_PATTERNS)
+
+
+def github_retry_delay(attempt: int) -> float:
+    """Return ``60s * attempt`` capped at 15 minutes (attempt is 1-based)."""
+    number = max(1, int(attempt or 0))
+    return min(
+        GITHUB_INFRA_RETRY_BASE_SECONDS * number,
+        GITHUB_INFRA_RETRY_MAX_SECONDS,
+    )
+
+
 def role_command(job: Mapping[str, Any]) -> list[str]:
     """Build the delegated dispatcher argv for one job, never through a shell."""
     role = str(job.get("role") or "").strip().lower()
@@ -459,6 +515,7 @@ def _execution_job(row: Mapping[str, Any]) -> dict[str, Any]:
         "pr": row.get("pr"),
         "state": row.get("state"),
         "attempt": int(row.get("attempt") or 0),
+        "retry_at": row.get("retry_at"),
     }
 
 
@@ -564,6 +621,45 @@ def _refresh_execution_state(
         return
     result["job"] = _execution_job(current)
     result["state"] = current.get("state")
+    result["retry_at"] = current.get("retry_at")
+
+
+def _apply_retry_recovery(
+    recovery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+    job: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run the optional pre-requeue recovery hook, normalizing failures."""
+    if recovery is None:
+        # Requeuing without restoring the issue would make the next claim fail
+        # admission; fail closed instead of silently breaking the retry.
+        return {
+            "ok": False,
+            "retryable": False,
+            "skipped": False,
+            "reason": "未配置 retry recovery，拒绝在状态未恢复时 requeue",
+        }
+    try:
+        outcome = recovery(job)
+    except (Exception, SystemExit) as error:
+        return {
+            "ok": False,
+            "retryable": False,
+            "skipped": False,
+            "reason": f"{type(error).__name__}: {error}",
+        }
+    if not isinstance(outcome, Mapping):
+        return {
+            "ok": False,
+            "retryable": False,
+            "skipped": False,
+            "reason": f"recovery 返回值无效：{type(outcome).__name__}",
+        }
+    result = dict(outcome)
+    result.setdefault("ok", False)
+    result.setdefault("retryable", True)
+    result.setdefault("skipped", False)
+    result["reason"] = str(result.get("reason") or "")
+    return result
 
 
 def run_once(
@@ -573,6 +669,7 @@ def run_once(
     lease_seconds: float = DEFAULT_LEASE_SECONDS,
     *,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+    recovery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Claim at most one queued job, run its role command, and record the outcome.
 
@@ -582,9 +679,17 @@ def run_once(
     delegated ``dispatcher.py`` subprocess runs, then finalizes the row:
 
     * exit 0 -> ``done``
-    * exit 2 (per-PR lock busy) -> back to ``queued`` via
+    * exit 2 (per-PR lock busy) -> back to ``queued`` with a short backoff via
       :meth:`JobStore.requeue`, never ``failed``
-    * any other exit or start failure -> ``failed`` with truncated stderr
+    * a GitHub infrastructure failure (timeout, connection, rate limit,
+      HTTP 5xx, GraphQL network) -> run the ``recovery`` hook first
+      (restore issue status, clean safe worktree), then ``queued`` with
+      exponential-ish backoff (60s per attempt, capped at 15 minutes); if
+      recovery fails or is not configured, the job becomes ``failed`` with
+      ``retryable=False`` and the reason is recorded instead of silently
+      requeueing a job whose issue cannot be claimed
+    * any other exit or start failure -> ``failed`` with the combined
+      stdout/stderr tail
 
     The scheduler never writes GitHub itself (only the delegated command may)
     and never merges.  The heartbeat is always stopped before the row is
@@ -609,6 +714,10 @@ def run_once(
                 "lease_seconds": lease,
                 "command": [],
                 "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "retry_at": None,
+                "retry_delay": None,
                 "error": "",
                 "finished": False,
                 "executed": False,
@@ -622,6 +731,10 @@ def run_once(
             "lease_seconds": lease,
             "command": [],
             "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "retry_at": None,
+            "retry_delay": None,
             "error": "",
             "finished": False,
             "executed": False,
@@ -643,6 +756,10 @@ def run_once(
             "lease_seconds": lease,
             "command": [],
             "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "retry_at": None,
+            "retry_delay": None,
             "error": "",
             "finished": False,
             "executed": False,
@@ -659,6 +776,10 @@ def run_once(
         "lease_seconds": lease,
         "command": [],
         "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "retry_at": None,
+        "retry_delay": None,
         "error": "",
         "finished": False,
         "executed": False,
@@ -693,8 +814,11 @@ def run_once(
         stderr = str(error)
     finally:
         heartbeat.stop()
+    combined = _combined_output(stdout, stderr)
     result["heartbeat"] = heartbeat.result()
     result["exit_code"] = exit_code
+    result["stdout"] = _truncate(stdout)
+    result["stderr"] = _truncate(stderr)
     result["executed"] = True
 
     if exit_code == 0:
@@ -704,12 +828,46 @@ def run_once(
     elif exit_code == EXIT_LOCK_BUSY:
         # Another dispatcher already owns this PR; leave the work claimable.
         result["action"] = "requeued"
+        result["retry_delay"] = LOCK_BUSY_RETRY_SECONDS
         result["finished"] = store.requeue(
-            job_id, owner_value, attempt=attempt, error=""
+            job_id,
+            owner_value,
+            attempt=attempt,
+            error="",
+            delay=LOCK_BUSY_RETRY_SECONDS,
         )
+    elif exit_code is not None and is_github_infrastructure_error(combined):
+        # GitHub had a transient outage.  Before retrying, put the issue back
+        # in the state its role expects and clean a safe stale worktree;
+        # otherwise the next claim would fail admission and burn the job.
+        recovery_result = _apply_retry_recovery(recovery, claimed)
+        result["recovery"] = recovery_result
+        result["retryable"] = bool(recovery_result.get("retryable", True))
+        if not recovery_result.get("ok") or not recovery_result.get("retryable", True):
+            reason = str(recovery_result.get("reason") or "unknown recovery failure")
+            message = _truncate(f"retry recovery failed: {reason}")
+            result["action"] = "failed"
+            result["retryable"] = False
+            result["error"] = message
+            result["finished"] = store.finish(
+                job_id, "failed", message, owner=owner_value, attempt=attempt
+            )
+        else:
+            message = _truncate(combined)
+            delay = github_retry_delay(attempt)
+            result["action"] = "requeued"
+            result["retryable"] = True
+            result["retry_delay"] = delay
+            result["finished"] = store.requeue(
+                job_id,
+                owner_value,
+                attempt=attempt,
+                error=message,
+                delay=delay,
+            )
     else:
         message = _truncate(
-            stderr or stdout or f"delegated command exited {exit_code}"
+            combined or f"delegated command exited {exit_code}"
         )
         result["action"] = "failed"
         result["error"] = message

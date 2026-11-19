@@ -642,7 +642,8 @@ class SchedulerRunOnceTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = Path(self.tmp.name) / "jobs.db"
-        self.store = job_store.JobStore(self.db)
+        self.now = 1_000_000.0
+        self.store = job_store.JobStore(self.db, now=lambda: self.now)
 
     def enqueue(self, role="implementer", ticket=134, pr=None, *, now=100.0,
                 prompt_hash=None, store=None):
@@ -739,6 +740,9 @@ class SchedulerRunOnceTests(unittest.TestCase):
         self.assertEqual(result["state"], "failed")
         self.assertTrue(result["finished"])
         self.assertEqual(result["exit_code"], 7)
+        self.assertEqual(result["stdout"], "out")
+        self.assertEqual(len(result["stderr"]), scheduler.MAX_ERROR_CHARS)
+        self.assertTrue(result["stderr"].endswith("x" * 10))
         self.assertLessEqual(len(result["error"]), scheduler.MAX_ERROR_CHARS)
         self.assertTrue(result["error"].endswith("x" * 10))
         self.assertTrue(result["heartbeat"]["stopped"])
@@ -748,7 +752,7 @@ class SchedulerRunOnceTests(unittest.TestCase):
         self.assertEqual(stored["error"], result["error"])
         self.assertIsNone(stored["lease_owner"])
 
-    def test_lock_busy_requeues_without_marking_failed(self):
+    def test_lock_busy_requeues_with_short_backoff_without_marking_failed(self):
         job = self.enqueue()
         with mock.patch.object(
             scheduler.subprocess,
@@ -761,17 +765,265 @@ class SchedulerRunOnceTests(unittest.TestCase):
         self.assertEqual(result["state"], "queued")
         self.assertTrue(result["finished"])
         self.assertEqual(result["error"], "")
+        self.assertEqual(result["retry_delay"], scheduler.LOCK_BUSY_RETRY_SECONDS)
+        self.assertEqual(result["retry_at"], self.now + scheduler.LOCK_BUSY_RETRY_SECONDS)
         self.assertTrue(result["heartbeat"]["stopped"])
 
         stored = self.store.get_job(job["job_id"])
         self.assertEqual(stored["state"], "queued")
         self.assertEqual(stored["error"], "")
-        self.assertEqual(stored["attempt"], 1)
+        self.assertEqual(stored["attempt"], 2)
+        self.assertEqual(stored["retry_at"], self.now + scheduler.LOCK_BUSY_RETRY_SECONDS)
         self.assertIsNone(stored["lease_owner"])
         self.assertIsNone(stored["lease_until"])
-        reclaimed = self.store.claim("next-tick", 60)
+        self.assertIsNone(self.store.claim("too-early", 60, now=self.now + 4.0))
+
+        reclaimed = self.store.claim("next-tick", 60, now=self.now + 5.0)
         self.assertEqual(reclaimed["job_id"], job["job_id"])
-        self.assertEqual(reclaimed["attempt"], 2)
+        self.assertEqual(reclaimed["attempt"], 3)
+
+    def test_github_timeout_requeues_with_backoff_instead_of_failing(self):
+        job = self.enqueue()
+        stderr = "gh: HTTP request timed out after 30s"
+        with mock.patch.object(
+            scheduler.subprocess, "run", return_value=self.completed(1, "", stderr)
+        ):
+            result = self.run_tick(recovery=lambda _job: {"ok": True, "retryable": True})
+
+        self.assertEqual(result["action"], "requeued")
+        self.assertEqual(result["state"], "queued")
+        self.assertTrue(result["finished"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["stderr"], stderr)
+        self.assertEqual(result["error"], "")
+        self.assertEqual(result["retry_delay"], 60.0)
+        self.assertEqual(result["retry_at"], self.now + 60.0)
+
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertEqual(stored["attempt"], 2)
+        self.assertEqual(stored["retry_at"], self.now + 60.0)
+        self.assertIn("timed out", stored["error"])
+        self.assertIsNone(self.store.claim("too-early", 60, now=self.now + 59.0))
+
+        reclaimed = self.store.claim("next-tick", 60, now=self.now + 60.0)
+        self.assertEqual(reclaimed["job_id"], job["job_id"])
+        self.assertEqual(reclaimed["attempt"], 3)
+
+    def test_infra_without_recovery_fails_closed(self):
+        job = self.enqueue()
+        with mock.patch.object(
+            scheduler.subprocess,
+            "run",
+            return_value=self.completed(1, "", "HTTP request timed out"),
+        ):
+            result = self.run_tick()
+
+        self.assertEqual(result["action"], "failed")
+        self.assertFalse(result["retryable"])
+        self.assertIn("未配置 retry recovery", result["error"])
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "failed")
+        self.assertIsNone(stored["retry_at"])
+
+    def test_infra_requeue_runs_recovery_before_requeue(self):
+        job = self.enqueue()
+        seen = []
+
+        def recovery(claimed):
+            seen.append(claimed)
+            return {
+                "ok": True,
+                "retryable": True,
+                "status": "status:ready",
+                "worktree_action": "cleaned",
+                "reason": "",
+            }
+
+        with mock.patch.object(
+            scheduler.subprocess,
+            "run",
+            return_value=self.completed(1, "", "HTTP request timed out"),
+        ):
+            result = self.run_tick(recovery=recovery)
+
+        self.assertEqual(result["action"], "requeued")
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["recovery"]["status"], "status:ready")
+        self.assertEqual(result["recovery"]["worktree_action"], "cleaned")
+        self.assertEqual(seen[0]["job_id"], job["job_id"])
+        self.assertEqual(seen[0]["role"], "implementer")
+        self.assertEqual(seen[0]["ticket"], 134)
+        self.assertEqual(seen[0]["attempt"], 1)
+        self.assertEqual(self.store.get_job(job["job_id"])["state"], "queued")
+
+    def test_infra_recovery_failure_fails_job_with_visible_reason(self):
+        job = self.enqueue()
+
+        def recovery(_claimed):
+            return {
+                "ok": False,
+                "retryable": False,
+                "status": "status:ready",
+                "reason": "worktree 有未提交改动，保留以避免丢失 Agent 工作",
+            }
+
+        with mock.patch.object(
+            scheduler.subprocess,
+            "run",
+            return_value=self.completed(1, "", "connection reset by peer"),
+        ):
+            result = self.run_tick(recovery=recovery)
+
+        self.assertEqual(result["action"], "failed")
+        self.assertEqual(result["state"], "failed")
+        self.assertFalse(result["retryable"])
+        self.assertIn("retry recovery failed", result["error"])
+        self.assertIn("未提交改动", result["error"])
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "failed")
+        self.assertIn("未提交改动", stored["error"])
+        self.assertIsNone(stored["retry_at"])
+        self.assertIsNone(self.store.claim("next-tick", 60, now=self.now + 60.0))
+
+    def test_infra_recovery_exception_fails_job_with_clear_error(self):
+        job = self.enqueue()
+
+        def recovery(_claimed):
+            raise RuntimeError("gh down")
+
+        with mock.patch.object(
+            scheduler.subprocess,
+            "run",
+            return_value=self.completed(1, "", "GraphQL: network error"),
+        ):
+            result = self.run_tick(recovery=recovery)
+
+        self.assertEqual(result["action"], "failed")
+        self.assertIn("RuntimeError: gh down", result["error"])
+        self.assertEqual(self.store.get_job(job["job_id"])["state"], "failed")
+
+    def test_next_tick_after_infra_recovery_requeue_can_execute(self):
+        job = self.enqueue()
+        before = {
+            "number": 134,
+            "title": "test ticket",
+            "state": "open",
+            "labels": [
+                {"name": "status:claimed"},
+                {"name": "status:in-progress"},
+            ],
+        }
+        after = {
+            **before,
+            "labels": [{"name": "status:ready"}],
+        }
+        status_calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(dispatcher, "WORKTREE_ROOT", Path(tmp)),
+                mock.patch.object(
+                    dispatcher, "issue_detail", side_effect=[before, after]
+                ),
+                mock.patch.object(
+                    dispatcher, "clean_issue_worktree", return_value=""
+                ) as clean,
+                mock.patch.object(
+                    dispatcher,
+                    "gh",
+                    side_effect=lambda args: status_calls.append(args),
+                ),
+                mock.patch.object(
+                    scheduler.subprocess,
+                    "run",
+                    return_value=self.completed(1, "", "HTTP request timed out"),
+                ),
+            ):
+                first = self.run_tick(recovery=dispatcher.recover_scheduler_retry)
+            worktree = Path(tmp) / "134-test-ticket"
+
+        self.assertEqual(first["action"], "requeued")
+        self.assertEqual(first["recovery"]["status"], "status:ready")
+        self.assertEqual(first["recovery"]["worktree_action"], "cleaned")
+        self.assertEqual(first["state"], "queued")
+        clean.assert_called_once_with(
+            "ai/134-test-ticket", worktree, remove=True
+        )
+        self.assertIn("status:ready", status_calls[0])
+        self.assertIn("status:claimed", status_calls[0])
+
+        self.now += first["retry_delay"]
+        with mock.patch.object(
+            scheduler.subprocess, "run", return_value=self.completed(0, "ok")
+        ) as run:
+            second = self.run_tick()
+
+        self.assertEqual(second["action"], "executed")
+        self.assertEqual(second["state"], "done")
+        self.assertEqual(run.call_count, 1)
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "done")
+        self.assertEqual(stored["attempt"], 3)
+
+    def test_lock_busy_does_not_invoke_retry_recovery(self):
+        self.enqueue()
+
+        def recovery(_claimed):
+            raise AssertionError("lock busy must not run recovery")
+
+        with mock.patch.object(
+            scheduler.subprocess,
+            "run",
+            return_value=self.completed(scheduler.EXIT_LOCK_BUSY),
+        ):
+            result = self.run_tick(recovery=recovery)
+
+        self.assertEqual(result["action"], "requeued")
+
+    def test_github_infrastructure_classifier_covers_required_failures(self):
+        infrastructure = (
+            "timeout",
+            "request timed out",
+            "connection refused",
+            "API rate limit exceeded",
+            "HTTP 502: Bad Gateway",
+            "status code: 503",
+            "GraphQL: network error",
+            "network is unreachable",
+        )
+        for text in infrastructure:
+            with self.subTest(text=text):
+                self.assertTrue(scheduler.is_github_infrastructure_error(text))
+        for text in ("assertion failed", "syntax error", "agent exited 1", ""):
+            with self.subTest(text=text):
+                self.assertFalse(scheduler.is_github_infrastructure_error(text))
+
+    def test_github_retry_delay_grows_linearly_and_caps_at_fifteen_minutes(self):
+        self.assertEqual(scheduler.github_retry_delay(1), 60.0)
+        self.assertEqual(scheduler.github_retry_delay(2), 120.0)
+        self.assertEqual(scheduler.github_retry_delay(0), 60.0)
+        self.assertEqual(scheduler.github_retry_delay(14), 840.0)
+        self.assertEqual(scheduler.github_retry_delay(15), 900.0)
+        self.assertEqual(scheduler.github_retry_delay(99), 900.0)
+
+    def test_non_infra_failure_keeps_stdout_and_stderr_tails(self):
+        job = self.enqueue()
+        stdout = "agent output line"
+        stderr = "fatal: validation failed"
+        with mock.patch.object(
+            scheduler.subprocess, "run", return_value=self.completed(1, stdout, stderr)
+        ):
+            result = self.run_tick()
+
+        self.assertEqual(result["action"], "failed")
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["stdout"], stdout)
+        self.assertEqual(result["stderr"], stderr)
+        self.assertIn("stdout:\n" + stdout, result["error"])
+        self.assertIn("stderr:\n" + stderr, result["error"])
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "failed")
+        self.assertEqual(stored["error"], result["error"])
 
     def test_heartbeat_renews_while_command_runs_and_stops_afterwards(self):
         job = self.enqueue()
@@ -1015,7 +1267,9 @@ class SchedulerRunCliTests(unittest.TestCase):
         payload = json.loads(text)
         self.assertEqual(payload["action"], "executed")
         self.assertEqual(payload["job"]["ticket"], 134)
-        run_once.assert_called_once_with(mock.ANY)
+        run_once.assert_called_once_with(
+            mock.ANY, recovery=dispatcher.recover_scheduler_retry
+        )
 
     def test_cli_returns_nonzero_for_a_failed_job(self):
         with mock.patch.object(scheduler, "run_once", return_value=self.result("failed")):
