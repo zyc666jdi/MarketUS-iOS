@@ -106,6 +106,9 @@ LOOP_STATE_NAME = "loop-state.json"
 LOOP_STALE_SECONDS_ENV = "MARKETUS_LOOP_STALE_SECONDS"
 LOOP_STALE_SECONDS = 7200
 LOOP_STALE_STATUS = "stale"
+# Phase 1c-iii execution is opt-in; any value other than "1" keeps the legacy
+# repair/dispatch/review sweeps.
+SCHEDULER_ENV = "MARKETUS_SCHEDULER"
 AGENT_ROLE_STEPS = {
     "implementer": "dispatch",
     "reviewer": "review",
@@ -250,6 +253,11 @@ def loop_stale_seconds() -> int:
     except ValueError:
         return LOOP_STALE_SECONDS
     return configured if configured > 0 else LOOP_STALE_SECONDS
+
+
+def scheduler_enabled() -> bool:
+    """Scheduler execution is opt-in and enabled only by MARKETUS_SCHEDULER=1."""
+    return os.environ.get(SCHEDULER_ENV, "0").strip() == "1"
 
 
 def error_summary(error: BaseException) -> str:
@@ -4948,9 +4956,54 @@ def _print_scheduler_shadow(result: dict[str, Any]) -> None:
     print(f"  missing_pr     {missing}")
 
 
+def _print_scheduler_run(result: dict[str, Any]) -> None:
+    """Render one explicit scheduler execution tick."""
+    print("scheduler run (claim → execute → finish; no merge)")
+    job = result.get("job")
+    if not job:
+        print("  no queued job")
+    else:
+        pr = job["pr"] if job["pr"] is not None else "-"
+        print(
+            f"  {job['job_id']} {job['role']} ticket={job['ticket']} pr={pr} "
+            f"state={result.get('state') or '-'} action={result.get('action')}"
+        )
+        print(f"  command: {' '.join(result.get('command') or []) or '-'}")
+        heartbeat = result.get("heartbeat") or {}
+        exit_code = result.get("exit_code")
+        print(
+            f"  exit={exit_code if exit_code is not None else '-'} "
+            f"heartbeat={int(heartbeat.get('beats') or 0)} "
+            f"stopped={bool(heartbeat.get('stopped'))}"
+        )
+    if result.get("error"):
+        print(f"  error: {result['error']}")
+
+
+def _cmd_scheduler_run(args: argparse.Namespace) -> int:
+    """Claim and execute at most one queued job (explicit opt-in).
+
+    ``--once`` is accepted as the explicit single-tick spelling; one tick is
+    already the only mode, matching the launchd ``run`` cadence.
+    """
+    try:
+        result = scheduler.run_once(_job_store())
+    except (OSError, sqlite3.Error, ValueError, scheduler.SchedulerError) as error:
+        print(f"⛔ scheduler run: {error}")
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        _print_scheduler_run(result)
+    return 1 if result.get("action") == "failed" else 0
+
+
 def cmd_scheduler(args: argparse.Namespace) -> int:
-    """Scheduler shadow: enqueue desired jobs once; never claim or execute."""
-    if getattr(args, "scheduler_command", None) != "shadow":
+    """Scheduler subcommands: shadow enqueue only or explicit single tick."""
+    command = getattr(args, "scheduler_command", None)
+    if command == "run":
+        return _cmd_scheduler_run(args)
+    if command != "shadow":
         print("⛔ scheduler: 缺少子命令")
         return 2
     try:
@@ -5056,6 +5109,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         trace.finish_or_defer()
 
 
+def _run_planner_phase(args: argparse.Namespace, trace: LoopTrace,
+                       prs: list[dict[str, Any]]) -> None:
+    """Run the idle-time Planner phase; shared by legacy and scheduler runs."""
+    with trace.step("planner") as phase:
+        try:
+            open_ai_prs = [pr for pr in prs if pr.get("headRefName", "").startswith("ai/")]
+            active = [issue for issue in list_issues() if labels_of(issue) & ACTIVE_STATUS]
+            ready_now = list_issues("status:ready")
+        except SystemExit as error:
+            print(f"planner: 无法读取仓库状态，跳过本轮（{error}）")
+        else:
+            code = maybe_run_planner(args, ready_now, open_ai_prs, active)
+            if code != 0:
+                phase.fail(f"planner exit={code}")
+
+
 def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
     state_dir = STATE_ROOT
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -5081,6 +5150,45 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
             code = cmd_watch(argparse.Namespace(dry_run=args.dry_run))
             if code != 0:
                 phase.fail(f"watch exit={code}")
+
+        if scheduler_enabled():
+            # Phase 1c-iii: the job store replaces the legacy repair/dispatch/
+            # review sweeps, still claiming at most one job per tick.
+            with trace.step("scheduler") as phase:
+                try:
+                    result = scheduler.run_once(
+                        _job_store(), execute=not args.dry_run
+                    )
+                except (
+                    OSError,
+                    sqlite3.Error,
+                    ValueError,
+                    scheduler.SchedulerError,
+                ) as error:
+                    print(f"⛔ scheduler: {error}")
+                    phase.fail(f"scheduler: {error}")
+                else:
+                    _print_scheduler_run(result)
+                    if result.get("action") == "failed":
+                        job = result.get("job") or {}
+                        phase.fail(
+                            f"scheduler job {job.get('job_id') or '-'} failed"
+                        )
+            # Planner keeps its idle signal but does not run a legacy sweep.
+            prs = gh_json(
+                [
+                    "pr",
+                    "list",
+                    "--state",
+                    "open",
+                    "--limit",
+                    str(OPEN_PR_LIMIT),
+                    "--json",
+                    "number,body,headRefName,isDraft,createdAt",
+                ]
+            )
+            _run_planner_phase(args, trace, prs)
+            return 0
 
         with trace.step("repair") as phase:
             prs = gh_json(
@@ -5248,17 +5356,7 @@ def _run_loop_phases(args: argparse.Namespace, trace: LoopTrace) -> int:
                 break
 
         # 只有完全空闲时才让 Planner 选题；每轮最多创建 1 张，下一轮才会被派发。
-        with trace.step("planner") as phase:
-            try:
-                open_ai_prs = [pr for pr in prs if pr.get("headRefName", "").startswith("ai/")]
-                active = [issue for issue in list_issues() if labels_of(issue) & ACTIVE_STATUS]
-                ready_now = list_issues("status:ready")
-            except SystemExit as error:
-                print(f"planner: 无法读取仓库状态，跳过本轮（{error}）")
-            else:
-                code = maybe_run_planner(args, ready_now, open_ai_prs, active)
-                if code != 0:
-                    phase.fail(f"planner exit={code}")
+        _run_planner_phase(args, trace, prs)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
@@ -5323,7 +5421,7 @@ def main() -> int:
     jobs_show_parser.add_argument("job_id")
 
     scheduler_parser = subparsers.add_parser(
-        "scheduler", help="Scheduler shadow（只入队，不执行）"
+        "scheduler", help="Scheduler shadow（只入队）或 run（显式执行一个 job）"
     )
     scheduler_subparsers = scheduler_parser.add_subparsers(
         dest="scheduler_command", required=True
@@ -5332,6 +5430,13 @@ def main() -> int:
         "shadow", help="生成 desired jobs 并幂等写入 jobs.db"
     )
     shadow_parser.add_argument("--json", action="store_true", help="输出 JSON")
+    scheduler_run_parser = scheduler_subparsers.add_parser(
+        "run", help="CAS 领取并执行一个 queued job（默认每次一个 tick）"
+    )
+    scheduler_run_parser.add_argument(
+        "--once", action="store_true", help="只跑一个 tick 后退出（当前默认行为）"
+    )
+    scheduler_run_parser.add_argument("--json", action="store_true", help="输出 JSON")
 
     run_parser = subparsers.add_parser("run", help="单次巡检：postmerge → dispatch → review → planner")
     run_parser.add_argument("--dry-run", action="store_true")

@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -632,6 +633,410 @@ class ReadOnlyGhTests(unittest.TestCase):
         with mock.patch.object(scheduler.subprocess, "run", return_value=failed):
             with self.assertRaises(scheduler.SchedulerError):
                 scheduler.read_issues()
+
+
+class SchedulerRunOnceTests(unittest.TestCase):
+    """Phase 1c-iii execution: claim, heartbeat, role command, finish/requeue."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "jobs.db"
+        self.store = job_store.JobStore(self.db)
+
+    def enqueue(self, role="implementer", ticket=134, pr=None, *, now=100.0,
+                prompt_hash=None, store=None):
+        return (store or self.store).enqueue(
+            role,
+            ticket,
+            pr,
+            prompt_hash=prompt_hash or PROMPT_HASHES.get(role, "sha256:job"),
+            now=now,
+        )
+
+    @staticmethod
+    def completed(code=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess([], code, stdout, stderr)
+
+    def run_tick(self, **kwargs):
+        kwargs.setdefault("owner", "tester")
+        kwargs.setdefault("lease_seconds", 60)
+        kwargs.setdefault("heartbeat_interval", 0.01)
+        return scheduler.run_once(self.store, **kwargs)
+
+    def test_success_marks_job_done_with_dispatcher_command(self):
+        job = self.enqueue()
+        with mock.patch.object(
+            scheduler.subprocess, "run", return_value=self.completed(0, "ok")
+        ) as run:
+            result = self.run_tick()
+
+        self.assertEqual(result["action"], "executed")
+        self.assertEqual(result["state"], "done")
+        self.assertTrue(result["finished"])
+        self.assertTrue(result["executed"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["error"], "")
+        self.assertTrue(result["heartbeat"]["started"])
+        self.assertTrue(result["heartbeat"]["stopped"])
+        self.assertFalse(result["heartbeat"]["alive"])
+
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "done")
+        self.assertEqual(stored["attempt"], 1)
+        self.assertIsNone(stored["lease_owner"])
+
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                sys.executable,
+                str(scheduler.DISPATCHER_PATH),
+                "once",
+                "--issue",
+                "134",
+                "--execute",
+            ],
+        )
+        self.assertNotIn("merge", command)
+        self.assertFalse(run.call_args.kwargs.get("shell", False))
+
+    def test_each_role_maps_to_its_existing_dispatcher_entry_point(self):
+        cases = (
+            ("implementer", None, ["once", "--issue", "134", "--execute"]),
+            ("reviewer", 42, ["review", "--pr", "42", "--execute"]),
+            ("repair", 43, ["repair", "--pr", "43", "--execute"]),
+        )
+        for role, pr, tail in cases:
+            with self.subTest(role=role):
+                db = Path(self.tmp.name) / f"{role}.db"
+                store = job_store.JobStore(db)
+                job = self.enqueue(role=role, ticket=134, pr=pr, store=store)
+                with mock.patch.object(
+                    scheduler.subprocess, "run", return_value=self.completed(0)
+                ) as run:
+                    result = scheduler.run_once(
+                        store,
+                        owner="tester",
+                        lease_seconds=60,
+                        heartbeat_interval=0.01,
+                    )
+                self.assertEqual(result["action"], "executed")
+                self.assertEqual(result["state"], "done")
+                self.assertEqual(run.call_args.args[0][1:], [str(scheduler.DISPATCHER_PATH), *tail])
+                self.assertEqual(store.get_job(job["job_id"])["state"], "done")
+
+    def test_nonzero_exit_marks_job_failed_with_truncated_stderr(self):
+        job = self.enqueue()
+        stderr = "x" * 5000
+        with mock.patch.object(
+            scheduler.subprocess, "run", return_value=self.completed(7, "out", stderr)
+        ):
+            result = self.run_tick()
+
+        self.assertEqual(result["action"], "failed")
+        self.assertEqual(result["state"], "failed")
+        self.assertTrue(result["finished"])
+        self.assertEqual(result["exit_code"], 7)
+        self.assertLessEqual(len(result["error"]), scheduler.MAX_ERROR_CHARS)
+        self.assertTrue(result["error"].endswith("x" * 10))
+        self.assertTrue(result["heartbeat"]["stopped"])
+
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "failed")
+        self.assertEqual(stored["error"], result["error"])
+        self.assertIsNone(stored["lease_owner"])
+
+    def test_lock_busy_requeues_without_marking_failed(self):
+        job = self.enqueue()
+        with mock.patch.object(
+            scheduler.subprocess,
+            "run",
+            return_value=self.completed(scheduler.EXIT_LOCK_BUSY, "", "lock busy"),
+        ):
+            result = self.run_tick()
+
+        self.assertEqual(result["action"], "requeued")
+        self.assertEqual(result["state"], "queued")
+        self.assertTrue(result["finished"])
+        self.assertEqual(result["error"], "")
+        self.assertTrue(result["heartbeat"]["stopped"])
+
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertEqual(stored["error"], "")
+        self.assertEqual(stored["attempt"], 1)
+        self.assertIsNone(stored["lease_owner"])
+        self.assertIsNone(stored["lease_until"])
+        reclaimed = self.store.claim("next-tick", 60)
+        self.assertEqual(reclaimed["job_id"], job["job_id"])
+        self.assertEqual(reclaimed["attempt"], 2)
+
+    def test_heartbeat_renews_while_command_runs_and_stops_afterwards(self):
+        job = self.enqueue()
+        first_beat = threading.Event()
+        calls = []
+
+        def fake_heartbeat(job_id, owner, ttl, **kwargs):
+            calls.append((job_id, owner, ttl))
+            first_beat.set()
+            return True
+
+        def fake_run(command, **kwargs):
+            if not first_beat.wait(2.0):
+                return subprocess.CompletedProcess(command, 99, "", "no heartbeat")
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with (
+            mock.patch.object(self.store, "heartbeat", side_effect=fake_heartbeat),
+            mock.patch.object(scheduler.subprocess, "run", side_effect=fake_run),
+        ):
+            result = self.run_tick(owner="beat-owner", lease_seconds=60)
+
+        self.assertEqual(calls[0], (job["job_id"], "beat-owner", 60))
+        self.assertGreaterEqual(result["heartbeat"]["beats"], 1)
+        self.assertTrue(result["heartbeat"]["started"])
+        self.assertTrue(result["heartbeat"]["stopped"])
+        self.assertFalse(result["heartbeat"]["alive"])
+        self.assertFalse(
+            any(
+                thread.name == f"scheduler-heartbeat-{job['job_id']}"
+                and thread.is_alive()
+                for thread in threading.enumerate()
+            )
+        )
+        self.assertEqual(self.store.get_job(job["job_id"])["state"], "done")
+
+    def test_one_tick_claims_only_one_job_and_the_next_tick_gets_the_other(self):
+        first = self.enqueue(ticket=134, now=100.0)
+        second = self.enqueue(ticket=135, now=200.0)
+        with mock.patch.object(
+            scheduler.subprocess, "run", return_value=self.completed(0)
+        ) as run:
+            first_result = self.run_tick()
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(first_result["job"]["job_id"], first["job_id"])
+        self.assertEqual(self.store.get_job(first["job_id"])["state"], "done")
+        self.assertEqual(self.store.get_job(second["job_id"])["state"], "queued")
+
+        with mock.patch.object(
+            scheduler.subprocess, "run", return_value=self.completed(0)
+        ) as second_run:
+            second_result = self.run_tick()
+        self.assertEqual(second_run.call_count, 1)
+        self.assertEqual(second_result["job"]["job_id"], second["job_id"])
+        self.assertEqual(self.store.get_job(second["job_id"])["state"], "done")
+
+        with mock.patch.object(scheduler.subprocess, "run") as idle_run:
+            idle = self.run_tick()
+        idle_run.assert_not_called()
+        self.assertEqual(idle["action"], "idle")
+        self.assertIsNone(idle["job"])
+        self.assertFalse(idle["heartbeat"]["started"])
+
+    def test_a_second_tick_cannot_execute_an_already_leased_job(self):
+        job = self.enqueue()
+        running = threading.Event()
+        release = threading.Event()
+        calls = []
+        results = {}
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            running.set()
+            if not release.wait(2.0):
+                return subprocess.CompletedProcess(command, 99, "", "stuck")
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        def worker():
+            results["first"] = scheduler.run_once(
+                self.store,
+                owner="tick-a",
+                lease_seconds=60,
+                heartbeat_interval=0.01,
+            )
+
+        with mock.patch.object(scheduler.subprocess, "run", side_effect=fake_run):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            try:
+                self.assertTrue(running.wait(2.0))
+                second = scheduler.run_once(
+                    self.store,
+                    owner="tick-b",
+                    lease_seconds=60,
+                    heartbeat_interval=0.01,
+                )
+                self.assertEqual(second["action"], "idle")
+                self.assertIsNone(second["job"])
+            finally:
+                release.set()
+                thread.join(timeout=3.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results["first"]["state"], "done")
+        self.assertEqual(self.store.get_job(job["job_id"])["state"], "done")
+
+    def test_oserror_marks_job_failed_and_still_stops_heartbeat(self):
+        job = self.enqueue()
+        with mock.patch.object(
+            scheduler.subprocess, "run", side_effect=OSError("cannot exec")
+        ):
+            result = self.run_tick()
+
+        self.assertEqual(result["action"], "failed")
+        self.assertEqual(result["state"], "failed")
+        self.assertIsNone(result["exit_code"])
+        self.assertIn("cannot exec", result["error"])
+        self.assertTrue(result["heartbeat"]["started"])
+        self.assertTrue(result["heartbeat"]["stopped"])
+        self.assertEqual(self.store.get_job(job["job_id"])["state"], "failed")
+
+    def test_unknown_role_fails_without_running_a_command(self):
+        job = self.enqueue(role="planner", prompt_hash="sha256:planner")
+        with mock.patch.object(scheduler.subprocess, "run") as run:
+            result = self.run_tick()
+
+        run.assert_not_called()
+        self.assertEqual(result["action"], "failed")
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("未知 role", result["error"])
+        self.assertFalse(result["heartbeat"]["started"])
+        self.assertEqual(self.store.get_job(job["job_id"])["state"], "failed")
+
+    def test_lock_busy_exit_code_matches_dispatcher_contract(self):
+        self.assertEqual(scheduler.EXIT_LOCK_BUSY, dispatcher.EXIT_LOCK_BUSY)
+        self.assertEqual(dispatcher.EXIT_LOCK_BUSY, 2)
+
+    def test_dry_run_previews_without_claiming_or_executing(self):
+        job = self.enqueue()
+        with mock.patch.object(scheduler.subprocess, "run") as run:
+            result = self.run_tick(execute=False)
+
+        run.assert_not_called()
+        self.assertEqual(result["action"], "dry_run")
+        self.assertEqual(result["state"], "queued")
+        self.assertFalse(result["executed"])
+        self.assertEqual(result["command"][2:], ["once", "--issue", "134", "--execute"])
+        self.assertFalse(result["heartbeat"]["started"])
+        stored = self.store.get_job(job["job_id"])
+        self.assertEqual(stored["state"], "queued")
+        self.assertEqual(stored["attempt"], 0)
+        self.assertIsNone(stored["lease_owner"])
+
+    def test_empty_queue_is_idle(self):
+        with mock.patch.object(scheduler.subprocess, "run") as run:
+            result = self.run_tick()
+
+        run.assert_not_called()
+        self.assertEqual(result["action"], "idle")
+        self.assertEqual(result["state"], None)
+        self.assertFalse(result["executed"])
+        self.assertFalse(result["finished"])
+
+    def test_run_once_rejects_invalid_lease_or_heartbeat_interval(self):
+        self.enqueue()
+        with self.assertRaises(ValueError):
+            scheduler.run_once(self.store, lease_seconds=0)
+        with self.assertRaises(ValueError):
+            scheduler.run_once(self.store, heartbeat_interval=0)
+        with self.assertRaises(ValueError):
+            scheduler.run_once(self.store, heartbeat_interval=float("nan"))
+
+
+class SchedulerRunCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "jobs.db"
+
+    def run_cli(self, *argv):
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "JOBS_DB_PATH", self.db),
+            mock.patch.object(sys, "argv", ["dispatcher.py", "scheduler", "run", *argv]),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.main()
+        return code, output.getvalue()
+
+    def result(self, action="executed"):
+        return {
+            "action": action,
+            "job": {
+                "job_id": "implementer-134-abcdef0123456789",
+                "role": "implementer",
+                "ticket": 134,
+                "pr": None,
+                "state": "done" if action == "executed" else "failed",
+                "attempt": 1,
+            },
+            "state": "done" if action == "executed" else "failed",
+            "owner": "scheduler-1",
+            "lease_seconds": 7200,
+            "command": [sys.executable, str(scheduler.DISPATCHER_PATH), "once",
+                        "--issue", "134", "--execute"],
+            "exit_code": 0 if action == "executed" else 1,
+            "error": "" if action == "executed" else "agent failed",
+            "finished": True,
+            "executed": True,
+            "heartbeat": {
+                "started": True, "stopped": True, "alive": False,
+                "beats": 1, "rejected": 0, "errors": 0,
+                "interval_seconds": 30.0,
+            },
+        }
+
+    def test_parser_dispatches_scheduler_run_once_json(self):
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["dispatcher.py", "scheduler", "run", "--once", "--json"],
+            ),
+            mock.patch.object(dispatcher, "cmd_scheduler", return_value=0) as command,
+        ):
+            self.assertEqual(dispatcher.main(), 0)
+        command.assert_called_once()
+        args = command.call_args.args[0]
+        self.assertEqual(args.scheduler_command, "run")
+        self.assertTrue(args.once)
+        self.assertTrue(args.json)
+
+    def test_cli_json_reports_a_completed_tick(self):
+        with mock.patch.object(
+            scheduler, "run_once", return_value=self.result()
+        ) as run_once:
+            code, text = self.run_cli("--once", "--json")
+
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertEqual(payload["action"], "executed")
+        self.assertEqual(payload["job"]["ticket"], 134)
+        run_once.assert_called_once_with(mock.ANY)
+
+    def test_cli_returns_nonzero_for_a_failed_job(self):
+        with mock.patch.object(scheduler, "run_once", return_value=self.result("failed")):
+            code, text = self.run_cli("--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(text)["error"], "agent failed")
+
+    def test_cli_reports_execution_errors_without_traceback(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(dispatcher, "JOBS_DB_PATH", self.db),
+            mock.patch.object(
+                scheduler, "run_once", side_effect=scheduler.SchedulerError("db boom")
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            code = dispatcher.cmd_scheduler(
+                argparse.Namespace(scheduler_command="run", json=False)
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("scheduler run: db boom", output.getvalue())
 
 
 class SchedulerCliTests(unittest.TestCase):

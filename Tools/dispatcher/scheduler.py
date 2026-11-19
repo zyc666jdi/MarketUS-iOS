@@ -1,10 +1,15 @@
-"""Phase 1c-ii: scheduler shadow planning for the dispatcher.
+"""Phase 1c-ii/iii: scheduler shadow planning and opt-in execution.
 
 The scheduler turns the current issue labels plus open PRs into the jobs the
-dispatcher *would* want, then enqueues them into the Phase 1c-i job store.  It
-stops there: this phase never claims a job, never runs an agent, and never
-writes to GitHub (labels, comments, branches or PRs).  ``dispatcher.py
-scheduler shadow`` is the only entry point and is not wired into ``run``.
+dispatcher *would* want, then enqueues them into the Phase 1c-i job store
+(:func:`shadow_tick`).  Shadow planning never claims a job, never runs an agent
+and never writes to GitHub.
+
+Phase 1c-iii adds opt-in execution on top of that queue (:func:`run_once`):
+one CAS claim per tick, a heartbeat thread that renews the lease, and a
+delegated ``dispatcher.py`` subprocess selected by role.  Execution is off by
+default; ``dispatcher.py run`` only uses it when ``MARKETUS_SCHEDULER=1`` is
+set, and ``dispatcher.py scheduler run`` must be invoked explicitly.
 
 Job ids come from :func:`jobs.derive_job_id` and are stable by construction:
 
@@ -21,15 +26,22 @@ Job ids come from :func:`jobs.derive_job_id` and are stable by construction:
   with a stale prompt.
 
 Inputs may be passed in (tests, callers) or read through read-only ``gh``
-list commands.  The module has no write path to GitHub.
+list commands.  Shadow planning has no write path to GitHub; execution only
+writes GitHub through the delegated ``once`` / ``review`` / ``repair`` command
+and never merges.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import re
+import sqlite3
 import subprocess
+import sys
+import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +50,7 @@ from typing import Any
 from jobs import JOB_STATES, JobStore, derive_job_id
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DISPATCHER_PATH = Path(__file__).resolve().with_name("dispatcher.py")
 
 # repair reuses the implementer prompt, matching config/agents.yaml.
 PROMPT_PATHS: dict[str, Path] = {
@@ -70,6 +83,13 @@ GH_PR_PAGE_SIZE = 100
 
 PR_BRANCH_PATTERN = re.compile(r"(?:ai|human)/(\d+)-", re.IGNORECASE)
 PR_ISSUE_PATTERN = re.compile(r"(?:Fixes|Closes|Refs)\s*#(\d+)", re.IGNORECASE)
+
+# Execution (Phase 1c-iii): one claim per tick, lease renewed while a command runs.
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+DEFAULT_LEASE_SECONDS = 7200.0
+MAX_ERROR_CHARS = 2000
+# dispatcher.py uses 2 for "another process already holds the per-PR lock".
+EXIT_LOCK_BUSY = 2
 
 
 class SchedulerError(RuntimeError):
@@ -379,6 +399,328 @@ def shadow_tick(
         "diff": diff,
         "db_counts": db_counts,
     }
+
+
+# -- execution (Phase 1c-iii) ------------------------------------------------
+
+
+def default_owner() -> str:
+    """Return the lease owner used when the caller does not name one."""
+    return f"scheduler-{os.getpid()}"
+
+
+def _truncate(text: str, limit: int = MAX_ERROR_CHARS) -> str:
+    """Keep at most ``limit`` characters, preferring the actionable tail."""
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return "…" + value[-(limit - 1):]
+
+
+def role_command(job: Mapping[str, Any]) -> list[str]:
+    """Build the delegated dispatcher argv for one job, never through a shell."""
+    role = str(job.get("role") or "").strip().lower()
+    ticket = int(job.get("ticket") or 0)
+    if ticket <= 0:
+        raise ValueError("job ticket 必须是正整数")
+    if role == "implementer":
+        return [
+            sys.executable,
+            str(DISPATCHER_PATH),
+            "once",
+            "--issue",
+            str(ticket),
+            "--execute",
+        ]
+    if role in ("reviewer", "repair"):
+        pr_value = job.get("pr")
+        if pr_value in (None, ""):
+            raise ValueError(f"{role} job 缺少 pr")
+        pr = int(pr_value)
+        if pr <= 0:
+            raise ValueError(f"{role} job 的 pr 必须是正整数")
+        verb = "review" if role == "reviewer" else "repair"
+        return [
+            sys.executable,
+            str(DISPATCHER_PATH),
+            verb,
+            "--pr",
+            str(pr),
+            "--execute",
+        ]
+    raise ValueError(f"未知 role：{role or '-'}")
+
+
+def _execution_job(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": row.get("job_id"),
+        "role": row.get("role"),
+        "ticket": int(row.get("ticket") or 0),
+        "pr": row.get("pr"),
+        "state": row.get("state"),
+        "attempt": int(row.get("attempt") or 0),
+    }
+
+
+def _heartbeat_placeholder(interval: float) -> dict[str, Any]:
+    return {
+        "started": False,
+        "stopped": False,
+        "alive": False,
+        "beats": 0,
+        "rejected": 0,
+        "errors": 0,
+        "interval_seconds": interval,
+    }
+
+
+def _oldest_queued(store: JobStore) -> dict[str, Any] | None:
+    """Read-only preview of the oldest ``queued`` row (dry-run only)."""
+    rows = store.list_jobs(state="queued")
+    if not rows:
+        return None
+    return min(
+        rows,
+        key=lambda row: (float(row.get("created_at") or 0), str(row.get("job_id") or "")),
+    )
+
+
+class _LeaseHeartbeat:
+    """Renew one job's lease from a daemon thread until :meth:`stop` is called."""
+
+    def __init__(
+        self,
+        store: JobStore,
+        job_id: str,
+        owner: str,
+        lease_seconds: float,
+        interval: float,
+    ) -> None:
+        self.store = store
+        self.job_id = job_id
+        self.owner = owner
+        self.lease_seconds = lease_seconds
+        self.interval = interval
+        self.beats = 0
+        self.rejected = 0
+        self.errors = 0
+        self.started = False
+        self.stopped = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"scheduler-heartbeat-{job_id}",
+            daemon=True,
+        )
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def start(self) -> None:
+        self._thread.start()
+        self.started = True
+
+    def stop(self) -> None:
+        """Set the stop flag and join; safe to call from the tick's finally."""
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(1.0, self.interval * 2))
+        self.stopped = not self._thread.is_alive()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                renewed = self.store.heartbeat(
+                    self.job_id, self.owner, self.lease_seconds
+                )
+            except (OSError, sqlite3.Error, ValueError):
+                self.errors += 1
+                continue
+            if renewed:
+                self.beats += 1
+            else:
+                # Lease reclaimed or job already finished: no point renewing.
+                self.rejected += 1
+                return
+
+    def result(self) -> dict[str, Any]:
+        return {
+            "started": self.started,
+            "stopped": self.stopped,
+            "alive": self.alive,
+            "beats": self.beats,
+            "rejected": self.rejected,
+            "errors": self.errors,
+            "interval_seconds": self.interval,
+        }
+
+
+def _refresh_execution_state(
+    store: JobStore, result: dict[str, Any], job_id: str
+) -> None:
+    current = store.get_job(job_id)
+    if current is None:
+        return
+    result["job"] = _execution_job(current)
+    result["state"] = current.get("state")
+
+
+def run_once(
+    store: JobStore,
+    execute: bool = True,
+    owner: str | None = None,
+    lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    *,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+) -> dict[str, Any]:
+    """Claim at most one queued job, run its role command, and record the outcome.
+
+    ``execute=False`` is a read-only preview: it inspects the oldest queued
+    job without claiming it or running a command.  The real path uses the
+    store's CAS claim, keeps the lease alive from a heartbeat thread while the
+    delegated ``dispatcher.py`` subprocess runs, then finalizes the row:
+
+    * exit 0 -> ``done``
+    * exit 2 (per-PR lock busy) -> back to ``queued`` via
+      :meth:`JobStore.requeue`, never ``failed``
+    * any other exit or start failure -> ``failed`` with truncated stderr
+
+    The scheduler never writes GitHub itself (only the delegated command may)
+    and never merges.  The heartbeat is always stopped before the row is
+    finalized.
+    """
+    interval = float(heartbeat_interval)
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("heartbeat_interval 必须大于 0")
+    lease = float(lease_seconds)
+    if not math.isfinite(lease) or lease <= 0:
+        raise ValueError("lease_seconds 必须大于 0")
+    owner_value = str(owner or "").strip() or default_owner()
+
+    if not execute:
+        job = _oldest_queued(store)
+        if job is None:
+            return {
+                "action": "idle",
+                "job": None,
+                "state": None,
+                "owner": owner_value,
+                "lease_seconds": lease,
+                "command": [],
+                "exit_code": None,
+                "error": "",
+                "finished": False,
+                "executed": False,
+                "heartbeat": _heartbeat_placeholder(interval),
+            }
+        result: dict[str, Any] = {
+            "action": "dry_run",
+            "job": _execution_job(job),
+            "state": job.get("state"),
+            "owner": owner_value,
+            "lease_seconds": lease,
+            "command": [],
+            "exit_code": None,
+            "error": "",
+            "finished": False,
+            "executed": False,
+            "heartbeat": _heartbeat_placeholder(interval),
+        }
+        try:
+            result["command"] = role_command(job)
+        except (TypeError, ValueError) as error:
+            result["error"] = _truncate(f"invalid job: {error}")
+        return result
+
+    claimed = store.claim(owner_value, lease)
+    if claimed is None:
+        return {
+            "action": "idle",
+            "job": None,
+            "state": None,
+            "owner": owner_value,
+            "lease_seconds": lease,
+            "command": [],
+            "exit_code": None,
+            "error": "",
+            "finished": False,
+            "executed": False,
+            "heartbeat": _heartbeat_placeholder(interval),
+        }
+
+    job_id = str(claimed["job_id"])
+    attempt = int(claimed.get("attempt") or 0)
+    result = {
+        "action": "executed",
+        "job": _execution_job(claimed),
+        "state": claimed.get("state"),
+        "owner": owner_value,
+        "lease_seconds": lease,
+        "command": [],
+        "exit_code": None,
+        "error": "",
+        "finished": False,
+        "executed": False,
+        "heartbeat": _heartbeat_placeholder(interval),
+    }
+    try:
+        command = role_command(claimed)
+    except (TypeError, ValueError) as error:
+        message = _truncate(f"invalid job: {error}")
+        result["action"] = "failed"
+        result["error"] = message
+        result["finished"] = store.finish(
+            job_id, "failed", message, owner=owner_value, attempt=attempt
+        )
+        _refresh_execution_state(store, result, job_id)
+        return result
+
+    result["command"] = command
+    heartbeat = _LeaseHeartbeat(store, job_id, owner_value, lease, interval)
+    exit_code: int | None = None
+    stderr = ""
+    stdout = ""
+    heartbeat.start()
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            command, capture_output=True, text=True, check=False
+        )
+        exit_code = int(completed.returncode)
+        stderr = completed.stderr or ""
+        stdout = completed.stdout or ""
+    except OSError as error:
+        stderr = str(error)
+    finally:
+        heartbeat.stop()
+    result["heartbeat"] = heartbeat.result()
+    result["exit_code"] = exit_code
+    result["executed"] = True
+
+    if exit_code == 0:
+        result["finished"] = store.finish(
+            job_id, "done", owner=owner_value, attempt=attempt
+        )
+    elif exit_code == EXIT_LOCK_BUSY:
+        # Another dispatcher already owns this PR; leave the work claimable.
+        result["action"] = "requeued"
+        result["finished"] = store.requeue(
+            job_id, owner_value, attempt=attempt, error=""
+        )
+    else:
+        message = _truncate(
+            stderr or stdout or f"delegated command exited {exit_code}"
+        )
+        result["action"] = "failed"
+        result["error"] = message
+        result["finished"] = store.finish(
+            job_id, "failed", message, owner=owner_value, attempt=attempt
+        )
+
+    _refresh_execution_state(store, result, job_id)
+    if not result["finished"] and not result["error"]:
+        result["error"] = "lease lost before finish"
+    return result
 
 
 def _gh_json(args: list[str]) -> Any:
